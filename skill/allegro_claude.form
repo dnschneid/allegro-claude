@@ -1,0 +1,82 @@
+# SPDX-FileCopyrightText: (C) 2026 Meta Platforms Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+# Allegro-Claude dialog definition
+
+FILE_TYPE=FORM_DEFN VERSION=2
+
+FORM FIXED_FONT
+FIXED
+PORT 80 40
+HEADER "Claude AI Assistant"
+
+DEFAULT send
+
+POPUP <MODE>"Auto""auto","Instant""instant","Batch""batch","Teach""teach".
+POPUP <EFFORT>"low""low","medium""medium","high""high","max""max".
+
+TILE
+
+FIELD chatlog
+FLOC 0 0
+STRFILLIN 78 65536
+FSIZE 78 28
+INFO_ONLY
+ENDFIELD
+
+TEXT "Ready"
+FLOC 0 29
+INFO statuslabel 60
+OPTIONS border
+ENDTEXT
+
+FIELD userinput
+FLOC 0 31
+STRFILLIN 62 4096
+ENDFIELD
+
+FIELD send
+FLOC 63 31
+MENUBUTTON "Send" 15 2
+ENDFIELD
+
+FIELD mode
+FLOC 0 33
+ENUMSET 12
+POP "MODE"
+ENDFIELD
+
+FIELD effort
+FLOC 13 33
+ENUMSET 12
+POP "EFFORT"
+ENDFIELD
+
+FIELD record
+FLOC 26 33
+MENUBUTTON "Record" 12 2
+ENDFIELD
+
+FIELD context
+FLOC 39 33
+MENUBUTTON "Context" 10 2
+ENDFIELD
+
+FIELD fulllog
+FLOC 50 33
+MENUBUTTON "Full Log" 11 2
+ENDFIELD
+
+FIELD session
+FLOC 63 33
+MENUBUTTON "Session..." 15 2
+ENDFIELD
+
+ENDTILE
+
+FLEXMODE edgegravity
+FLEX chatlog 0 0 1 1
+FLEX userinput 0 0 1 0
+FLEX statuslabel 0 0 1 0
+
+ENDFORM
