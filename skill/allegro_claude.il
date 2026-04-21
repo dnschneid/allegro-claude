@@ -168,8 +168,9 @@ procedure(ACL_jsonVal(v)
   cond(
     (stringp(v) ACL_jsonEscStr(v))
     (numberp(v) sprintf(nil "%L" v))
-    (v == t     "true")
-    (null(v)    "null")
+    (v == t      "true")
+    (v == 'false "false")
+    (null(v)     "null")
     (listp(v)
       if(and(car(v) listp(car(v)))
         strcat("{" buildString(
@@ -220,6 +221,8 @@ defvar(ACL_gotText nil)          ; set to t when any text arrives
 defvar(ACL_isReady nil)          ; set to t when response is complete with no more blocks
 defvar(ACL_hadToolUse nil)       ; true if tool_use occurred since last text block
 defvar(ACL_execQueue nil)        ; queued exec blocks for deferred execution
+defvar(ACL_promptId 1)            ; counter for message UUIDs
+defvar(ACL_pendingInput nil)      ; text being sent (nil = not queued)
 
 defvar(ACL_tagOpen "<allegro_execute>")
 defvar(ACL_tagClose "</allegro_execute>")
@@ -369,6 +372,7 @@ procedure(ACL_startClaude(@optional resumeId fork)
       " --input-format stream-json"
       " --output-format stream-json"
       " --include-partial-messages"
+      " --replay-user-messages"
       " --append-system-prompt-file " promptFile
       " --effort " ACL_effort)
     when(resumeId
@@ -378,6 +382,8 @@ procedure(ACL_startClaude(@optional resumeId fork)
     ACL_responseBuf = ""
     ACL_displayBuf = ""
     ACL_inExecBlock = nil
+    ACL_promptId = 1
+    ACL_pendingInput = nil
     ACL_claude = ipcBeginProcess(cmd ""
       'ACL_claudeDataHandler
       lambda((id data)
@@ -391,7 +397,9 @@ procedure(ACL_startClaude(@optional resumeId fork)
 procedure(ACL_stopClaude()
   when(and(ACL_claude ipcIsAliveProcess(ACL_claude))
     ipcSignalProcess(ACL_claude 'TERM))
-  ACL_claude = nil)
+  ACL_claude = nil
+  ACL_pendingInput = nil
+  when(ACL_form axlFormSetField(ACL_form "send" "Send")))
 
 procedure(ACL_ensureClaude()
   when(and(ACL_claude null(ipcIsAliveProcess(ACL_claude)))
@@ -401,16 +409,19 @@ procedure(ACL_ensureClaude()
   unless(ACL_claude
     ACL_startClaude(ACL_sessionId)))
 
-procedure(ACL_sendToClaude(text)
+procedure(ACL_sendMessage(text @key (uuid nil) (isSynthetic nil) (noQuery nil))
   ACL_ensureClaude()
   when(ACL_claude
-    ipcWriteProcess(ACL_claude strcat(
-      ACL_jsonObj(
+    let((pairs)
+      pairs = list(
         list("type" "user")
         list("message" list(
           list("role" "user")
           list("content" text))))
-      "\n"))))
+      when(uuid pairs = append(pairs list(list("uuid" uuid))))
+      when(isSynthetic pairs = append(pairs list(list("isSynthetic" t))))
+      when(noQuery pairs = append(pairs list(list("shouldQuery" 'false))))
+      ipcWriteProcess(ACL_claude strcat(ACL_jsonVal(pairs) "\n")))))
 
 ; ============================================================
 ; 7. Stream Event Processing
@@ -502,6 +513,27 @@ procedure(ACL_processStreamLine(line)
                 when(text
                   ACL_responseBuf = strcat(ACL_responseBuf text)
                   ACL_streamToDisplay(text)))))))
+      ; Replayed user messages (from --replay-user-messages)
+      (etype == "user"
+        let((uuid msg content)
+          uuid = or(ACL_jGet(parsed "uuid") "")
+          msg = ACL_jGet(parsed "message")
+          content = when(msg ACL_jGet(msg "content"))
+          cond(
+            ; Skip system/synthetic messages
+            (and(strlen(uuid) >= 6 substring(uuid 1 6) == "system")
+              nil)
+            ; User message confirmed - clear input, show in log
+            (and(strlen(uuid) >= 4 substring(uuid 1 4) == "user")
+              ACL_promptId++
+              ACL_pendingInput = nil
+              when(ACL_form
+                axlFormSetField(ACL_form "userinput" "")
+                axlFormSetField(ACL_form "send" "Send")
+                axlFormSetActiveField(ACL_form "userinput"))
+              ACL_drainDisplayBuf()
+              when(content
+                ACL_appendChat(sprintf(nil "\nYou: %s" content)))))))
       ; Result (response complete)
       (etype == "result"
         ACL_flushDisplay()
@@ -635,6 +667,7 @@ procedure(ACL_checkFuncDocs(code)
     when(missing
       sprintf(nil "Undefined functions: %s. These do not exist. Read algroskill/algroskill.json to find correct function names."
         buildString(missing ", ")))))
+
 procedure(ACL_logCmd(code)
   ; Log command to file for reference.
   when(ACL_sessionId
@@ -697,10 +730,12 @@ procedure(ACL_executeQueued(@rest args)
       results = mapcar('ACL_execBlock blocks)
       ACL_toolUseRounds++
       ACL_setStatus("Thinking...")
-      ACL_sendToClaude(strcat("Execution results:\n"
+      ACL_sendMessage(strcat("Execution results:\n"
         buildString(ACL_formatNumbered(results "Result ") "\n")
         "\n\nContinue if more commands are needed, "
-        "or summarize the outcome.")))))
+        "or summarize the outcome.")
+        ?uuid sprintf(nil "system_exec%d_%d" ACL_promptId ACL_toolUseRounds)
+        ?isSynthetic t))))
 
 ; ============================================================
 ; 11. Form Callback
@@ -714,18 +749,24 @@ procedure(ACL_formCB(form)
     cond(
       (field == "send"
         ACL_doSend(form))
+      (field == "userinput"
+        ; If queued and text changed, re-send with same UUID
+        when(ACL_pendingInput
+          when((val != ACL_pendingInput)
+            ACL_pendingInput = val
+            ACL_sendMessage(val ?uuid sprintf(nil "user%d" ACL_promptId)))))
       (field == "mode"
         ACL_mode = val
         ACL_setStatus(sprintf(nil "Mode: %s" val)))
       (field == "effort"
         ACL_effort = val
         when(and(ACL_claude ipcIsAliveProcess(ACL_claude))
-          ACL_sendToClaude(sprintf(nil "/effort %s" val)))
+          ACL_sendMessage(sprintf(nil "/effort %s" val) ?isSynthetic t ?noQuery t))
         ACL_setStatus(sprintf(nil "Effort: %s" val)))
       (field == "record"
         ACL_toggleRecording(form))
       (field == "context"
-        ACL_sendToClaude("/compact"))
+        ACL_sendMessage("/compact" ?isSynthetic t ?noQuery t))
       (field == "fulllog"
         ACL_showFullLog())
       (field == "session"
@@ -736,12 +777,23 @@ procedure(ACL_doSend(form)
     text = axlFormGetField(form "userinput")
     when(and(text strlen(text) > 0)
       cond(
-        (pcreMatchp(ACL_approveRe text)  ACL_handleApprove())
-        (pcreMatchp(ACL_rejectRe text)   ACL_handleReject())
-        (t  ACL_appendChat(sprintf(nil "\nYou: %s\n" text))
-              ACL_handleUserMessage(text)))
-      axlFormSetField(form "userinput" "")
-      axlFormSetActiveField(form "userinput"))))
+        (pcreMatchp(ACL_approveRe text)
+          axlFormSetField(form "userinput" "")
+          axlFormSetActiveField(form "userinput")
+          ACL_handleApprove())
+        (pcreMatchp(ACL_rejectRe text)
+          axlFormSetField(form "userinput" "")
+          axlFormSetActiveField(form "userinput")
+          ACL_handleReject())
+        ; Already queued - re-send if text changed
+        (ACL_pendingInput
+          unless(text == ACL_pendingInput
+            ACL_pendingInput = text
+            ACL_sendMessage(text ?uuid sprintf(nil "user%d" ACL_promptId))))
+        ; New message - queue and send
+        (t
+          axlFormSetField(form "send" "Queued")
+          ACL_handleUserMessage(text))))))
 
 procedure(ACL_toggleRecording(form)
   if(ACL_recording then
@@ -763,24 +815,52 @@ procedure(ACL_toggleRecording(form)
     ACL_setStatus("Recording macro...")))
 
 ; ============================================================
-; 12. Message Handlers
+; 12. Input Polling (auto-update queued messages)
+; ============================================================
+
+procedure(ACL_startInputPoll()
+  ; Schedule first poll after 500ms (one-shot, self-rescheduling)
+  axlUIWTimerAdd(nil 30 t 'ACL_pollInput))
+
+procedure(ACL_pollInput(@rest args)
+  ; Timer callback: check if queued input text has changed.
+  ; Self-terminates when ACL_pendingInput becomes nil.
+  when(and(ACL_pendingInput ACL_form)
+    let((text)
+      text = axlFormGetField(ACL_form "userinput")
+      when((text != ACL_pendingInput)
+        ACL_pendingInput = text
+        ACL_sendMessage(text ?uuid sprintf(nil "user%d" ACL_promptId))))
+    ; Re-schedule while still queued
+    axlUIWTimerAdd(nil 30 t 'ACL_pollInput)))
+
+; ============================================================
+; 13. Message Handlers
 ; ============================================================
 
 procedure(ACL_handleUserMessage(text)
   ACL_setStatus("Thinking...")
   ACL_responseBuf = ""
   ACL_toolUseRounds = 0
-  let((elapsed prefix)
+  ACL_pendingInput = text
+  let((elapsed prefix systemUuid userUuid)
     elapsed = stringToTime(getCurrentTime()) - ACL_lastCmdTime
-    prefix = if(and(ACL_lastCmdTime elapsed > 60)
-      "[The board may have been edited. Re-query the design instead of relying on memory.] "
-      "")
-    ACL_sendToClaude(strcat(prefix
-      "[ALWAYS CHECK CADENCE DOCUMENTATION BEFORE EXECUTING OR REPLYING] "
-      text
+    prefix = strcat(
+      if(and(ACL_lastCmdTime elapsed > 60)
+        "[The board may have been edited. Re-query the design instead of relying on memory.] "
+        "")
+      "[ALWAYS CHECK CADENCE DOCUMENTATION BEFORE EXECUTING OR REPLYING]"
       if(ACL_mode == "batch"
-        "\n\n[BATCH MODE: List all commands you would execute as <allegro_execute> blocks. I will review and approve first.]"
-        "")))))
+        " [BATCH MODE: List all commands you would execute as <allegro_execute> blocks. I will review and approve first.]"
+        ""))
+    systemUuid = sprintf(nil "system%d" ACL_promptId)
+    userUuid = sprintf(nil "user%d" ACL_promptId)
+    ; Send system prefix as synthetic (not displayed, no response generated)
+    ACL_sendMessage(prefix ?uuid systemUuid ?isSynthetic t ?noQuery t)
+    ; Send user's actual message
+    ACL_sendMessage(text ?uuid userUuid)
+    ; Start polling for input changes
+    ACL_startInputPoll()))
 
 procedure(ACL_handleApprove()
   when(ACL_pendingBatch
@@ -816,12 +896,14 @@ procedure(ACL_handleReject()
 procedure(ACL_handleJournal(contents)
   ACL_setStatus("Analyzing recording...")
   ACL_responseBuf = ""
-  ACL_sendToClaude(strcat(
+  ACL_sendMessage(strcat(
     "The user recorded this Allegro macro/journal:\n\n```\n"
     contents "\n```\n\n"
     "Analyze the commands. Explain what the user did step by step. "
     "Generate a reusable SKILL procedure that replicates this action "
-    "with parameterized inputs where appropriate.")))
+    "with parameterized inputs where appropriate.")
+    ?uuid sprintf(nil "system_journal%d_%d" ACL_promptId ACL_toolUseRounds)
+    ?isSynthetic t))
 
 ; ============================================================
 ; 13. Session Management UI
@@ -867,6 +949,8 @@ procedure(ACL_handleNewSession()
   ACL_startClaude()
   ACL_appendChat("Starting new session...")
   ACL_setStatus("Ready"))
+  ACL_sendMessage(strcat("Hello! Current board: " axlGetDrawingName())
+    ?uuid "system_start" ?isSynthetic t)
 
 procedure(ACL_handleRestoreSession(sid)
   let((info logDir files)
@@ -899,9 +983,10 @@ procedure(ACL_handleForkSession(sid)
     oldBoard = or(ACL_jGet(info "board") "unknown")
     ACL_startClaude(sid t)
     ACL_responseBuf = ""
-    ACL_sendToClaude(sprintf(nil
+    ACL_sendMessage(sprintf(nil
       "The target board has changed from \"%s\" to \"%s\". Disregard any previous design-specific information and re-query the new design as needed."
-      oldBoard axlGetDrawingName()))
+      oldBoard axlGetDrawingName())
+      ?uuid "system_fork" ?isSynthetic t ?noQuery t)
     ACL_appendChat(sprintf(nil "Forked from session: %s" sid))))
 
 ; ============================================================
@@ -1118,7 +1203,7 @@ procedure(ACL_runTests()
       ; ipcSleep processes handlers while waiting
       printf("  Sending hello to Claude...\n")
       ACL_responseBuf = ""
-      ACL_sendToClaude("Say exactly: HELLO_TEST_OK")
+      ACL_sendMessage("Say exactly: HELLO_TEST_OK")
       ; Wait for response (ipcSleep processes handlers)
       ACL_gotText = nil
       for(i 1 120
@@ -1129,7 +1214,7 @@ procedure(ACL_runTests()
       printf("  Testing SKILL execution round-trip...\n")
       ACL_responseBuf = ""
       ACL_gotText = nil
-      ACL_sendToClaude("Execute this SKILL expression using <allegro_execute> tags and report the result: (plus 40 2)")
+      ACL_sendMessage("Execute this SKILL expression using <allegro_execute> tags and report the result: (plus 40 2)")
       for(i 1 120
         unless(ACL_gotText ipcSleep(1)))
       ACL_check("skill exec response" ACL_gotText t)
