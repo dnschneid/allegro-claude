@@ -223,6 +223,7 @@ defvar(ACL_hadToolUse nil)       ; true if tool_use occurred since last text blo
 defvar(ACL_execQueue nil)        ; queued exec blocks for deferred execution
 defvar(ACL_promptId 1)            ; counter for message UUIDs
 defvar(ACL_pendingInput nil)      ; text being sent (nil = not queued)
+defvar(ACL_autoUpdateInput nil)   ; t to enable auto-polling of input edits
 
 defvar(ACL_tagOpen "<allegro_execute>")
 defvar(ACL_tagClose "</allegro_execute>")
@@ -514,17 +515,14 @@ procedure(ACL_processStreamLine(line)
                   ACL_responseBuf = strcat(ACL_responseBuf text)
                   ACL_streamToDisplay(text)))))))
       ; Replayed user messages (from --replay-user-messages)
-      (etype == "user"
+      (and((etype == "user") ACL_autoUpdateInput)
         let((uuid msg content)
           uuid = or(ACL_jGet(parsed "uuid") "")
           msg = ACL_jGet(parsed "message")
           content = when(msg ACL_jGet(msg "content"))
           cond(
-            ; Skip system/synthetic messages
-            (and(strlen(uuid) >= 6 substring(uuid 1 6) == "system")
-              nil)
-            ; User message confirmed - clear input, show in log
-            (and(strlen(uuid) >= 4 substring(uuid 1 4) == "user")
+            ; Only show user messages
+            ((substring(uuid 1 4) == "user")
               ACL_promptId++
               ACL_pendingInput = nil
               when(ACL_form
@@ -734,7 +732,6 @@ procedure(ACL_executeQueued(@rest args)
         buildString(ACL_formatNumbered(results "Result ") "\n")
         "\n\nContinue if more commands are needed, "
         "or summarize the outcome.")
-        ?uuid sprintf(nil "system_exec%d_%d" ACL_promptId ACL_toolUseRounds)
         ?isSynthetic t))))
 
 ; ============================================================
@@ -790,10 +787,18 @@ procedure(ACL_doSend(form)
           unless(text == ACL_pendingInput
             ACL_pendingInput = text
             ACL_sendMessage(text ?uuid sprintf(nil "user%d" ACL_promptId))))
-        ; New message - queue and send
+        ; New message - send (queue or echo depending on auto-update mode)
         (t
-          axlFormSetField(form "send" "Queued")
-          ACL_handleUserMessage(text))))))
+          if(ACL_autoUpdateInput then
+            axlFormSetField(form "send" "Queued")
+          else
+            ACL_appendChat(sprintf(nil "\nYou: %s" text))
+            axlFormSetField(form "userinput" "")
+            axlFormSetActiveField(form "userinput"))
+          ACL_handleUserMessage(text)
+          unless(ACL_autoUpdateInput
+            ACL_promptId++
+            ACL_pendingInput = nil))))))
 
 procedure(ACL_toggleRecording(form)
   if(ACL_recording then
@@ -832,7 +837,7 @@ procedure(ACL_pollInput(@rest args)
         ACL_pendingInput = text
         ACL_sendMessage(text ?uuid sprintf(nil "user%d" ACL_promptId))))
     ; Re-schedule while still queued
-    axlUIWTimerAdd(nil 30 t 'ACL_pollInput)))
+    ACL_startInputPoll()))
 
 ; ============================================================
 ; 13. Message Handlers
@@ -853,14 +858,13 @@ procedure(ACL_handleUserMessage(text)
       if(ACL_mode == "batch"
         " [BATCH MODE: List all commands you would execute as <allegro_execute> blocks. I will review and approve first.]"
         ""))
-    systemUuid = sprintf(nil "system%d" ACL_promptId)
     userUuid = sprintf(nil "user%d" ACL_promptId)
     ; Send system prefix as synthetic (not displayed, no response generated)
-    ACL_sendMessage(prefix ?uuid systemUuid ?isSynthetic t ?noQuery t)
+    ACL_sendMessage(prefix ?isSynthetic t ?noQuery t)
     ; Send user's actual message
     ACL_sendMessage(text ?uuid userUuid)
-    ; Start polling for input changes
-    ACL_startInputPoll()))
+    ; Start polling for input changes (if enabled)
+    when(ACL_autoUpdateInput ACL_startInputPoll())))
 
 procedure(ACL_handleApprove()
   when(ACL_pendingBatch
@@ -902,7 +906,6 @@ procedure(ACL_handleJournal(contents)
     "Analyze the commands. Explain what the user did step by step. "
     "Generate a reusable SKILL procedure that replicates this action "
     "with parameterized inputs where appropriate.")
-    ?uuid sprintf(nil "system_journal%d_%d" ACL_promptId ACL_toolUseRounds)
     ?isSynthetic t))
 
 ; ============================================================
@@ -949,8 +952,8 @@ procedure(ACL_handleNewSession()
   ACL_startClaude()
   ACL_appendChat("Starting new session...")
   ACL_setStatus("Ready"))
-  ACL_sendMessage(strcat("Hello! Current board: " axlGetDrawingName())
-    ?uuid "system_start" ?isSynthetic t)
+  ACL_sendMessage(sprintf(nil "Current board: %s\nSay hello" axlGetDrawingName())
+    ?isSynthetic t)
 
 procedure(ACL_handleRestoreSession(sid)
   let((info logDir files)
@@ -986,7 +989,7 @@ procedure(ACL_handleForkSession(sid)
     ACL_sendMessage(sprintf(nil
       "The target board has changed from \"%s\" to \"%s\". Disregard any previous design-specific information and re-query the new design as needed."
       oldBoard axlGetDrawingName())
-      ?uuid "system_fork" ?isSynthetic t ?noQuery t)
+      ?isSynthetic t)
     ACL_appendChat(sprintf(nil "Forked from session: %s" sid))))
 
 ; ============================================================
