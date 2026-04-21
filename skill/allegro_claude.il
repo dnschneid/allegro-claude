@@ -926,10 +926,12 @@ procedure(ACL_openPanel()
         let((sessions board)
           board = axlGetDrawingName()
           sessions = when(board ACL_getBoardSessions(board))
-          if(sessions then
+          ; FIXME: session loading is janky right now, so bypass
+          ;if(sessions then
             ACL_handleSessionPick()
-          else
-            ACL_handleNewSession()))))))
+          ;else
+          ;  ACL_handleNewSession())
+        )))))
 
 axlCmdRegister("claude" 'ACL_openPanel ?cmdType "general")
 regExitBefore('ACL_stopClaude)
