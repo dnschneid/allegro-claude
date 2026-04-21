@@ -220,9 +220,9 @@ defvar(ACL_recording nil)
 defvar(ACL_journalFile nil)
 defvar(ACL_cmdSeq 0)
 defvar(ACL_gotText nil)          ; set to t when any text arrives
-defvar(ACL_isReady nil)          ; set to t when response is complete with no more blocks
 defvar(ACL_hadToolUse nil)       ; true if tool_use occurred since last text block
 defvar(ACL_execQueue nil)        ; queued exec blocks for deferred execution
+defvar(ACL_execTimer nil)        ; one-shot timer for deferred exec
 defvar(ACL_promptId 1)            ; counter for message UUIDs
 defvar(ACL_pendingInput nil)      ; text being sent (nil = not queued)
 defvar(ACL_autoUpdateInput nil)   ; t to enable auto-polling of input edits
@@ -255,12 +255,7 @@ procedure(ACL_readFile(path)
     return(text)))
 
 procedure(ACL_appendChat(text)
-  ; Append text with a newline (for distinct messages)
   ACL_logWrite(strcat(text "\n")))
-
-procedure(ACL_appendChatRaw(text)
-  ; Append text without newline (for streaming chunks)
-  ACL_logWrite(text))
 
 procedure(ACL_logWrite(text)
   ACL_logContent = strcat(ACL_logContent text)
@@ -286,8 +281,7 @@ procedure(ACL_logWrite(text)
       axlFormSetField(ACL_form "chatlog" display))))
 
 procedure(ACL_lastNLines(text n)
-  ; Return the last n lines of text, prefixed with "...\n" if truncated.
-  let((pos count len)
+  prog((pos count len)
     len = strlen(text)
     when(or(null(text) len == 0) return(""))
     pos = len
@@ -299,9 +293,9 @@ procedure(ACL_lastNLines(text n)
       when(substring(text pos 1) == "\n"
         count++)
       pos--)
-    if(count >= n
+    return(if(count >= n
       strcat("...\n" substring(text (pos + 2)))
-      text)))
+      text))))
 
 procedure(ACL_logReset()
   ACL_logContent = ""
@@ -472,7 +466,6 @@ procedure(ACL_processStreamLine(line)
     parsed = car(parsed)
     etype = ACL_jGet(parsed "type")
     ; Capture session ID from any event
-    ; Capture session ID from any event
     sid = ACL_jGet(parsed "session_id")
     when(and(sid sid != ACL_sessionId)
       ACL_sessionId = sid)
@@ -517,7 +510,7 @@ procedure(ACL_processStreamLine(line)
                   ; Force-flush ALL pending display text before tool execution
                   when(and(ACL_displayBuf strlen(ACL_displayBuf) > 0
                            null(ACL_inExecBlock))
-                    ACL_appendChatRaw(ACL_displayBuf)
+                    ACL_logWrite(ACL_displayBuf)
                     ACL_displayBuf = "")
                   ACL_hadToolUse = t
                   ACL_setStatus(sprintf(nil "Using %s..."
@@ -525,7 +518,7 @@ procedure(ACL_processStreamLine(line)
                 (and(cblock ACL_jGet(cblock "type") == "text")
                   ; Add separator only if a tool_use occurred since last text
                   when(ACL_hadToolUse
-                    ACL_appendChatRaw("\n")
+                    ACL_logWrite("\n")
                     ACL_hadToolUse = nil))))
             (evtype == "content_block_stop"
               ACL_setStatus("Thinking...")))))
@@ -584,19 +577,19 @@ procedure(ACL_drainDisplayBuf()
         pos = nindex(ACL_displayBuf ACL_tagOpen)
         if(pos then
           when(pos > 1
-            ACL_appendChatRaw(substring(ACL_displayBuf 1 (pos - 1))))
+            ACL_logWrite(substring(ACL_displayBuf 1 (pos - 1))))
           ACL_displayBuf = substring(ACL_displayBuf (pos + strlen(ACL_tagOpen)))
           ACL_inExecBlock = t
         else
           safe = strlen(ACL_displayBuf) - strlen(ACL_tagOpen) + 1
           when(safe > 0
-            ACL_appendChatRaw(substring(ACL_displayBuf 1 safe))
+            ACL_logWrite(substring(ACL_displayBuf 1 safe))
             ACL_displayBuf = substring(ACL_displayBuf (safe + 1)))
           return(nil))))))
 
 procedure(ACL_flushDisplay()
   when(and(ACL_displayBuf strlen(ACL_displayBuf) > 0 null(ACL_inExecBlock))
-    ACL_appendChatRaw(ACL_displayBuf))
+    ACL_logWrite(ACL_displayBuf))
   ACL_displayBuf = ""
   ACL_inExecBlock = nil)
 
@@ -638,7 +631,7 @@ procedure(ACL_execBlock(code)
     preview = if(strlen(code) > ACL_logCodeLimit
       strcat(substring(code 1 (ACL_logCodeLimit - 3)) "...")
       code)
-    ACL_appendChatRaw(sprintf(nil "[exec: %s]\n" preview))
+    ACL_logWrite(sprintf(nil "[exec: %s]\n" preview))
     ; Execute with:
     ;   poport redirect to capture printf output
     ;   muffleWarnings to capture warnings
@@ -714,7 +707,7 @@ procedure(ACL_formatNumbered(items @optional (prefix ""))
       items)))
 
 procedure(ACL_onResponseComplete()
-  let((blocks)
+  prog((blocks)
     blocks = ACL_extractExecBlocks(ACL_responseBuf)
     ACL_responseBuf = ""
     cond(
@@ -728,20 +721,15 @@ procedure(ACL_onResponseComplete()
         when(and(ACL_toolUseMax ACL_toolUseRounds >= ACL_toolUseMax)
           ACL_appendChat("(Tool-use loop limit reached.)")
           ACL_setStatus("Ready")
-          ACL_isReady = t
           return(nil))
         ; Queue blocks for deferred execution at top level.
         ; evalstring can't run inside a dataHandler -- it needs
         ; the top-level interpreter.
         ACL_execQueue = blocks
         ACL_setStatus("Queued SKILL execution...")
-        ; Use a one-shot timer to execute at top level without console output.
-        ; axlUIWTimerAdd callback return values are ignored (unlike axlShellPost).
-        defvar(ACL_execTimer nil)
         ACL_execTimer = axlUIWTimerAdd(nil 1 t 'ACL_executeQueued))
       (t
         ACL_setStatus("Ready")
-        ACL_isReady = t
         ACL_toolUseRounds = 0))))
 
 procedure(ACL_executeQueued(@rest args)
@@ -765,7 +753,7 @@ procedure(ACL_executeQueued(@rest args)
 ; ============================================================
 
 procedure(ACL_formCB(form)
-  prog((field val text)
+  prog((field val)
     field = form->curField
     val = form->curValue
     when(form->doneState == 3  ACL_form = nil  return(t))
@@ -902,26 +890,10 @@ procedure(ACL_handleUserMessage(text)
 procedure(ACL_handleApprove()
   when(ACL_pendingBatch
     ACL_setStatus("Executing batch...")
-    let((n results i)
-      n = length(ACL_pendingBatch)
-      i = 0
-      results = mapcar(lambda((code)
-        i++
-        ACL_setStatus(sprintf(nil "Batch %d/%d..." i n))
-        let((err result port output)
-          ACL_logCmd(code)
-          port = outstring()
-          err = errset(let(((poport port))
-            result = evalstring(code)))
-          output = getOutstring(port)
-          close(port)
-          sprintf(nil "%d. %s%L" i
-            if(and(output strlen(output) > 0)
-              strcat(output "\n") "")
-            if(err result "*error*"))))
-        ACL_pendingBatch)
+    let((results)
+      results = mapcar('ACL_execBlock ACL_pendingBatch)
       ACL_appendChat(strcat("Batch results:\n"
-        buildString(results "\n")))
+        buildString(ACL_formatNumbered(results "Result ") "\n")))
       ACL_pendingBatch = nil
       ACL_setStatus("Ready"))))
 
@@ -942,7 +914,7 @@ procedure(ACL_handleJournal(contents)
     ?isSynthetic t))
 
 ; ============================================================
-; 13. Session Management UI
+; 14. Session Management UI
 ; ============================================================
 
 procedure(ACL_handleSessionPick()
@@ -984,9 +956,9 @@ procedure(ACL_handleNewSession()
   ACL_logReset()
   ACL_startClaude()
   ACL_appendChat("Starting new session...")
-  ACL_setStatus("Ready"))
+  ACL_setStatus("Ready")
   ACL_sendMessage(sprintf(nil "Current board: %s\nSay hello" axlGetDrawingName())
-    ?isSynthetic t)
+    ?isSynthetic t))
 
 procedure(ACL_handleRestoreSession(sid)
   let((info logDir files)
@@ -1026,7 +998,7 @@ procedure(ACL_handleForkSession(sid)
     ACL_appendChat(sprintf(nil "Forked from session: %s" sid))))
 
 ; ============================================================
-; 14. Open Panel & Registration
+; 15. Open Panel & Registration
 ; ============================================================
 
 procedure(ACL_openPanel()
@@ -1051,16 +1023,16 @@ procedure(ACL_openPanel()
           sessions = when(board ACL_getBoardSessions(board))
           ; FIXME: session loading is janky right now, so bypass
           ;if(sessions then
-            ACL_handleSessionPick()
+          ;  ACL_handleSessionPick()
           ;else
-          ;  ACL_handleNewSession())
+            ACL_handleNewSession()
         )))))
 
 axlCmdRegister("claude" 'ACL_openPanel ?cmdType "general")
 regExitBefore('ACL_stopClaude)
 
 ; ============================================================
-; 15. Tests  --  run with:  ACL_runTests()
+; 16. Tests  --  run with:  ACL_runTests()
 ; ============================================================
 
 defvar(ACL_testPass 0)
