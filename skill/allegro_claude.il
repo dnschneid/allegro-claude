@@ -197,6 +197,13 @@ when(and(boundp('ACL_claude) ACL_claude)
   ACL_claude = nil)
 
 defvar(ACL_claude nil)
+defvar(ACL_isWindows (getShellEnvVar("OS") == "Windows_NT"))
+
+procedure(ACL_normPath(path)
+  if(and(path ACL_isWindows)
+    pcreReplace(pcreCompile("\\\\") path "/" 0)
+    path))
+
 defvar(ACL_form nil)
 defvar(ACL_logContent "")          ; accumulated log text
 defvar(ACL_logTruncLimit 12500)    ; max chars shown in form field
@@ -233,13 +240,13 @@ defvar(ACL_tagClose "</allegro_execute>")
 defvar(ACL_approveRe pcreCompile("^\\s*approve\\s*$" pcreGenCompileOptBits(?caseLess t)))
 defvar(ACL_rejectRe  pcreCompile("^\\s*reject\\s*$"  pcreGenCompileOptBits(?caseLess t)))
 
-defvar(ACL_homeDir      strcat(getShellEnvVar("HOME") "/.allegro_claude"))
+defvar(ACL_homeDir      strcat(or(getShellEnvVar("HOME") getShellEnvVar("USERPROFILE")) "/.allegro_claude"))
 defvar(ACL_sessionsFile strcat(ACL_homeDir "/sessions.json"))
 defvar(ACL_logDir       strcat(ACL_homeDir "/logs"))
 
 defvar(ACL_scriptDir
-  pcreReplace(pcreCompile("[^/\\\\]+$")
-    simplifyFilename(get_filename(piport)) "" 0))
+  ACL_normPath(pcreReplace(pcreCompile("[^/\\\\]+$")
+    simplifyFilename(get_filename(piport)) "" 0)))
 
 ; ============================================================
 ; 4. Utilities
@@ -328,17 +335,16 @@ procedure(ACL_buildSystemPrompt()
     re = pcreCompile("\\{\\{ALLEGRO_CLAUDE_PATH\\}\\}")
     template = pcreReplace(re template ACL_scriptDir 0)
     ; Inject Cadence paths from allegro_install_root
-    installRoot = axlGetVariable("allegro_install_root")
+    installRoot = ACL_normPath(axlGetVariable("allegro_install_root"))
     re = pcreCompile("\\{\\{CADENCE_DOC_PATH\\}\\}")
     template = pcreReplace(re template strcat(installRoot "/doc") 0)
     re = pcreCompile("\\{\\{CADENCE_EXAMPLES_PATH\\}\\}")
     pcreReplace(re template strcat(installRoot "/share/pcb/examples") 0)))
 
 procedure(ACL_shellQuote(s)
-  ; Wrap s in single quotes for safe shell argument passing.
-  ; Escapes embedded single quotes as '\'' (end quote, escaped quote,
-  ; reopen quote).
-  strcat("'" pcreReplace(pcreCompile("'") s "'\\''" 0) "'"))
+  if(ACL_isWindows
+    strcat("\"" pcreReplace(pcreCompile("\"") s "\\\"" 0) "\"")
+    strcat("'" pcreReplace(pcreCompile("'") s "'\\''" 0) "'")))
 
 ; ============================================================
 ; 5. Session Management
@@ -371,30 +377,35 @@ procedure(ACL_getSession(sid)
   cadr(assoc(sid or(ACL_loadSessions() nil))))
 
 procedure(ACL_getBoardSessions(boardPath)
-  setof(pair or(ACL_loadSessions() nil)
-    ACL_jGet(cadr(pair) "board") == boardPath))
+  let((normBoard)
+    normBoard = ACL_normPath(boardPath)
+    setof(pair or(ACL_loadSessions() nil)
+      ACL_normPath(ACL_jGet(cadr(pair) "board")) == normBoard)))
 
 ; ============================================================
 ; 6. Claude Process Management
 ; ============================================================
 
 procedure(ACL_startClaude(@optional resumeId fork)
-  let((cmd promptFile fp)
+  let((cmd promptFile fp installRoot)
     ACL_stopClaude()
     ; Write system prompt to a temp file to avoid shell escaping issues
-    promptFile = sprintf(nil "%s/acl_prompt.md" getTempDir())
+    promptFile = ACL_normPath(sprintf(nil "%s/acl_prompt.md" getTempDir()))
     fp = outfile(promptFile)
     when(fp
       fprintf(fp "%s" ACL_buildSystemPrompt())
       close(fp))
+    installRoot = ACL_normPath(axlGetVariable("allegro_install_root"))
     cmd = strcat(
-      "env -u LD_LIBRARY_PATH claude -p"
+      if(ACL_isWindows "claude -p" "env -u LD_LIBRARY_PATH claude -p")
       " --verbose"
       " --input-format stream-json"
       " --output-format stream-json"
       " --include-partial-messages"
       " --replay-user-messages"
-      " --append-system-prompt-file " promptFile
+      " --append-system-prompt-file " ACL_shellQuote(promptFile)
+      " --add-dir " ACL_shellQuote(installRoot)
+      " --add-dir " ACL_shellQuote(ACL_scriptDir)
       " --effort " ACL_effort)
     when(resumeId
       cmd = sprintf(nil "%s --resume %s" cmd resumeId)
@@ -499,7 +510,7 @@ procedure(ACL_processStreamLine(line)
                       when(and(null(ACL_sessionSaved) ACL_sessionId
                                axlGetDrawingName())
                         ACL_addSession(ACL_sessionId list(
-                          list("board" axlGetDrawingName())
+                          list("board" ACL_normPath(axlGetDrawingName()))
                           list("time" sprintf(nil "%d"
                             stringToTime(getCurrentTime())))))
                         ACL_sessionSaved = t))))))
@@ -946,7 +957,7 @@ procedure(ACL_handleSessionPick()
       else
         sid = nth((choice - 1) sids)
         board = or(ACL_jGet(ACL_getSession(sid) "board") "")
-        if(board == axlGetDrawingName()
+        if(ACL_normPath(board) == ACL_normPath(axlGetDrawingName())
           ACL_handleRestoreSession(sid)
           ACL_handleForkSession(sid))))))
 
@@ -957,7 +968,7 @@ procedure(ACL_handleNewSession()
   ACL_startClaude()
   ACL_appendChat("Starting new session...")
   ACL_setStatus("Ready")
-  ACL_sendMessage(sprintf(nil "Current board: %s\nSay hello" axlGetDrawingName())
+  ACL_sendMessage(sprintf(nil "Current board: %L\nSay hello" axlGetDrawingName())
     ?isSynthetic t))
 
 procedure(ACL_handleRestoreSession(sid)
@@ -1201,7 +1212,9 @@ procedure(ACL_runTests()
 
   printf("\n--- Claude Process ---\n")
   let((claudeExists savedEffort)
-    claudeExists = errset(system("env -u LD_LIBRARY_PATH which claude > /dev/null 2>&1"))
+    claudeExists = errset(system(
+      if(ACL_isWindows "where claude >NUL 2>&1"
+        "env -u LD_LIBRARY_PATH which claude > /dev/null 2>&1")))
     if(and(claudeExists car(claudeExists) == 0) then
       ; Use sonnet for faster test response
       savedEffort = ACL_effort
