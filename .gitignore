@@ -6,3 +6,4 @@
 .*.swo
 .*.swp
 signoise.run/
+test/cadence.sh
