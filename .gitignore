@@ -1,0 +1,8 @@
+*,*
+*.jrl
+*.log
+*.out
+*_
+.*.swo
+.*.swp
+signoise.run/
