@@ -200,6 +200,8 @@ defvar(ACL_claude nil)
 defvar(ACL_form nil)
 defvar(ACL_logContent "")          ; accumulated log text
 defvar(ACL_logTruncLimit 12500)    ; max chars shown in form field
+defvar(ACL_logLineLimit 50)        ; max lines shown in form field
+defvar(ACL_logLineCount 0)         ; running newline count in logContent
 defvar(ACL_logFile nil)            ; temp file for full log viewer
 defvar(ACL_logCodeLimit 250)       ; max chars for each code preview
 defvar(ACL_sessionId nil)
@@ -262,24 +264,48 @@ procedure(ACL_appendChatRaw(text)
 
 procedure(ACL_logWrite(text)
   ACL_logContent = strcat(ACL_logContent text)
+  ; Count newlines in appended text
+  let((i) for(i 1 strlen(text)
+    when(substring(text i 1) == "\n" ACL_logLineCount++)))
   ; Write to backing file (full history)
   when(ACL_logFile
     let((fp)
       fp = outfile(ACL_logFile "a")
       when(fp fprintf(fp "%s" text) close(fp))))
-  ; Update form field (truncated to last N chars)
+  ; Update form field (truncated to last N lines, with char limit backstop)
   when(ACL_form
     let((display)
-      if(strlen(ACL_logContent) > ACL_logTruncLimit then
+      if(ACL_logLineCount > ACL_logLineLimit then
+        display = ACL_lastNLines(ACL_logContent ACL_logLineLimit)
+      else if(strlen(ACL_logContent) > ACL_logTruncLimit then
         display = strcat("...\n"
           substring(ACL_logContent
             (strlen(ACL_logContent) - ACL_logTruncLimit + 5)))
       else
-        display = ACL_logContent)
+        display = ACL_logContent))
       axlFormSetField(ACL_form "chatlog" display))))
+
+procedure(ACL_lastNLines(text n)
+  ; Return the last n lines of text, prefixed with "...\n" if truncated.
+  let((pos count len)
+    len = strlen(text)
+    when(or(null(text) len == 0) return(""))
+    pos = len
+    count = 0
+    ; Skip trailing newline
+    when(substring(text pos 1) == "\n" pos--)
+    ; Scan backwards counting newlines
+    while(and(pos >= 1 count < n)
+      when(substring(text pos 1) == "\n"
+        count++)
+      pos--)
+    if(count >= n
+      strcat("...\n" substring(text (pos + 2)))
+      text)))
 
 procedure(ACL_logReset()
   ACL_logContent = ""
+  ACL_logLineCount = 0
   when(ACL_form axlFormSetField(ACL_form "chatlog" ""))
   when(ACL_logFile
     let((fp) fp = outfile(ACL_logFile) when(fp close(fp)))))
@@ -766,6 +792,13 @@ procedure(ACL_formCB(form)
         ACL_sendMessage("/compact" ?isSynthetic t ?noQuery t))
       (field == "fulllog"
         ACL_showFullLog())
+      (field == "loglines"
+        let((n)
+          n = atoi(val)
+          when(and(n n > 0)
+            ACL_logLineLimit = n
+            ; Redisplay with new limit
+            ACL_logWrite(""))))
       (field == "session"
         ACL_handleSessionPick()))))
 
@@ -1006,8 +1039,10 @@ procedure(ACL_openPanel()
       axlFormDefaultButton(ACL_form "send")
       axlFormSetField(ACL_form "mode" "auto")
       axlFormSetField(ACL_form "effort" "medium")
+      axlFormSetField(ACL_form "loglines" sprintf(nil "%d" ACL_logLineLimit))
       axlFormSetField(ACL_form "statuslabel" "Starting...")
       axlFormDisplay(ACL_form)
+      axlFormSetActiveField(ACL_form "userinput")
       if(ACL_sessionId then
         ACL_ensureClaude()
       else

@@ -26,9 +26,20 @@ ENDFIELD
 
 TEXT "Ready"
 FLOC 0 29
-INFO statuslabel 60
+INFO statuslabel 55
 OPTIONS border
 ENDTEXT
+
+TEXT "Lines:"
+FLOC 63 29
+ENDTEXT
+
+FIELD loglines
+FLOC 64 29
+LONGFILLIN 5 5
+MIN 1
+MAX 99
+ENDFIELD
 
 FIELD userinput
 FLOC 0 31
