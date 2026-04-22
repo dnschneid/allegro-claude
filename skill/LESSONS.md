@@ -77,3 +77,20 @@ Silkscreen data may live under `BOARD GEOMETRY/SILKSCREEN_TOP` and `PACKAGE GEOM
 ## `paramLayerGroup:ETCH` is obsolete for cross-section queries
 Use `axlXSectionGet(nil 'all)` instead of `axlGetParam("paramLayerGroup:ETCH")` to get layer stackup information including layer types, thicknesses, and materials. `paramLayerGroup:ETCH` still returns the list of etch layer names via `->groupMembers` but has no type information.
 
+## `assoc` uses `eq`, not `equal` â€” symbols â‰  strings
+`axlDBGetProperties` returns an assoc list with **symbol** keys, e.g., `((PACKAGE_HEIGHT_MAX "0.85 MM"))`. Using `assoc("PACKAGE_HEIGHT_MAX" props)` returns nil because the string `"PACKAGE_HEIGHT_MAX"` is not `eq` to the symbol `PACKAGE_HEIGHT_MAX`. Use `assoc('PACKAGE_HEIGHT_MAX props)` (quoted symbol) instead. This applies to all `assoc` lookups on property lists from Allegro.
+
+## Component placement info is on `comp->symbol`, not `comp`
+`isPlaced`, `isMirrored`, `xy`, `rotation`, `layer`, and `bBox` are properties of `comp->symbol` (the placed symbol instance), not of the component object itself. `comp->??` won't show these. Use `comp->symbol->isMirrored`, `comp->symbol->layer`, etc.
+
+## `PACKAGE_HEIGHT_MAX` lives on place_bound shapes, not components
+Component height is stored as a property on the PLACE_BOUND_TOP or PLACE_BOUND_BOTTOM shape child of the symbol, not on the component or symbol directly. To find it: iterate `comp->symbol->children`, find shapes on `PACKAGE GEOMETRY/PLACE_BOUND_*` layers, then call `axlDBGetProperties(child nil)` and look for `'PACKAGE_HEIGHT_MAX`.
+
+## `axlVisibleLayer`/`axlVisibleDesign` don't reliably update the display
+`axlVisibleLayer`, `axlVisibleDesign`, `axlVisibleSet`, and `axlVisibleUpdate(t)` modify internal visibility state but often fail to visually update the canvas. The reliable way to change layer visibility is to write a `.color` file and load it with `axlShellPost("colorview load myfile.color")`. The `.color` file format uses shell-style commands:
+```
+color -globvis off
+color -vis "ETCH/TOP"
+color -vis "PIN/TOP"
+```
+Use `color -globvis off` to turn everything off, then `color -vis "CLASS/SUBCLASS"` for each layer to enable. See examples in `c:/cadence/spb_23.1/share/pcb/toolbox/getting_started/mfgdoc/`.
