@@ -71,7 +71,7 @@ SKILL is Lisp-based. Key syntax:
 
 ## SKILL Pitfalls
 
-Common mistakes when writing SKILL code are stored in `{{ALLEGRO_CLAUDE_PATH}}/LESSONS.md`. **Review these before emitting `<allegro_execute>` blocks.** Update the file as you learn new unituitive behaviors.
+Common mistakes when writing SKILL code are stored in `$ALLEGRO_CLAUDE_PATH/LESSONS.md`. **Review these before emitting `<allegro_execute>` blocks.** Update the file as you learn new unituitive behaviors.
 
 ## Common Allegro Commands (Shell Interface)
 
@@ -89,9 +89,9 @@ These commands expect user interaction (point picks, etc.) and are best handled 
 
 ## Reference Documentation
 
-Cadence HTML documentation is installed at `{{CADENCE_DOC_PATH}}`. You can read these files directly to look up function signatures, command syntax, design concepts, and DRC rules. Use targeted file reads -- don't try to read entire directories.
+Cadence HTML documentation is installed at `$ALLEGRO_INSTALL_ROOT/doc`. You can read these files directly to look up function signatures, command syntax, design concepts, and DRC rules. Use targeted file reads -- don't try to read entire directories.
 
-All paths in this section are relative to `{{CADENCE_DOC_PATH}}/`.
+All paths in this section are relative to `$ALLEGRO_INSTALL_ROOT/doc/`.
 
 ### Looking Up SKILL Functions
 
@@ -162,9 +162,9 @@ Every Allegro command has an HTML page in a letter-coded directory (`acoms/` thr
 - DFM/DRC rules in `dfmcons/` are named descriptively: `Annular_Ring.html`, `Acid_Traps_Angle.html`
 - When unsure which directory holds a topic, check the relevant JSON TOC or search HTML filenames
 
-### SKILL Examples and Sample Data
+## SKILL Examples and Sample Data
 
-Working examples are at `{{CADENCE_EXAMPLES_PATH}}`. These are real, runnable SKILL code -- consult them when writing unfamiliar code patterns.
+Working examples are at `$ALLEGRO_INSTALL_ROOT/share/pcb/examples`. These are real, runnable SKILL code -- consult them when writing unfamiliar code patterns.
 
 **SKILL examples** (`skill/` subdirectory):
 
@@ -191,3 +191,62 @@ Working examples are at `{{CADENCE_EXAMPLES_PATH}}`. These are real, runnable SK
 | `board_design/` | Sample board files (`cds_routed.brd`) with symbols and device libraries |
 | `stackups/` | Standard stackup tech files: 4, 6, 8, 10, 18, and 32-layer |
 | `padstack_xml/` | XML padstack definitions (SMD, through-hole, via) |
+
+## Allegro Configuration & Resources
+
+Allegro's global configuration directory is at `$ALLEGRO_INSTALL_ROOT/share/pcb/text`. These files control environment setup, define commands and menus, and contain reference data for materials, units, file types, and more. Use targeted file reads.
+
+All paths in this section are relative to `$ALLEGRO_INSTALL_ROOT/share/pcb/text/`.
+
+**Environment & Startup:**
+
+| File | What's There |
+|------|--------------|
+| `env` | **Master environment file.** All search paths (PADPATH, PSMPATH, TECHPATH, etc.), function key aliases (F2=zoom fit, F3=add connect, F6=done, F8=oops, etc.), mouse wheel bindings, display variables. Read this to understand how Allegro resolves files and what shortcuts exist |
+| `env_local.txt` | Template for user local environment overrides |
+| `fileops.txt` | Every file type Allegro uses: extensions, search path variables, descriptions. Essential for understanding how files are resolved |
+| `units.dat` | Unit definitions and conversion chains (mil, mm, um, ohm, pF, ns, etc.). Database units vs display units |
+
+**Commands & Menus:**
+
+| File | What's There |
+|------|--------------|
+| `cuimenus/allegro.men` | **Complete menu structure** mapping every menu item to its Allegro command string. Uses `#ifdef` for product tiers. Do NOT modify -- use `axlUIMenuRegister()` in SKILL instead |
+| `workflows/workflow.xml` | Standard PCB design flow (Setup -> Placement -> Routing -> Manufacturing) with exact command strings for each step |
+| `script/*.scr` | Allegro command-line scripts (not SKILL). Show `setwindow`, `FORM mini`, `fillin`, `replay` patterns |
+
+**Materials & Stackup:**
+
+| File | What's There |
+|------|--------------|
+| `materials.dat` | 74 PCB materials with electrical conductivity, dielectric constant, loss tangent, thickness. Includes FR-4, polyimide, copper, surface finishes (ENIG, ENEPIG, etc.) |
+| `tech/tech_sample.tech` | Complete sample technology file in S-expression format: units, cross-section (layer stackup), spacing rules, routing widths, via definitions |
+| `xsectionChartParams.txt` | Cross-section chart display columns and scale |
+| `xsectionTableParams.txt` | Stackup table output format and units |
+
+**Forms & Views:**
+
+| File | What's There |
+|------|--------------|
+| `forms/*.form` | ~1,366 form definitions for every Allegro dialog. Field names here are what SKILL uses with `axlFormSetField`/`axlFormGetField` |
+| `views/*.txt` | Database field names for extract/report commands. `comp_bv.txt` (component fields), `net_bv.txt` (net fields), `layer_bv.txt` (layer fields), `drc_rep.txt` (DRC fields), `bom_rep.txt` (BOM fields) |
+
+**Manufacturing & Export:**
+
+| File | What's There |
+|------|--------------|
+| `nclegend/*.dlt` | Drill legend templates (column definitions, hole figure symbols, units) |
+| `IPC2581_LayerMappingCfg.txt` | Maps Allegro film names to IPC-2581 layer categories |
+| `ecad_mcad*.cnv` | Class/subclass to IDX layer mapping for MCAD collaboration |
+| `export/SingleExportConfig.json` | Default export configurations (Gerber, IPC-2581, PDF) |
+
+**Other Reference:**
+
+| File | What's There |
+|------|--------------|
+| `pinOneCfg.txt` | Pin identifiers recognized as pin one (`1`, `A1`, `A`, `POS`, `CATHODE`, etc.) |
+| `allegro_192.col` | 192-color palette (color index -> RGB). Needed for SKILL display/visibility code |
+| `spmh*.xml` | Error/warning/info messages organized by module. `spmhsk.xml` has SKILL-specific messages. Messages include extended descriptions with root causes and resolutions |
+| `allegro_smi_modules.txt` | Maps module names to spmh XML files |
+| `README_CCR.txt` | All bug fixes across SPB 23.1 hotfixes -- useful for troubleshooting known issues |
+

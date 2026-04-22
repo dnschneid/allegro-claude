@@ -326,19 +326,16 @@ procedure(ACL_setStatus(text)
     axlFormSetField(ACL_form "statuslabel" text)))
 
 procedure(ACL_buildSystemPrompt()
-  ; Read the PROMPT.md template, substitute {{CADENCE_DOC_PATH}} and
-  ; {{CADENCE_EXAMPLES_PATH}} with actual Cadence directories, and
-  ; return the result.
+  ; Read the PROMPT.md template, substitute $ALLEGRO_INSTALL_ROOT and
+  ; $ALLEGRO_CLAUDE_PATH with actual directories, and return the result.
   let((template installRoot re)
     template = ACL_readFile(strcat(ACL_scriptDir "PROMPT.md"))
-    re = pcreCompile("\\{\\{ALLEGRO_CLAUDE_PATH\\}\\}")
+    re = pcreCompile("[$]ALLEGRO_CLAUDE_PATH")
     template = pcreReplace(re template ACL_scriptDir 0)
     ; Inject Cadence paths from allegro_install_root
     installRoot = ACL_normPath(axlGetVariable("allegro_install_root"))
-    re = pcreCompile("\\{\\{CADENCE_DOC_PATH\\}\\}")
-    template = pcreReplace(re template strcat(installRoot "/doc") 0)
-    re = pcreCompile("\\{\\{CADENCE_EXAMPLES_PATH\\}\\}")
-    template = pcreReplace(re template strcat(installRoot "/share/pcb/examples") 0)
+    re = pcreCompile("[$]ALLEGRO_INSTALL_ROOT")
+    template = pcreReplace(re template installRoot 0)
     when(ACL_isWindows
       template = strcat(template "\n\n"
         "## Output Encoding\n\n"
