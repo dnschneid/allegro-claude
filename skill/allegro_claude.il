@@ -243,6 +243,7 @@ defvar(ACL_rejectRe  pcreCompile("^\\s*reject\\s*$"  pcreGenCompileOptBits(?case
 defvar(ACL_homeDir      strcat(or(getShellEnvVar("HOME") getShellEnvVar("USERPROFILE")) "/.allegro_claude"))
 defvar(ACL_sessionsFile strcat(ACL_homeDir "/sessions.json"))
 defvar(ACL_logDir       strcat(ACL_homeDir "/logs"))
+defvar(ACL_sessionLogDir ACL_logDir)
 
 defvar(ACL_scriptDir
   ACL_normPath(pcreReplace(pcreCompile("[^/\\\\]+$")
@@ -268,11 +269,6 @@ procedure(ACL_logWrite(text)
   ; Count newlines in appended text
   let((i) for(i 1 strlen(text)
     when(substring(text i 1) == "\n" ACL_logLineCount++)))
-  ; Write to backing file (full history)
-  when(ACL_logFile
-    let((fp)
-      fp = outfile(ACL_logFile "a")
-      when(fp fprintf(fp "%s" text) close(fp))))
   ; Update form field (truncated to last N lines, with char limit backstop)
   when(ACL_form
     let((display)
@@ -306,20 +302,17 @@ procedure(ACL_lastNLines(text n)
 procedure(ACL_logReset()
   ACL_logContent = ""
   ACL_logLineCount = 0
-  when(ACL_form axlFormSetField(ACL_form "chatlog" ""))
-  when(ACL_logFile
-    let((fp) fp = outfile(ACL_logFile) when(fp close(fp)))))
+  when(ACL_form axlFormSetField(ACL_form "chatlog" "")))
 
 procedure(ACL_showFullLog()
   ; Write full log to file and open in a viewer window
-  unless(ACL_logFile
-    ACL_logFile = sprintf(nil "%s/acl_log.txt" getTempDir()))
-  let((fp)
-    fp = outfile(ACL_logFile)
+  let((logfile fp)
+    logfile = strcat(ACL_sessionLogDir "/log.txt")
+    fp = outfile(logfile)
     when(fp
       fprintf(fp "%s" ACL_logContent)
-      close(fp)))
-  axlUIViewFileCreate(ACL_logFile "Claude - Full Log" nil '(50 120) nil ACL_form))
+      close(fp)
+    axlUIViewFileCreate(logfile "Claude - Full Log" nil '(50 120) nil ACL_form))))
 
 procedure(ACL_setStatus(text)
   when(ACL_form
@@ -392,7 +385,7 @@ procedure(ACL_getBoardSessions(boardPath)
 procedure(ACL_startClaude(@optional resumeId fork)
   let((cmd promptFile fp installRoot projectDir args)
     ACL_stopClaude()
-    promptFile = ACL_normPath(sprintf(nil "%s/acl_prompt.md" getTempDir()))
+    promptFile = ACL_normPath(strcat(ACL_homeDir "/PROMPT.md"))
     fp = outfile(promptFile)
     when(fp
       fprintf(fp "%s" ACL_buildSystemPrompt())
@@ -431,7 +424,7 @@ procedure(ACL_startClaude(@optional resumeId fork)
         axlFlushDisplay()))
     ipcWaitForProcess(ACL_claude)
     unless(and(ACL_claude ipcIsAliveProcess(ACL_claude))
-      ACL_setStatus("Failed to start Claude")
+      ACL_setStatus("Failed to initialize!")
       printf("*Error* ACL: claude process failed to start. Command: %s\n" cmd))))
 
 procedure(ACL_stopClaude()
@@ -490,7 +483,11 @@ procedure(ACL_processStreamLine(line)
     ; Capture session ID from any event
     sid = ACL_jGet(parsed "session_id")
     when(and(sid sid != ACL_sessionId)
-      ACL_sessionId = sid)
+      ACL_sessionId = sid
+      ACL_sessionLogDir = strcat(ACL_logDir "/" ACL_sessionId)
+      createDir(ACL_logDir)
+      createDir(ACL_sessionLogDir)
+    )
     cond(
       ; System events (init, api_retry, etc.)
       (etype == "system"
@@ -717,12 +714,9 @@ procedure(ACL_checkFuncDocs(code)
 procedure(ACL_logCmd(code)
   ; Log command to file for reference.
   when(ACL_sessionId
-    errset(let((logDir fp)
+    errset(let((fp)
       ACL_cmdSeq++
-      logDir = strcat(ACL_logDir "/" ACL_sessionId)
-      createDir(ACL_logDir)
-      createDir(logDir)
-      fp = outfile(sprintf(nil "%s/cmd_%06d.il" logDir ACL_cmdSeq))
+      fp = outfile(sprintf(nil "%s/cmd_%06d.il" ACL_sessionLogDir ACL_cmdSeq))
       when(fp fprintf(fp "%s\n" code) close(fp))))))
 
 ; ============================================================
@@ -854,12 +848,12 @@ procedure(ACL_toggleRecording(form)
       when(strlen(contents) > 0
         ACL_handleJournal(contents)))
   else
-    ACL_journalFile = sprintf(nil "%s/acl_journal.scr" getTempDir())
+    ACL_journalFile = strcat(ACL_sessionLogDir "/journal.scr")
     axlJournal(ACL_journalFile)
     ACL_recording = t
     axlFormSetField(form "record" "Done")
     ACL_appendChat(
-      "Recording... Perform the action in Allegro, then click Done.")
+      "\n\nRecording... Perform the action in Allegro, then click Done.")
     ACL_setStatus("Recording macro...")))
 
 ; ============================================================
@@ -925,7 +919,7 @@ procedure(ACL_handleReject()
   ACL_setStatus("Ready"))
 
 procedure(ACL_handleJournal(contents)
-  ACL_setStatus("Analyzing recording...")
+  ACL_setStatus("Analyzing...")
   ACL_responseBuf = ""
   ACL_sendMessage(strcat(
     "The user recorded this Allegro macro/journal:\n\n```\n"
@@ -983,14 +977,14 @@ procedure(ACL_handleNewSession()
     ?isSynthetic t))
 
 procedure(ACL_handleRestoreSession(sid)
-  let((info logDir files)
+  let((info files)
     info = ACL_getSession(sid)
     if(info then
       ACL_sessionId = sid
+      ACL_sessionLogDir = strcat(ACL_logDir "/" ACL_sessionId)
       ; Find highest existing command sequence number
-      logDir = strcat(ACL_logDir "/" sid)
       ACL_cmdSeq = 0
-      files = errset(getDirFiles(logDir))
+      files = errset(getDirFiles(ACL_sessionLogDir))
       when(and(files car(files))
         foreach(f car(files)
           let((m)
