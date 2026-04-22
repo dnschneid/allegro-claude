@@ -93,15 +93,21 @@ procedure(ACL_jUnescape(s)
     out))
 
 procedure(ACL_jParseNum(str pos)
-  let((start c)
+  let((start c numStr digits)
     start = pos
-    ; A JSON number ends at whitespace or a structural character.
     c = substring(str pos 1)
     while(and(c null(nindex(" \t\n\r,]}" c)))
       pos++
       c = substring(str pos 1))
     when(pos > start
-      list(evalstring(substring(str start pos - start)) pos))))
+      numStr = substring(str start pos - start)
+      digits = if(substring(numStr 1 1) == "-" (strlen(numStr) - 1) strlen(numStr))
+      when(and(digits > 9
+               null(nindex(numStr "."))
+               null(nindex(numStr "e"))
+               null(nindex(numStr "E")))
+        numStr = strcat(numStr ".0"))
+      list(evalstring(numStr) pos))))
 
 procedure(ACL_jParseLit(str pos word value)
   when(substring(str pos strlen(word)) == word
