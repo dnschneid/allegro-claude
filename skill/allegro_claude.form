@@ -7,35 +7,34 @@ FILE_TYPE=FORM_DEFN VERSION=2
 
 FORM FIXED_FONT
 FIXED
-PORT 80 40
+PORT 80 60
 HEADER "Claude AI Assistant"
 
 DEFAULT send
 
 POPUP <MODE>"Auto""auto","Instant""instant","Batch""batch","Teach""teach".
-POPUP <EFFORT>"low""low","medium""medium","high""high","max""max".
 
 TILE
 
 FIELD chatlog
 FLOC 0 0
-STRFILLIN 78 65536
-FSIZE 78 28
+STRFILLIN 46 65536
+FSIZE 46 28
 INFO_ONLY
 ENDFIELD
 
 TEXT "Ready"
 FLOC 0 29
-INFO statuslabel 55
+INFO statuslabel 33
 OPTIONS border
 ENDTEXT
 
 TEXT "Lines:"
-FLOC 63 29
+FLOC 34 29
 ENDTEXT
 
 FIELD loglines
-FLOC 64 29
+FLOC 35 29
 LONGFILLIN 5 5
 MIN 1
 MAX 99
@@ -43,51 +42,45 @@ ENDFIELD
 
 FIELD userinput
 FLOC 0 31
-STRFILLIN 62 4096
+STRFILLIN 34 65536
 ENDFIELD
 
 FIELD send
-FLOC 63 31
-MENUBUTTON "Send" 15 2
-ENDFIELD
-
-FIELD mode
-FLOC 0 33
-ENUMSET 12
-POP "MODE"
-ENDFIELD
-
-FIELD effort
-FLOC 13 33
-ENUMSET 12
-POP "EFFORT"
+FLOC 34 31
+MENUBUTTON "Send" 12 2
 ENDFIELD
 
 FIELD record
-FLOC 26 33
+FLOC 0 33
 MENUBUTTON "Record" 12 2
 ENDFIELD
 
-FIELD context
-FLOC 39 33
-MENUBUTTON "Context" 10 2
-ENDFIELD
-
-FIELD fulllog
-FLOC 50 33
-MENUBUTTON "Full Log" 11 2
+FIELD mode
+FLOC 12 33
+ENUMSET 3
+POP "MODE"
 ENDFIELD
 
 FIELD session
-FLOC 63 33
-MENUBUTTON "Session..." 15 2
+FLOC 22 33
+MENUBUTTON "Session..." 12 2
 ENDFIELD
 
-ENDTILE
+FIELD fulllog
+FLOC 34 33
+MENUBUTTON "Full Log" 12 2
+ENDFIELD
 
-FLEXMODE edgegravity
+# NOTE: none of these seem to take effect other than to enable resizing.
+#       the detailed parameters are just ignored
 FLEX chatlog 0 0 1 1
-FLEX userinput 0 0 1 0
-FLEX statuslabel 0 0 1 0
+FLEX statuslabel 0 1 1 0
+FLEX userinput 0 1 1 0
+FLEX send 1 1 0 0
+FLEX mode 0 1 0 0
+FLEX session 1 1 0 0
+FLEXMODE StandButtons
+
+ENDTILE
 
 ENDFORM

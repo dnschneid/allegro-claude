@@ -214,7 +214,6 @@ defvar(ACL_logCodeLimit 250)       ; max chars for each code preview
 defvar(ACL_sessionId nil)
 defvar(ACL_sessionSaved nil)       ; true after first successful reply
 defvar(ACL_mode "auto")
-defvar(ACL_effort "medium")
 defvar(ACL_lineBuf "")
 defvar(ACL_responseBuf "")
 defvar(ACL_displayBuf "")
@@ -416,7 +415,7 @@ procedure(ACL_startClaude(@optional resumeId fork)
       "--add-dir" ACL_shellQuote(ACL_scriptDir)
       "--add-dir" ACL_shellQuote(projectDir)
       "--allowedTools" ACL_shellQuote("Edit(*/LESSONS.md)")
-      "--effort" ACL_effort)
+      "--model" "opus[1m]")
     when(resumeId
       args = append1(args "--resume")
       args = append1(args resumeId)
@@ -802,15 +801,8 @@ procedure(ACL_formCB(form)
       (field == "mode"
         ACL_mode = val
         ACL_setStatus(sprintf(nil "Mode: %s" val)))
-      (field == "effort"
-        ACL_effort = val
-        when(and(ACL_claude ipcIsAliveProcess(ACL_claude))
-          ACL_sendMessage(sprintf(nil "/effort %s" val) ?isSynthetic t ?noQuery t))
-        ACL_setStatus(sprintf(nil "Effort: %s" val)))
       (field == "record"
         ACL_toggleRecording(form))
-      (field == "context"
-        ACL_sendMessage("/compact" ?isSynthetic t ?noQuery t))
       (field == "fulllog"
         ACL_showFullLog())
       (field == "loglines"
@@ -1044,7 +1036,6 @@ procedure(ACL_openPanel()
     when(ACL_form
       axlFormDefaultButton(ACL_form "send")
       axlFormSetField(ACL_form "mode" "auto")
-      axlFormSetField(ACL_form "effort" "medium")
       axlFormSetField(ACL_form "loglines" sprintf(nil "%d" ACL_logLineLimit))
       axlFormSetField(ACL_form "statuslabel" "Starting...")
       axlFormDisplay(ACL_form)
@@ -1239,16 +1230,12 @@ procedure(ACL_runTests()
     ipcKillProcess(proc))
 
   printf("\n--- Claude Process ---\n")
-  let((claudeExists savedEffort)
+  let((claudeExists)
     claudeExists = errset(system(
       if(ACL_isWindows "where claude >NUL 2>&1"
         "env -u LD_LIBRARY_PATH which claude > /dev/null 2>&1")))
     if(and(claudeExists car(claudeExists) == 0) then
-      ; Use sonnet for faster test response
-      savedEffort = ACL_effort
-      ACL_effort = "low"
       ACL_startClaude()
-      ACL_effort = savedEffort
       ACL_check("claude start" and(ACL_claude ipcIsAliveProcess(ACL_claude) t) t)
       ; End-to-end: send message and wait for response via ipcSleep
       ; ipcSleep processes handlers while waiting
