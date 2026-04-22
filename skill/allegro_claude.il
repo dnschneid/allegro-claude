@@ -988,13 +988,13 @@ procedure(ACL_handleUserMessage(text)
       if(and(ACL_lastCmdTime elapsed > 60)
         "[The board may have been edited. Re-query the design instead of relying on memory.] "
         "")
-      "[ALWAYS CHECK CADENCE DOCUMENTATION BEFORE EXECUTING OR REPLYING]"
       if(ACL_mode == "manual"
         " [MANUAL MODE: List all commands you would execute as <allegro_execute> blocks. I will review and approve first.]"
         ""))
     userUuid = sprintf(nil "user%d" ACL_promptId)
     ; Send system prefix as synthetic (not displayed, no response generated)
-    ACL_sendMessage(prefix ?isSynthetic t ?noQuery t)
+    (when (strlen(prefix) > 0)
+      ACL_sendMessage(prefix ?isSynthetic t ?noQuery t))
     ; Send user's actual message
     ACL_sendMessage(text ?uuid userUuid)
     ; Start polling for input changes (if enabled)
@@ -1075,6 +1075,31 @@ procedure(ACL_handleNewSession()
   ACL_startClaude()
   ACL_appendChat("Starting new session...")
   ACL_setStatus("Starting...")
+  ; Preloading all Allegro documentation for significantly better accuracy.
+  ; Generating the docs can take an hour. Loaded docs consumes ~200k tokens of context.
+  let((doc)
+    doc = strcat(
+      ACL_notesDir "/SPB" pcreReplace(pcreCompile("[^\\w]") axlVersion('fullVersion) "_" 0) ".md")
+    ACL_sendMessage(strcat("[Do the following **totally silently in the background**: "
+      "Read **all** of `" doc "` into your context. It is very large and requires reading in "
+      "chunks -- just do it, no narration, no status updates. "
+      "If the file does not exist yet: "
+      "1. Briefly apologize that you need to pre-read the Allegro documentation, and provide "
+      "extremely succinct progress updates (a few words at most) as you do it. "
+      "2. Spawn sub-agents (aim for <25 functions each) to thoroughly read through *all* of the "
+      "Allegro documentation you have access to and accumulate that knowledge into `" doc "` "
+      "with extensive detail, sufficient to be able to reliably use every single API and interface "
+      "on your first try, as well as understand and apply topics, concepts, and usages covered in "
+      "more free-form documentation and examples. "
+      "The agents should take extra time to ensure complete coverage of all of the interfaces "
+      "enumerated in TOCs, and take special note of things that were omitted from the TOC. "
+      "The agents should write incrementally to avoid timing out on large writes. "
+      "This may take an hour and should result in a large file. "
+      "3. Once ready, read the entirety of `" doc "` into your context. "
+      "4. Clean up any remaining sub-agent files. "
+      "Until all this is complete, **be very careful to check documentation** manually before "
+      "responding to queries, and warn the user that you haven't completed your survey yet.]")
+      ?isSynthetic t))
   ACL_sendMessage(sprintf(nil "Current board: %L\nSay hello" axlGetDrawingName())
     ?isSynthetic t))
 
