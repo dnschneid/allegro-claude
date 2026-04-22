@@ -951,7 +951,7 @@ procedure(ACL_handleJournal(contents)
 ; ============================================================
 
 procedure(ACL_handleSessionPick()
-  let((sessions labels sids choice sid board)
+  prog((sessions labels sids choice sid board)
     unless(axlGetDrawingName()
       ACL_appendChat("No board file loaded.")
       return(nil))
@@ -973,7 +973,7 @@ procedure(ACL_handleSessionPick()
       sessions)
     labels = cons("New session" labels)
     choice = axlUIMultipleChoice("Select a session" labels "Claude Sessions")
-    when(choice
+    when(and(choice choice >= 0)
       if(choice == 0 then
         ACL_handleNewSession()
       else
@@ -1011,7 +1011,7 @@ procedure(ACL_handleRestoreSession(sid)
       ACL_logReset()
       ACL_startClaude(sid)
       ACL_appendChat(sprintf(nil "Restored session: %s" sid))
-      ACL_setStatus("Resuming...")
+      ACL_setStatus("Ready")
     else
       ACL_appendChat(sprintf(nil "Session not found: %s" sid)))))
 
@@ -1022,6 +1022,7 @@ procedure(ACL_handleForkSession(sid)
       ACL_appendChat(sprintf(nil "Session not found: %s" sid))
       return(nil))
     oldBoard = or(ACL_jGet(info "board") "unknown")
+    ACL_logReset()
     ACL_startClaude(sid t)
     ACL_responseBuf = ""
     ACL_sendMessage(sprintf(nil
@@ -1050,6 +1051,11 @@ procedure(ACL_openPanel()
       axlFormSetActiveField(ACL_form "userinput")
       if(ACL_sessionId then
         ACL_ensureClaude()
+        ; Redisplay existing log and status after window reopen
+        when(strlen(ACL_logContent) > 0
+          axlFormSetField(ACL_form "chatlog" ACL_logContent))
+        ACL_setStatus(if(and(ACL_claude ipcIsAliveProcess(ACL_claude))
+          "Ready" "Starting..."))
       else
         let((sessions board)
           board = axlGetDrawingName()
