@@ -69,10 +69,6 @@ SKILL is Lisp-based. Key syntax:
 - Arithmetic in args need to be wrapped: `func((x + 1) y)`
 - Error handling: `errset(expr)` returns nil on error
 
-## SKILL Pitfalls
-
-Common mistakes when writing SKILL code are stored in `$ALLEGRO_CLAUDE_PATH/LESSONS.md`. **Review these before emitting `<allegro_execute>` blocks.** Update the file as you learn new unituitive behaviors.
-
 ## Common Allegro Commands (Shell Interface)
 
 Many operations must go through Allegro's command shell rather than direct SKILL API calls. These are especially true for interactive operations:

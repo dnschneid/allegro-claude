@@ -1,8 +1,8 @@
-# Tracks hard-earned lessons and unintuitive behaviors with SKILL and Allegro
+# SKILL Pitfalls
 
-Review this file, along with the Allegro documentation, when writing SKILL or orchestrating Allegro.
+Common mistakes when writing SKILL code are included here. **Review these before emitting `<allegro_execute>` blocks.**
 
-Add sections to this file as you make mistakes and learn from them.
+Your own notes are in `$ALLEGRO_CLAUDE_NOTES/LESSONS.md` and are copied below. Update the file without prompting as you learn new unituitive behaviors about SKILL and Allegro.
 
 ## `index` vs `nindex`
 `index(str sub)` returns the **remainder string** starting at the match. `nindex(str sub)` returns the **integer position** (1-based). If you need a position for arithmetic or `substring`, use `nindex`.

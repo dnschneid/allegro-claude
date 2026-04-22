@@ -241,6 +241,7 @@ defvar(ACL_approveRe pcreCompile("^\\s*approve\\s*$" pcreGenCompileOptBits(?case
 defvar(ACL_rejectRe  pcreCompile("^\\s*reject\\s*$"  pcreGenCompileOptBits(?caseLess t)))
 
 defvar(ACL_homeDir      strcat(or(getShellEnvVar("HOME") getShellEnvVar("USERPROFILE")) "/.allegro_claude"))
+defvar(ACL_notesDir       strcat(ACL_homeDir "/notes"))
 defvar(ACL_sessionsFile strcat(ACL_homeDir "/sessions.json"))
 defvar(ACL_logDir       strcat(ACL_homeDir "/logs"))
 defvar(ACL_sessionLogDir ACL_logDir)
@@ -248,6 +249,7 @@ defvar(ACL_sessionLogDir ACL_logDir)
 defvar(ACL_scriptDir
   ACL_normPath(pcreReplace(pcreCompile("[^/\\\\]+$")
     simplifyFilename(get_filename(piport)) "" 0)))
+
 ; ============================================================
 ; 4. Utilities
 ; ============================================================
@@ -323,12 +325,16 @@ procedure(ACL_buildSystemPrompt()
   ; $ALLEGRO_CLAUDE_PATH with actual directories, and return the result.
   let((template installRoot re)
     template = ACL_readFile(strcat(ACL_scriptDir "PROMPT.md"))
-    re = pcreCompile("[$]ALLEGRO_CLAUDE_PATH")
-    template = pcreReplace(re template ACL_scriptDir 0)
-    ; Inject Cadence paths from allegro_install_root
-    installRoot = ACL_normPath(axlGetVariable("allegro_install_root"))
+    template = strcat(template "\n\n" ACL_readFile(strcat(ACL_scriptDir "LESSONS.md")))
+    when(isFile(strcat(ACL_notesDir "/LESSONS.md"))
+      template = strcat(template "\n\n" ACL_readFile(strcat(ACL_notesDir "/LESSONS.md"))))
+    ; Inject paths
+    re = pcreCompile("[$]ALLEGRO_CLAUDE_NOTES")
+    template = pcreReplace(re template ACL_notesDir 0)
     re = pcreCompile("[$]ALLEGRO_INSTALL_ROOT")
+    installRoot = ACL_normPath(axlGetVariable("allegro_install_root"))
     template = pcreReplace(re template installRoot 0)
+    ; Platform-specific
     when(ACL_isWindows
       template = strcat(template "\n\n"
         "## Output Encoding\n\n"
@@ -355,7 +361,6 @@ procedure(ACL_loadSessions()
 
 procedure(ACL_saveSessions(sessions)
   let((tmp fp)
-    createDir(ACL_homeDir)
     tmp = sprintf(nil "%s.tmp.%d" ACL_sessionsFile stringToTime(getCurrentTime()))
     fp = outfile(tmp)
     when(fp
@@ -385,6 +390,8 @@ procedure(ACL_getBoardSessions(boardPath)
 procedure(ACL_startClaude(@optional resumeId fork)
   let((cmd promptFile fp installRoot projectDir args)
     ACL_stopClaude()
+    createDir(ACL_homeDir)
+    createDir(ACL_notesDir)
     promptFile = ACL_normPath(strcat(ACL_homeDir "/PROMPT.md"))
     fp = outfile(promptFile)
     when(fp
@@ -404,11 +411,12 @@ procedure(ACL_startClaude(@optional resumeId fork)
       "--replay-user-messages"
       "--append-system-prompt-file" ACL_shellQuote(promptFile)
       "--add-dir" ACL_shellQuote(installRoot)
+      "--add-dir" ACL_shellQuote(ACL_homeDir)
       "--add-dir" ACL_shellQuote(ACL_scriptDir)
       "--add-dir" ACL_shellQuote(siteDir)
       "--add-dir" ACL_shellQuote(pcbenvDir)
       "--add-dir" ACL_shellQuote(projectDir)
-      "--allowedTools" ACL_shellQuote("Edit(*/LESSONS.md)")
+      "--allowedTools" ACL_shellQuote(strcat("Edit(" ACL_notesDir "/*)"))
       "--model" "opus[1m]")
     when(resumeId
       args = append1(args "--resume")
