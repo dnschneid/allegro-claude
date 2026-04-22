@@ -577,10 +577,13 @@ procedure(ACL_processStreamLine(line)
                 ACL_drainDisplayBuf()
                 when(content
                   ACL_appendChat(sprintf(nil "\nYou: %s" content))))
-              (t
+              (substring(uuid 1 4) != "user"
                 when(content
-                  ACL_setStatus(pcreReplace(
-                    pcreCompile("<[^>]+>") content "" 0))))))))
+                  let((stripped)
+                    stripped = pcreReplace(
+                      pcreCompile("<[^>]+>") content "" 0)
+                    ACL_setStatus(stripped)
+                    ACL_appendChat(sprintf(nil "\n[%s]" stripped)))))))))
       ; Result (response complete)
       (etype == "result"
         ACL_flushDisplay()
