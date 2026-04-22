@@ -36,6 +36,8 @@ For Claude (we're using the streaming json interface of the CLI), it's best to s
 
 ### Running tests
 
+You should always test the script after making edits, and add tests as you discover bugs and add features.
+
 Claude runs in a sandbox and cannot launch Allegro or use the Claude CLI, so follow this section carefully to run tests.
 
  * In general, robust tests should be added to `ACL_runTests()` so that they can be run as a regression suite.

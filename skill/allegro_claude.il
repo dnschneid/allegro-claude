@@ -247,7 +247,6 @@ defvar(ACL_logDir       strcat(ACL_homeDir "/logs"))
 defvar(ACL_scriptDir
   ACL_normPath(pcreReplace(pcreCompile("[^/\\\\]+$")
     simplifyFilename(get_filename(piport)) "" 0)))
-
 ; ============================================================
 ; 4. Utilities
 ; ============================================================
@@ -339,7 +338,14 @@ procedure(ACL_buildSystemPrompt()
     re = pcreCompile("\\{\\{CADENCE_DOC_PATH\\}\\}")
     template = pcreReplace(re template strcat(installRoot "/doc") 0)
     re = pcreCompile("\\{\\{CADENCE_EXAMPLES_PATH\\}\\}")
-    pcreReplace(re template strcat(installRoot "/share/pcb/examples") 0)))
+    template = pcreReplace(re template strcat(installRoot "/share/pcb/examples") 0)
+    when(ACL_isWindows
+      template = strcat(template "\n\n"
+        "## Output Encoding\n\n"
+        "**Only use ASCII characters in responses.** Do not use Unicode "
+        "characters such as curly quotes, em dashes, bullets, or other "
+        "non-ASCII glyphs. Use straight quotes, `--`, and `*` instead."))
+    template))
 
 procedure(ACL_shellQuote(s)
   if(ACL_isWindows
@@ -387,29 +393,34 @@ procedure(ACL_getBoardSessions(boardPath)
 ; ============================================================
 
 procedure(ACL_startClaude(@optional resumeId fork)
-  let((cmd promptFile fp installRoot)
+  let((cmd promptFile fp installRoot projectDir args)
     ACL_stopClaude()
-    ; Write system prompt to a temp file to avoid shell escaping issues
     promptFile = ACL_normPath(sprintf(nil "%s/acl_prompt.md" getTempDir()))
     fp = outfile(promptFile)
     when(fp
       fprintf(fp "%s" ACL_buildSystemPrompt())
       close(fp))
     installRoot = ACL_normPath(axlGetVariable("allegro_install_root"))
-    cmd = strcat(
+    projectDir = ACL_normPath(pcreReplace(pcreCompile("[^/\\\\]+$")
+      simplifyFilename(axlGetDrawingName()) "" 0))
+    args = list(
       if(ACL_isWindows "claude -p" "env -u LD_LIBRARY_PATH claude -p")
-      " --verbose"
-      " --input-format stream-json"
-      " --output-format stream-json"
-      " --include-partial-messages"
-      " --replay-user-messages"
-      " --append-system-prompt-file " ACL_shellQuote(promptFile)
-      " --add-dir " ACL_shellQuote(installRoot)
-      " --add-dir " ACL_shellQuote(ACL_scriptDir)
-      " --effort " ACL_effort)
+      "--verbose"
+      "--input-format stream-json"
+      "--output-format stream-json"
+      "--include-partial-messages"
+      "--replay-user-messages"
+      "--append-system-prompt-file" ACL_shellQuote(promptFile)
+      "--add-dir" ACL_shellQuote(installRoot)
+      "--add-dir" ACL_shellQuote(ACL_scriptDir)
+      "--add-dir" ACL_shellQuote(projectDir)
+      "--allowedTools" ACL_shellQuote("Edit(*/LESSONS.md)")
+      "--effort" ACL_effort)
     when(resumeId
-      cmd = sprintf(nil "%s --resume %s" cmd resumeId)
-      when(fork cmd = strcat(cmd " --fork-session")))
+      args = append1(args "--resume")
+      args = append1(args resumeId)
+      when(fork args = append1(args "--fork-session")))
+    cmd = buildString(args " ")
     ACL_lineBuf = ""
     ACL_responseBuf = ""
     ACL_displayBuf = ""
