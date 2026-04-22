@@ -93,7 +93,7 @@ procedure(ACL_jUnescape(s)
     out))
 
 procedure(ACL_jParseNum(str pos)
-  let((start c numStr digits)
+  let((start c numStr)
     start = pos
     c = substring(str pos 1)
     while(and(c null(nindex(" \t\n\r,]}" c)))
@@ -101,11 +101,7 @@ procedure(ACL_jParseNum(str pos)
       c = substring(str pos 1))
     when(pos > start
       numStr = substring(str start pos - start)
-      digits = if(substring(numStr 1 1) == "-" (strlen(numStr) - 1) strlen(numStr))
-      when(and(digits > 9
-               null(nindex(numStr "."))
-               null(nindex(numStr "e"))
-               null(nindex(numStr "E")))
+      when(pcreMatchp(ACL_bignumRe numStr)
         numStr = strcat(numStr ".0"))
       list(evalstring(numStr) pos))))
 
@@ -245,6 +241,7 @@ defvar(ACL_tagClose "</allegro_execute>")
 
 defvar(ACL_approveRe pcreCompile("^\\s*approve\\s*$" pcreGenCompileOptBits(?caseLess t)))
 defvar(ACL_rejectRe  pcreCompile("^\\s*reject\\s*$"  pcreGenCompileOptBits(?caseLess t)))
+defvar(ACL_bignumRe  pcreCompile("^-?\\d{10,}$"))
 
 defvar(ACL_homeDir      strcat(or(getShellEnvVar("HOME") getShellEnvVar("USERPROFILE")) "/.allegro_claude"))
 defvar(ACL_notesDir       strcat(ACL_homeDir "/notes"))
