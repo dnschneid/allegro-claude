@@ -231,6 +231,7 @@ defvar(ACL_hadToolUse nil)       ; true if tool_use occurred since last text blo
 defvar(ACL_execQueue nil)        ; queued exec blocks for deferred execution
 defvar(ACL_execTimer nil)        ; one-shot timer for deferred exec
 defvar(ACL_promptId 1)            ; counter for message UUIDs
+defvar(ACL_synthId 0)             ; counter for synthetic message UUIDs
 defvar(ACL_pendingInput nil)      ; text being sent (nil = not queued)
 defvar(ACL_autoUpdateInput nil)   ; t to enable auto-polling of input edits
 
@@ -461,6 +462,9 @@ procedure(ACL_sendMessage(text @key (uuid nil) (isSynthetic nil) (noQuery nil))
         list("message" list(
           list("role" "user")
           list("content" text))))
+      when(and(isSynthetic null(uuid))
+        ACL_synthId++
+        uuid = sprintf(nil "synth%d" ACL_synthId))
       when(uuid pairs = append(pairs list(list("uuid" uuid))))
       when(isSynthetic pairs = append(pairs list(list("isSynthetic" t))))
       when(noQuery pairs = append(pairs list(list("shouldQuery" 'false))))
@@ -555,24 +559,28 @@ procedure(ACL_processStreamLine(line)
                 when(text
                   ACL_responseBuf = strcat(ACL_responseBuf text)
                   ACL_streamToDisplay(text)))))))
-      ; Replayed user messages (from --replay-user-messages)
-      (and((etype == "user") ACL_autoUpdateInput)
+      ; Replayed messages: skip synthetic, show everything else
+      (etype == "user"
         let((uuid msg content)
           uuid = or(ACL_jGet(parsed "uuid") "")
           msg = ACL_jGet(parsed "message")
           content = when(msg ACL_jGet(msg "content"))
-          cond(
-            ; Only show user messages
-            ((substring(uuid 1 4) == "user")
-              ACL_promptId++
-              ACL_pendingInput = nil
-              when(ACL_form
-                axlFormSetField(ACL_form "userinput" "")
-                axlFormSetField(ACL_form "send" "Send")
-                axlFormSetActiveField(ACL_form "userinput"))
-              ACL_drainDisplayBuf()
-              when(content
-                ACL_appendChat(sprintf(nil "\nYou: %s" content)))))))
+          unless(substring(uuid 1 5) == "synth"
+            cond(
+              (and(ACL_autoUpdateInput substring(uuid 1 4) == "user")
+                ACL_promptId++
+                ACL_pendingInput = nil
+                when(ACL_form
+                  axlFormSetField(ACL_form "userinput" "")
+                  axlFormSetField(ACL_form "send" "Send")
+                  axlFormSetActiveField(ACL_form "userinput"))
+                ACL_drainDisplayBuf()
+                when(content
+                  ACL_appendChat(sprintf(nil "\nYou: %s" content))))
+              (t
+                when(content
+                  ACL_setStatus(pcreReplace(
+                    pcreCompile("<[^>]+>") content "" 0))))))))
       ; Result (response complete)
       (etype == "result"
         ACL_flushDisplay()
@@ -978,7 +986,7 @@ procedure(ACL_handleNewSession()
   ACL_logReset()
   ACL_startClaude()
   ACL_appendChat("Starting new session...")
-  ACL_setStatus("Ready")
+  ACL_setStatus("Starting...")
   ACL_sendMessage(sprintf(nil "Current board: %L\nSay hello" axlGetDrawingName())
     ?isSynthetic t))
 
@@ -1000,7 +1008,7 @@ procedure(ACL_handleRestoreSession(sid)
       ACL_logReset()
       ACL_startClaude(sid)
       ACL_appendChat(sprintf(nil "Restored session: %s" sid))
-      ACL_setStatus("Ready")
+      ACL_setStatus("Resuming...")
     else
       ACL_appendChat(sprintf(nil "Session not found: %s" sid)))))
 

@@ -31,7 +31,7 @@ runtest() {
   if grep -xFq "exit" "$SCR"; then
     timeout 300 "$CADENCE" "$TOOL" -nograph -s "$SCR" > "${OUT}_" 2>&1 ||
       echo "exit code $?" >> "${OUT}_"
-    mv -f "${OUT}_" "$OUT"
+    mv -f "${OUT}_" "$OUT" || true
   else
     echo "ERROR: test script $SCR must end in "'`exit`' > "$OUT"
   fi
