@@ -151,6 +151,14 @@ procedure(ACL_jParseArr(str pos)
 procedure(ACL_jGet(obj key)
   cadr(assoc(key obj)))
 
+procedure(ACL_assocStr(key alist)
+  ; Like assoc but uses equal (string-safe) instead of eq
+  prog((rest)
+    rest = alist
+    while(rest
+      when(equal(key caar(rest)) return(car(rest)))
+      rest = cdr(rest))))
+
 ; ============================================================
 ; 2. JSON Writer
 ; ============================================================
@@ -206,6 +214,7 @@ procedure(ACL_normPath(path)
     pcreReplace(pcreCompile("\\\\") path "/" 0)
     path))
 
+defvar(ACL_enableRawLog nil)       ; helps with debugging streams
 defvar(ACL_form nil)
 defvar(ACL_logContent "")          ; accumulated log text
 defvar(ACL_logTruncLimit 12500)    ; max chars shown in form field
@@ -228,6 +237,8 @@ defvar(ACL_recording nil)
 defvar(ACL_journalFile nil)
 defvar(ACL_cmdSeq 0)
 defvar(ACL_gotText nil)          ; set to t when any text arrives
+defvar(ACL_streamingMsgId nil)    ; message ID currently being streamed
+defvar(ACL_streamedMsgLen nil)    ; alist of (msgId . textLen) for streamed messages
 defvar(ACL_hadToolUse nil)       ; true if tool_use occurred since last text block
 defvar(ACL_execQueue nil)        ; queued exec blocks for deferred execution
 defvar(ACL_execTimer nil)        ; one-shot timer for deferred exec
@@ -445,11 +456,15 @@ procedure(ACL_startClaude(@optional resumeId fork)
       args = append1(args resumeId)
       when(fork args = append1(args "--fork-session")))
     cmd = buildString(args " ")
+    let((fp) fp = outfile(strcat(ACL_homeDir "/raw.log") "a")
+      when(fp fprintf(fp "\n--- %s ---\n" getCurrentTime()) close(fp)))
     ACL_lineBuf = ""
     ACL_responseBuf = ""
     ACL_displayBuf = ""
     ACL_inExecBlock = nil
     ACL_execQueue = nil
+    ACL_streamingMsgId = nil
+    ACL_streamedMsgLen = nil
     ACL_promptId = 1
     ACL_pendingInput = nil
     ACL_claude = ipcBeginProcess(cmd ""
@@ -500,13 +515,19 @@ procedure(ACL_sendMessage(text @key (uuid nil) (isSynthetic nil) (noQuery nil))
 
 procedure(ACL_claudeDataHandler(id data)
   let((pos line)
+    when(ACL_enableRawLog
+      let((fp)
+        fp = outfile(strcat(ACL_homeDir "/raw.log") "a")
+        when(fp fprintf(fp "%s" data) close(fp))))
     ACL_lineBuf = strcat(ACL_lineBuf data)
     pos = nindex(ACL_lineBuf "\n")
     while(pos
       line = substring(ACL_lineBuf 1 (pos - 1))
       ACL_lineBuf = or(substring(ACL_lineBuf (pos + 1)) "")
       when(and(line strlen(line) > 0)
-        errset(ACL_processStreamLine(line)))
+        unless(errset(ACL_processStreamLine(line))
+          printf("*Warning* ACL: stream error: %L\n" errset.errset)
+          axlFlushDisplay()))
       pos = nindex(ACL_lineBuf "\n"))))
 
 procedure(ACL_processStreamLine(line)
@@ -539,6 +560,12 @@ procedure(ACL_processStreamLine(line)
           evtype = ACL_jGet(event "type")
           cond(
             (evtype == "message_start"
+              let((msg msgId)
+                msg = ACL_jGet(event "message")
+                msgId = when(msg ACL_jGet(msg "id"))
+                ACL_streamingMsgId = msgId
+                when(and(msgId null(ACL_assocStr(msgId ACL_streamedMsgLen)))
+                  ACL_streamedMsgLen = cons(list(msgId 0) ACL_streamedMsgLen)))
               ACL_setStatus("Responding..."))
             (evtype == "content_block_delta"
               delta = ACL_jGet(event "delta")
@@ -547,6 +574,12 @@ procedure(ACL_processStreamLine(line)
                   (ACL_jGet(delta "type") == "text_delta"
                     text = ACL_jGet(delta "text")
                     when(text
+                      ; Track streamed text length per message
+                      when(ACL_streamingMsgId
+                        let((entry)
+                          entry = assoc(ACL_streamingMsgId ACL_streamedMsgLen)
+                          when(entry
+                            rplaca(cdr(entry) (cadr(entry) + strlen(text))))))
                       ACL_responseBuf = strcat(ACL_responseBuf text)
                       ACL_streamToDisplay(text)
                       ; Save session on first text
@@ -576,38 +609,48 @@ procedure(ACL_processStreamLine(line)
                     ACL_hadToolUse = nil))))
             (evtype == "content_block_stop"
               ACL_setStatus("Thinking...")))))
-      ; Assistant message (complete, non-streaming)
+      ; Assistant message (complete, non-streaming). Skip text already
+      ; received via streaming; only display new content beyond what
+      ; was streamed for this message ID.
       (etype == "assistant"
-        let((msg content block)
+        let((msg content block msgId entry seenLen fullText newText)
           msg = ACL_jGet(parsed "message")
+          msgId = when(msg ACL_jGet(msg "id"))
+          entry = when(msgId ACL_assocStr(msgId ACL_streamedMsgLen))
+          seenLen = if(entry cadr(entry) 0)
           content = when(msg ACL_jGet(msg "content"))
           when(content
+            fullText = ""
             foreach(block content
               when(and(block ACL_jGet(block "type") == "text")
                 text = ACL_jGet(block "text")
-                when(text
-                  ACL_responseBuf = strcat(ACL_responseBuf text)
-                  ACL_streamToDisplay(text)))))))
+                when(text fullText = strcat(fullText text))))
+            when(strlen(fullText) > seenLen
+              newText = substring(fullText (seenLen + 1))
+              when(and(newText strlen(newText) > 0)
+                ACL_responseBuf = strcat(ACL_responseBuf newText)
+                ACL_streamToDisplay(newText))
+              when(entry
+                rplaca(cdr(entry) strlen(fullText)))))))
       ; Replayed messages: skip synthetic, show everything else
       (etype == "user"
         let((uuid msg content)
           uuid = or(ACL_jGet(parsed "uuid") "")
           msg = ACL_jGet(parsed "message")
           content = when(msg ACL_jGet(msg "content"))
-          unless(substring(uuid 1 5) == "synth"
-            cond(
-              (and(ACL_autoUpdateInput substring(uuid 1 4) == "user")
-                ACL_promptId++
-                ACL_pendingInput = nil
-                when(ACL_form
-                  axlFormSetField(ACL_form "userinput" "")
-                  axlFormSetField(ACL_form "send" "Send")
-                  axlFormSetActiveField(ACL_form "userinput"))
-                ACL_drainDisplayBuf()
-                when(content
-                  ACL_appendChat(sprintf(nil "\nYou: %s" content))))
-              (substring(uuid 1 4) != "user"
-                when(content
+          when(and(content stringp(content))
+            unless(substring(uuid 1 5) == "synth"
+              cond(
+                (and(ACL_autoUpdateInput substring(uuid 1 4) == "user")
+                  ACL_promptId++
+                  ACL_pendingInput = nil
+                  when(ACL_form
+                    axlFormSetField(ACL_form "userinput" "")
+                    axlFormSetField(ACL_form "send" "Send")
+                    axlFormSetActiveField(ACL_form "userinput"))
+                  ACL_drainDisplayBuf()
+                  ACL_appendChat(sprintf(nil "\nYou: %s" content)))
+                (substring(uuid 1 4) != "user"
                   let((stripped)
                     stripped = pcreReplace(
                       pcreCompile("<[^>]+>") content "" 0)
@@ -635,7 +678,7 @@ procedure(ACL_drainDisplayBuf()
         pos = nindex(ACL_displayBuf ACL_tagClose)
         unless(pos return(nil))
         code = ACL_stripWS(substring(ACL_displayBuf 1 (pos - 1)))
-        ACL_displayBuf = substring(ACL_displayBuf (pos + strlen(ACL_tagClose)))
+        ACL_displayBuf = or(substring(ACL_displayBuf (pos + strlen(ACL_tagClose))) "")
         ACL_inExecBlock = nil
         when(and(code strlen(code) > 0)
           if(ACL_mode == "manual" then
@@ -653,7 +696,7 @@ procedure(ACL_drainDisplayBuf()
         if(pos then
           when(pos > 1
             ACL_logWrite(substring(ACL_displayBuf 1 (pos - 1))))
-          ACL_displayBuf = substring(ACL_displayBuf (pos + strlen(ACL_tagOpen)))
+          ACL_displayBuf = or(substring(ACL_displayBuf (pos + strlen(ACL_tagOpen))) "")
           ACL_inExecBlock = t
         else
           ; No complete open tag. Check if the buffer ends with a
