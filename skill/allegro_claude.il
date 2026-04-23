@@ -222,8 +222,6 @@ defvar(ACL_displayBuf "")
 defvar(ACL_inExecBlock nil)
 defvar(ACL_pendingBatch nil)
 defvar(ACL_lastCmdTime 0)
-defvar(ACL_toolUseRounds 0)
-defvar(ACL_toolUseMax 100)
 defvar(ACL_recording nil)
 defvar(ACL_journalFile nil)
 defvar(ACL_cmdSeq 0)
@@ -764,22 +762,15 @@ procedure(ACL_onResponseComplete()
     ACL_responseBuf = ""
     blocks = ACL_execQueue
     cond(
-      (and(ACL_mode == "batch" blocks ACL_toolUseRounds == 0)
+      (and(ACL_mode == "batch" blocks)
         ACL_execQueue = nil
         ACL_pendingBatch = blocks
         ACL_appendChat(strcat("Proposed commands:\n"
           buildString(ACL_formatNumbered(blocks "  ") "\n")
           "\n\nType 'approve' or 'reject' in the chat input."))
         ACL_setStatus("Awaiting approval..."))
-      (blocks
-        when(and(ACL_toolUseMax ACL_toolUseRounds >= ACL_toolUseMax)
-          ACL_execQueue = nil
-          ACL_appendChat("(Tool-use loop limit reached.)")
-          ACL_setStatus("Ready")
-          return(nil)))
       (t
-        ACL_setStatus("Ready")
-        ACL_toolUseRounds = 0))))
+        ACL_setStatus("Ready")))))
 
 procedure(ACL_executeQueued(@rest args)
   ; Called by axlUIWTimerAdd (args: window timerId elapsedTime).
@@ -790,7 +781,6 @@ procedure(ACL_executeQueued(@rest args)
     ACL_execQueue = nil
     when(blocks
       results = mapcar('ACL_execBlock blocks)
-      ACL_toolUseRounds++
       ACL_setStatus("Thinking...")
       ACL_sendMessage(strcat("Execution results:\n"
         buildString(ACL_formatNumbered(results "Result ") "\n")
@@ -911,7 +901,6 @@ procedure(ACL_handleUserMessage(text)
   ACL_setStatus("Thinking...")
   ACL_responseBuf = ""
   ACL_execQueue = nil
-  ACL_toolUseRounds = 0
   ACL_pendingInput = text
   let((elapsed prefix systemUuid userUuid)
     elapsed = stringToTime(getCurrentTime()) - ACL_lastCmdTime
