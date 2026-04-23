@@ -220,7 +220,7 @@ defvar(ACL_lineBuf "")
 defvar(ACL_responseBuf "")
 defvar(ACL_displayBuf "")
 defvar(ACL_inExecBlock nil)
-defvar(ACL_pendingBatch nil)
+defvar(ACL_pendingManual nil)
 defvar(ACL_lastCmdTime 0)
 defvar(ACL_recording nil)
 defvar(ACL_journalFile nil)
@@ -615,7 +615,7 @@ procedure(ACL_drainDisplayBuf()
         code = substring(ACL_displayBuf 1 (pos - 1))
         when(and(code strlen(code) > 0)
           ACL_execQueue = append1(or(ACL_execQueue nil) code)
-          unless(or(ACL_mode == "batch" ACL_execTimer)
+          unless(or(ACL_mode == "manual" ACL_execTimer)
             ACL_execTimer = axlUIWTimerAdd(nil 1 t 'ACL_executeQueued)))
         ACL_displayBuf = substring(ACL_displayBuf (pos + strlen(ACL_tagClose)))
         ACL_inExecBlock = nil
@@ -762,9 +762,9 @@ procedure(ACL_onResponseComplete()
     ACL_responseBuf = ""
     blocks = ACL_execQueue
     cond(
-      (and(ACL_mode == "batch" blocks)
+      (and(ACL_mode == "manual" blocks)
         ACL_execQueue = nil
-        ACL_pendingBatch = blocks
+        ACL_pendingManual = blocks
         ACL_appendChat(strcat("Proposed commands:\n"
           buildString(ACL_formatNumbered(blocks "  ") "\n")
           "\n\nType 'approve' or 'reject' in the chat input."))
@@ -909,8 +909,8 @@ procedure(ACL_handleUserMessage(text)
         "[The board may have been edited. Re-query the design instead of relying on memory.] "
         "")
       "[ALWAYS CHECK CADENCE DOCUMENTATION BEFORE EXECUTING OR REPLYING]"
-      if(ACL_mode == "batch"
-        " [BATCH MODE: List all commands you would execute as <allegro_execute> blocks. I will review and approve first.]"
+      if(ACL_mode == "manual"
+        " [MANUAL MODE: List all commands you would execute as <allegro_execute> blocks. I will review and approve first.]"
         ""))
     userUuid = sprintf(nil "user%d" ACL_promptId)
     ; Send system prefix as synthetic (not displayed, no response generated)
@@ -921,18 +921,18 @@ procedure(ACL_handleUserMessage(text)
     when(ACL_autoUpdateInput ACL_startInputPoll())))
 
 procedure(ACL_handleApprove()
-  when(ACL_pendingBatch
-    ACL_setStatus("Executing batch...")
+  when(ACL_pendingManual
+    ACL_setStatus("Executing...")
     let((results)
-      results = mapcar('ACL_execBlock ACL_pendingBatch)
-      ACL_appendChat(strcat("Batch results:\n"
+      results = mapcar('ACL_execBlock ACL_pendingManual)
+      ACL_appendChat(strcat("Manual results:\n"
         buildString(ACL_formatNumbered(results "Result ") "\n")))
-      ACL_pendingBatch = nil
+      ACL_pendingManual = nil
       ACL_setStatus("Ready"))))
 
 procedure(ACL_handleReject()
-  ACL_pendingBatch = nil
-  ACL_appendChat("Batch rejected.")
+  ACL_pendingManual = nil
+  ACL_appendChat("Rejected.")
   ACL_setStatus("Ready"))
 
 procedure(ACL_handleJournal(contents)
