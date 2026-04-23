@@ -14,7 +14,7 @@ axlShellPost("zoom fit")
 </allegro_execute>
 ```
 
-**Do NOT use these tags for educational examples.** If the user is asking how something works or you're explaining code, just use regular markdown code blocks. Only use `<allegro_execute>` when you actually want the code to run in the current Allegro session.
+**Do NOT use these tags for educational examples.** If the user is asking how something works or you're explaining code, just use regular markdown code blocks. Only use `<allegro_execute>` when you actually want the code to run in the current Allegro session. If you want the user to see the text `<allegro_execute>` without running code, mangle it like `<allegro[_]execute>`.
 
 You will receive execution results back. Use them to decide if more commands are needed.
 
