@@ -94,3 +94,9 @@ color -vis "ETCH/TOP"
 color -vis "PIN/TOP"
 ```
 Use `color -globvis off` to turn everything off, then `color -vis "CLASS/SUBCLASS"` for each layer to enable. See examples in `c:/cadence/spb_23.1/share/pcb/toolbox/getting_started/mfgdoc/`.
+
+## `axlVersion` takes a symbol argument, not property access
+`axlVersion()` with no argument returns a list of available option symbols. To get actual values, pass the option as a symbol: `axlVersion('version)` => `25.1`, `axlVersion('fullVersion)` => `"25.1-2025 S020"`. It is NOT a property list — do not use `->` access on the result.
+
+## `axlDBGetDesign()` property names differ from docs
+The docs list `->vias`, `->branches`, `->ratTs`, `->comps`, and `->xnets` as design properties, but **these properties do not exist**. SKILL silently returns nil for nonexistent properties, making it look like an empty list. The actual property for extended nets is `->xnet` (singular, not `xnets`). `->pins` exists but is always nil. To enumerate vias or pins, use the selection API (`axlSetFindFilter`/`axlAddSelectAll`/`axlGetSelSet`). To get branches, access per-net via `net->branches`. Use `->components` not `->comps`. Use `->xnet` not `->xnets`. Use `obj->?` to discover valid properties before guessing.
