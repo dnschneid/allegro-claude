@@ -211,6 +211,7 @@ defvar(ACL_logContent "")          ; accumulated log text
 defvar(ACL_logTruncLimit 12500)    ; max chars shown in form field
 defvar(ACL_logLineLimit 50)        ; max lines shown in form field
 defvar(ACL_logLineCount 0)         ; running newline count in logContent
+defvar(ACL_logTrailingNLs 0)       ; consecutive trailing newlines
 defvar(ACL_logFile nil)            ; temp file for full log viewer
 defvar(ACL_logCodeLimit 250)       ; max chars for each code preview
 defvar(ACL_sessionId nil)
@@ -268,10 +269,27 @@ procedure(ACL_appendChat(text)
   ACL_logWrite(strcat(text "\n")))
 
 procedure(ACL_logWrite(text)
-  ACL_logContent = strcat(ACL_logContent text)
-  ; Count newlines in appended text
-  let((i) for(i 1 strlen(text)
-    when(substring(text i 1) == "\n" ACL_logLineCount++)))
+  ; Suppress runs of more than 2 consecutive newlines
+  let((out rest nlPos)
+    out = ""
+    rest = text
+    while(and(rest strlen(rest) > 0)
+      nlPos = nindex(rest "\n")
+      if(nlPos then
+        when(nlPos > 1
+          out = strcat(out substring(rest 1 (nlPos - 1)))
+          ACL_logTrailingNLs = 0)
+        ACL_logTrailingNLs++
+        when(ACL_logTrailingNLs <= 2
+          out = strcat(out "\n")
+          ACL_logLineCount++)
+        rest = substring(rest (nlPos + 1))
+      else
+        out = strcat(out rest)
+        ACL_logTrailingNLs = 0
+        rest = nil))
+    when(strlen(out) > 0
+      ACL_logContent = strcat(ACL_logContent out)))
   ; Update form field (truncated to last N lines, with char limit backstop)
   when(ACL_form
     let((display)
@@ -305,6 +323,7 @@ procedure(ACL_lastNLines(text n)
 procedure(ACL_logReset()
   ACL_logContent = ""
   ACL_logLineCount = 0
+  ACL_logTrailingNLs = 0
   when(ACL_form axlFormSetField(ACL_form "chatlog" "")))
 
 procedure(ACL_showFullLog()
@@ -1231,6 +1250,11 @@ procedure(ACL_runTests()
     ACL_streamToDisplay("hi<allegro_execute>x < 5</allegro_execute>bye")
     ACL_check("lt in code flushed" ACL_logContent "hibye")
     ACL_check("lt in code residual" ACL_displayBuf "")
+    ; newlines around exec blocks are trimmed
+    ACL_logContent = "" ACL_displayBuf = "" ACL_inExecBlock = nil
+    ACL_streamToDisplay("before\n\n<allegro_execute>code</allegro_execute>\n\nafter")
+    ACL_check("nl trim flushed" ACL_logContent "before\n\nafter")
+    ACL_check("nl trim residual" ACL_displayBuf "")
     ACL_form = savedForm
     ACL_logContent = savedLog)
 
