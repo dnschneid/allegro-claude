@@ -209,6 +209,7 @@ procedure(ACL_normPath(path)
 defvar(ACL_form nil)
 defvar(ACL_logContent "")          ; accumulated log text
 defvar(ACL_logTruncLimit 12500)    ; max chars shown in form field
+defvar(ACL_resultTruncLimit 150)   ; max chars shown for results in manual mode
 defvar(ACL_logLineLimit 50)        ; max lines shown in form field
 defvar(ACL_logLineCount 0)         ; running newline count in logContent
 defvar(ACL_logTrailingNLs 0)       ; consecutive trailing newlines
@@ -627,17 +628,25 @@ procedure(ACL_streamToDisplay(text)
 
 procedure(ACL_drainDisplayBuf()
   prog((pos code)
-    while(and(ACL_displayBuf strlen(ACL_displayBuf) > 0)
+    while(and(ACL_displayBuf strlen(ACL_displayBuf) > 0
+              null(ACL_pendingManual))
       if(ACL_inExecBlock then
         pos = nindex(ACL_displayBuf ACL_tagClose)
         unless(pos return(nil))
-        code = substring(ACL_displayBuf 1 (pos - 1))
-        when(and(code strlen(code) > 0)
-          ACL_execQueue = append1(or(ACL_execQueue nil) code)
-          unless(or(ACL_mode == "manual" ACL_execTimer)
-            ACL_execTimer = axlUIWTimerAdd(nil 1 t 'ACL_executeQueued)))
+        code = ACL_stripWS(substring(ACL_displayBuf 1 (pos - 1)))
         ACL_displayBuf = substring(ACL_displayBuf (pos + strlen(ACL_tagClose)))
         ACL_inExecBlock = nil
+        when(and(code strlen(code) > 0)
+          if(ACL_mode == "manual" then
+            ACL_pendingManual = append1(or(ACL_pendingManual nil) code)
+            ACL_appendChat(strcat("Proposed commands:\n"
+              buildString(ACL_formatNumbered(ACL_pendingManual "  ") "\n")
+              "\n\nType 'approve' or 'reject' in the chat input."))
+            ACL_setStatus("Awaiting approval...")
+          else
+            ACL_execQueue = append1(or(ACL_execQueue nil) code)
+            unless(ACL_execTimer
+              ACL_execTimer = axlUIWTimerAdd(nil 1 t 'ACL_executeQueued))))
       else
         pos = nindex(ACL_displayBuf ACL_tagOpen)
         if(pos then
@@ -670,6 +679,9 @@ procedure(ACL_flushDisplay()
 ; 9. Execute Block Extraction & Execution
 ; ============================================================
 
+procedure(ACL_stripWS(code)
+  pcreReplace(pcreCompile("^\\s+|\\s+$") code "" 0))
+
 procedure(ACL_extractExecBlocks(text)
   ; Find all <allegro_execute>...</allegro_execute> blocks in text.
   prog((blocks openLen closeLen rest openPos closePos code)
@@ -692,11 +704,7 @@ procedure(ACL_execBlock(code)
   ; Execute one SKILL block with error handling.
   ; Returns result string including any printed output.
   prog((result err preview output port warnings)
-    ; Strip leading/trailing whitespace from code
-    while(and(code strlen(code) > 0 ACL_jIsWS(substring(code 1 1)))
-      code = substring(code 2))
-    while(and(code strlen(code) > 0 ACL_jIsWS(substring(code strlen(code) 1)))
-      code = substring(code 1 (strlen(code) - 1)))
+    code = ACL_stripWS(code)
     when(or(null(code) strlen(code) == 0)
       return("(empty block)"))
     ACL_setStatus("Executing SKILL...")
@@ -777,19 +785,24 @@ procedure(ACL_formatNumbered(items @optional (prefix ""))
       items)))
 
 procedure(ACL_onResponseComplete()
-  prog((blocks)
-    ACL_responseBuf = ""
-    blocks = ACL_execQueue
-    cond(
-      (and(ACL_mode == "manual" blocks)
-        ACL_execQueue = nil
-        ACL_pendingManual = blocks
-        ACL_appendChat(strcat("Proposed commands:\n"
-          buildString(ACL_formatNumbered(blocks "  ") "\n")
-          "\n\nType 'approve' or 'reject' in the chat input."))
-        ACL_setStatus("Awaiting approval..."))
-      (t
-        ACL_setStatus("Ready")))))
+  ACL_responseBuf = ""
+  unless(ACL_pendingManual
+    ACL_setStatus("Ready")))
+
+procedure(ACL_sendResults(results)
+  let((resultText msg preview)
+    resultText = strcat("Execution results:\n"
+      buildString(ACL_formatNumbered(results "Result ") "\n"))
+    msg = strcat(resultText
+      "\n\nContinue if more commands are needed, "
+      "or summarize the outcome.")
+    when(ACL_mode == "manual"
+      preview = if(strlen(resultText) > ACL_resultTruncLimit
+        strcat(substring(resultText 1 (ACL_resultTruncLimit - 4)) "\n...")
+        resultText)
+      ACL_appendChat(preview))
+    ACL_setStatus("Thinking...")
+    ACL_sendMessage(msg ?isSynthetic t)))
 
 procedure(ACL_executeQueued(@rest args)
   ; Called by axlUIWTimerAdd (args: window timerId elapsedTime).
@@ -800,12 +813,7 @@ procedure(ACL_executeQueued(@rest args)
     ACL_execQueue = nil
     when(blocks
       results = mapcar('ACL_execBlock blocks)
-      ACL_setStatus("Thinking...")
-      ACL_sendMessage(strcat("Execution results:\n"
-        buildString(ACL_formatNumbered(results "Result ") "\n")
-        "\n\nContinue if more commands are needed, "
-        "or summarize the outcome.")
-        ?isSynthetic t))))
+      ACL_sendResults(results))))
 
 ; ============================================================
 ; 11. Form Callback
@@ -855,6 +863,15 @@ procedure(ACL_doSend(form)
           axlFormSetField(form "userinput" "")
           axlFormSetActiveField(form "userinput")
           ACL_handleReject())
+        ; Any other text while manual approval pending acts as reject + new input
+        (ACL_pendingManual
+          ACL_handleReject(nil)
+          axlFormSetField(form "userinput" "")
+          axlFormSetActiveField(form "userinput")
+          ACL_appendChat(sprintf(nil "\nYou: %s" text))
+          ACL_handleUserMessage(text)
+          ACL_promptId++
+          ACL_pendingInput = nil)
         ; Already queued - re-send if text changed
         (ACL_pendingInput
           unless(text == ACL_pendingInput
@@ -944,15 +961,20 @@ procedure(ACL_handleApprove()
     ACL_setStatus("Executing...")
     let((results)
       results = mapcar('ACL_execBlock ACL_pendingManual)
-      ACL_appendChat(strcat("Manual results:\n"
-        buildString(ACL_formatNumbered(results "Result ") "\n")))
       ACL_pendingManual = nil
-      ACL_setStatus("Ready"))))
+      ACL_drainDisplayBuf()
+      ACL_sendResults(results))))
 
-procedure(ACL_handleReject()
-  ACL_pendingManual = nil
-  ACL_appendChat("Rejected.")
-  ACL_setStatus("Ready"))
+procedure(ACL_handleReject(@optional (notify t))
+  when(ACL_pendingManual
+    ACL_pendingManual = nil
+    ACL_drainDisplayBuf()
+    ACL_appendChat("Rejected.")
+    when(notify
+      ACL_setStatus("Thinking...")
+      ACL_sendMessage(
+        "The user rejected the proposed commands. Ask what they'd like instead."
+        ?isSynthetic t))))
 
 procedure(ACL_handleJournal(contents)
   ACL_setStatus("Analyzing...")
@@ -1255,6 +1277,29 @@ procedure(ACL_runTests()
     ACL_streamToDisplay("before\n\n<allegro_execute>code</allegro_execute>\n\nafter")
     ACL_check("nl trim flushed" ACL_logContent "before\n\nafter")
     ACL_check("nl trim residual" ACL_displayBuf "")
+    ; manual mode: block goes to pendingManual, not execQueue
+    ACL_logContent = "" ACL_displayBuf = "" ACL_inExecBlock = nil
+    ACL_execQueue = nil ACL_pendingManual = nil
+    let(((savedMode ACL_mode))
+      ACL_mode = "manual"
+      ACL_streamToDisplay("hi<allegro_execute>code1</allegro_execute>more")
+      ACL_check("manual pending" ACL_pendingManual '("code1"))
+      ACL_check("manual queue"   ACL_execQueue nil)
+      ; display freezes while pending
+      ACL_check("manual frozen"  nindex(ACL_logContent "more") nil)
+      ACL_check("manual held"    ACL_displayBuf "more")
+      ; reject clears and drains
+      ACL_handleReject(nil)
+      ACL_check("reject cleared" ACL_pendingManual nil)
+      ACL_check("reject drained" ACL_displayBuf "")
+      ; approve clears and drains
+      ACL_logContent = "" ACL_displayBuf = "" ACL_inExecBlock = nil
+      ACL_pendingManual = nil
+      ACL_streamToDisplay("a<allegro_execute>(plus 1 2)</allegro_execute>b")
+      ACL_handleApprove()
+      ACL_check("approve cleared" ACL_pendingManual nil)
+      ACL_check("approve drained" ACL_displayBuf "")
+      ACL_mode = savedMode)
     ACL_form = savedForm
     ACL_logContent = savedLog)
 
