@@ -431,6 +431,7 @@ procedure(ACL_startClaude(@optional resumeId fork)
     ACL_responseBuf = ""
     ACL_displayBuf = ""
     ACL_inExecBlock = nil
+    ACL_execQueue = nil
     ACL_promptId = 1
     ACL_pendingInput = nil
     ACL_claude = ipcBeginProcess(cmd ""
@@ -608,11 +609,16 @@ procedure(ACL_streamToDisplay(text)
   ACL_drainDisplayBuf())
 
 procedure(ACL_drainDisplayBuf()
-  prog((pos)
+  prog((pos code)
     while(and(ACL_displayBuf strlen(ACL_displayBuf) > 0)
       if(ACL_inExecBlock then
         pos = nindex(ACL_displayBuf ACL_tagClose)
         unless(pos return(nil))
+        code = substring(ACL_displayBuf 1 (pos - 1))
+        when(and(code strlen(code) > 0)
+          ACL_execQueue = append1(or(ACL_execQueue nil) code)
+          unless(or(ACL_mode == "batch" ACL_execTimer)
+            ACL_execTimer = axlUIWTimerAdd(nil 1 t 'ACL_executeQueued)))
         ACL_displayBuf = substring(ACL_displayBuf (pos + strlen(ACL_tagClose)))
         ACL_inExecBlock = nil
       else
@@ -755,10 +761,11 @@ procedure(ACL_formatNumbered(items @optional (prefix ""))
 
 procedure(ACL_onResponseComplete()
   prog((blocks)
-    blocks = ACL_extractExecBlocks(ACL_responseBuf)
     ACL_responseBuf = ""
+    blocks = ACL_execQueue
     cond(
       (and(ACL_mode == "batch" blocks ACL_toolUseRounds == 0)
+        ACL_execQueue = nil
         ACL_pendingBatch = blocks
         ACL_appendChat(strcat("Proposed commands:\n"
           buildString(ACL_formatNumbered(blocks "  ") "\n")
@@ -766,15 +773,10 @@ procedure(ACL_onResponseComplete()
         ACL_setStatus("Awaiting approval..."))
       (blocks
         when(and(ACL_toolUseMax ACL_toolUseRounds >= ACL_toolUseMax)
+          ACL_execQueue = nil
           ACL_appendChat("(Tool-use loop limit reached.)")
           ACL_setStatus("Ready")
-          return(nil))
-        ; Queue blocks for deferred execution at top level.
-        ; evalstring can't run inside a dataHandler -- it needs
-        ; the top-level interpreter.
-        ACL_execQueue = blocks
-        ACL_setStatus("Queued SKILL execution...")
-        ACL_execTimer = axlUIWTimerAdd(nil 1 t 'ACL_executeQueued))
+          return(nil)))
       (t
         ACL_setStatus("Ready")
         ACL_toolUseRounds = 0))))
@@ -783,6 +785,7 @@ procedure(ACL_executeQueued(@rest args)
   ; Called by axlUIWTimerAdd (args: window timerId elapsedTime).
   ; Executes queued blocks and sends results back to Claude.
   let((blocks results)
+    ACL_execTimer = nil
     blocks = ACL_execQueue
     ACL_execQueue = nil
     when(blocks
@@ -907,6 +910,7 @@ procedure(ACL_pollInput(@rest args)
 procedure(ACL_handleUserMessage(text)
   ACL_setStatus("Thinking...")
   ACL_responseBuf = ""
+  ACL_execQueue = nil
   ACL_toolUseRounds = 0
   ACL_pendingInput = text
   let((elapsed prefix systemUuid userUuid)
