@@ -216,12 +216,10 @@ procedure(ACL_normPath(path)
 
 defvar(ACL_enableRawLog nil)       ; helps with debugging streams
 defvar(ACL_form nil)
-defvar(ACL_logContent "")          ; accumulated log text
+defvar(ACL_logContent nil)          ; accumulated log chunks (newest first)
 defvar(ACL_logTruncLimit 12500)    ; max chars shown in form field
 defvar(ACL_resultTruncLimit 150)   ; max chars shown for results in manual mode
 defvar(ACL_logLineLimit 50)        ; max lines shown in form field
-defvar(ACL_logLineCount 0)         ; running newline count in logContent
-defvar(ACL_logTrailingNLs 0)       ; consecutive trailing newlines
 defvar(ACL_logFile nil)            ; temp file for full log viewer
 defvar(ACL_logCodeLimit 250)       ; max chars for each code preview
 defvar(ACL_sessionId nil)
@@ -281,61 +279,51 @@ procedure(ACL_appendChat(text)
   ACL_logWrite(strcat(text "\n")))
 
 procedure(ACL_logWrite(text)
-  ; Suppress runs of more than 2 consecutive newlines
-  let((out rest nlPos)
-    out = ""
+  ; Stores one line per list entry. Partial lines appended via rplaca.
+  ; Suppresses consecutive blank lines.
+  let((rest nlPos pre partial)
     rest = text
     while(and(rest strlen(rest) > 0)
+      partial = and(ACL_logContent
+                    substring(car(ACL_logContent) strlen(car(ACL_logContent)) 1) != "\n")
       nlPos = nindex(rest "\n")
       if(nlPos then
-        when(nlPos > 1
-          out = strcat(out substring(rest 1 (nlPos - 1)))
-          ACL_logTrailingNLs = 0)
-        ACL_logTrailingNLs++
-        when(ACL_logTrailingNLs <= 2
-          out = strcat(out "\n")
-          ACL_logLineCount++)
+        pre = substring(rest 1 nlPos)
+        cond(
+          (partial
+            rplaca(ACL_logContent strcat(car(ACL_logContent) pre)))
+          (or(pre != "\n" car(ACL_logContent) != "\n")
+            ACL_logContent = cons(pre ACL_logContent)))
         rest = substring(rest (nlPos + 1))
       else
-        out = strcat(out rest)
-        ACL_logTrailingNLs = 0
-        rest = nil))
-    when(strlen(out) > 0
-      ACL_logContent = strcat(ACL_logContent out)))
-  ; Update form field (truncated to last N lines, with char limit backstop)
+        if(partial then
+          rplaca(ACL_logContent strcat(car(ACL_logContent) rest))
+        else
+          ACL_logContent = cons(rest ACL_logContent))
+        rest = nil)))
   when(ACL_form
-    let((display)
-      if(ACL_logLineCount > ACL_logLineLimit then
-        display = ACL_lastNLines(ACL_logContent ACL_logLineLimit)
-      else if(strlen(ACL_logContent) > ACL_logTruncLimit then
-        display = strcat("...\n"
-          substring(ACL_logContent
-            (strlen(ACL_logContent) - ACL_logTruncLimit + 5)))
-      else
-        display = ACL_logContent))
-      axlFormSetField(ACL_form "chatlog" display))))
+    axlFormSetField(ACL_form "chatlog" ACL_logTail(ACL_logLineLimit))))
 
-procedure(ACL_lastNLines(text n)
-  prog((pos count len)
-    len = strlen(text)
-    when(or(null(text) len == 0) return(""))
-    pos = len
+procedure(ACL_logString()
+  buildString(reverse(ACL_logContent) ""))
+
+procedure(ACL_logTail(n)
+  prog((lines count result chunk)
+    lines = ACL_logContent
     count = 0
-    ; Skip trailing newline
-    when(substring(text pos 1) == "\n" pos--)
-    ; Scan backwards counting newlines
-    while(and(pos >= 1 count < n)
-      when(substring(text pos 1) == "\n"
+    result = ""
+    while(and(lines count < n)
+      chunk = car(lines)
+      when(strlen(result) + strlen(chunk) > ACL_logTruncLimit
+        return(strcat("...\n" result)))
+      result = strcat(chunk result)
+      when(substring(chunk strlen(chunk) 1) == "\n"
         count++)
-      pos--)
-    return(if(count >= n
-      strcat("...\n" substring(text (pos + 2)))
-      text))))
+      lines = cdr(lines))
+    return(if(lines strcat("...\n" result) result))))
 
 procedure(ACL_logReset()
-  ACL_logContent = ""
-  ACL_logLineCount = 0
-  ACL_logTrailingNLs = 0
+  ACL_logContent = nil
   when(ACL_form axlFormSetField(ACL_form "chatlog" "")))
 
 procedure(ACL_showFullLog()
@@ -344,7 +332,7 @@ procedure(ACL_showFullLog()
     logfile = strcat(ACL_sessionLogDir "/log.txt")
     fp = outfile(logfile)
     when(fp
-      fprintf(fp "%s" ACL_logContent)
+      fprintf(fp "%s" ACL_logString())
       close(fp)
     axlUIViewFileCreate(logfile "Claude - Full Log" nil '(50 120) nil ACL_form))))
 
@@ -649,7 +637,7 @@ procedure(ACL_processStreamLine(line)
                     axlFormSetField(ACL_form "send" "Send")
                     axlFormSetActiveField(ACL_form "userinput"))
                   ACL_drainDisplayBuf()
-                  ACL_appendChat(sprintf(nil "\nYou: %s" content)))
+                  ACL_appendChat(sprintf(nil "\n\nYou: %s" content)))
                 (substring(uuid 1 4) != "user"
                   let((stripped)
                     stripped = pcreReplace(
@@ -756,7 +744,7 @@ procedure(ACL_execBlock(code)
     preview = if(strlen(code) > ACL_logCodeLimit
       strcat(substring(code 1 (ACL_logCodeLimit - 3)) "...")
       code)
-    ACL_logWrite(sprintf(nil "[exec: %s]\n" preview))
+    ACL_logWrite(sprintf(nil "[exec: %s]\n\n" preview))
     ; Execute with:
     ;   poport redirect to capture printf output
     ;   muffleWarnings to capture warnings
@@ -912,7 +900,7 @@ procedure(ACL_doSend(form)
           ACL_handleReject(nil)
           axlFormSetField(form "userinput" "")
           axlFormSetActiveField(form "userinput")
-          ACL_appendChat(sprintf(nil "\nYou: %s" text))
+          ACL_appendChat(sprintf(nil "\n\nYou: %s" text))
           ACL_handleUserMessage(text)
           ACL_promptId++
           ACL_pendingInput = nil)
@@ -926,7 +914,7 @@ procedure(ACL_doSend(form)
           if(ACL_autoUpdateInput then
             axlFormSetField(form "send" "Queued")
           else
-            ACL_appendChat(sprintf(nil "\nYou: %s" text))
+            ACL_appendChat(sprintf(nil "\n\nYou: %s" text))
             axlFormSetField(form "userinput" "")
             axlFormSetActiveField(form "userinput"))
           ACL_handleUserMessage(text)
@@ -1161,8 +1149,9 @@ procedure(ACL_openPanel()
       if(ACL_sessionId then
         ACL_ensureClaude()
         ; Redisplay existing log and status after window reopen
-        when(strlen(ACL_logContent) > 0
-          axlFormSetField(ACL_form "chatlog" ACL_logContent))
+        when(ACL_logContent
+          axlFormSetField(ACL_form "chatlog"
+            ACL_logTail(ACL_logLineLimit)))
         ACL_setStatus(if(and(ACL_claude ipcIsAliveProcess(ACL_claude))
           "Ready" "Starting..."))
       else
@@ -1309,45 +1298,57 @@ procedure(ACL_runTests()
   let(((savedForm ACL_form) (savedLog ACL_logContent))
     ACL_form = nil
     ; plain text: flushes immediately, nothing held back
-    ACL_logContent = "" ACL_displayBuf = "" ACL_inExecBlock = nil
+    ACL_logContent = nil ACL_displayBuf = "" ACL_inExecBlock = nil
     ACL_streamToDisplay("hello world")
-    ACL_check("plain flush"    ACL_logContent "hello world")
+    ACL_check("plain flush"    ACL_logString() "hello world")
     ACL_check("plain residual" ACL_displayBuf "")
+    ; partial line continuation via rplaca
+    ACL_logContent = nil ACL_displayBuf = "" ACL_inExecBlock = nil
+    ACL_logWrite("hel")
+    ACL_logWrite("lo\nwor")
+    ACL_logWrite("ld")
+    ACL_check("partial lines" ACL_logString() "hello\nworld")
+    ; logTail with partial line
+    ACL_check("tail partial" ACL_logTail(50) "hello\nworld")
+    ; logTail truncation
+    ACL_logContent = nil
+    ACL_logWrite("a\nb\nc\nd\ne\n")
+    ACL_check("tail trunc" ACL_logTail(3) "...\nc\nd\ne\n")
     ; exec block in one chunk: text before/after visible, code hidden
-    ACL_logContent = "" ACL_displayBuf = "" ACL_inExecBlock = nil
+    ACL_logContent = nil ACL_displayBuf = "" ACL_inExecBlock = nil
     ACL_streamToDisplay("before<allegro_execute>secret</allegro_execute>after")
-    ACL_check("exec flushed"   ACL_logContent "beforeafter")
+    ACL_check("exec flushed"   ACL_logString() "beforeafter")
     ACL_check("exec residual"  ACL_displayBuf "")
     ; tag split across chunks
-    ACL_logContent = "" ACL_displayBuf = "" ACL_inExecBlock = nil
+    ACL_logContent = nil ACL_displayBuf = "" ACL_inExecBlock = nil
     ACL_streamToDisplay("text<allegro_ex")
-    ACL_check("split flushed"  ACL_logContent "text")
+    ACL_check("split flushed"  ACL_logString() "text")
     ACL_check("split held"     ACL_displayBuf "<allegro_ex")
     ACL_streamToDisplay("ecute>hidden</allegro_execute>end")
-    ACL_check("split complete flushed" ACL_logContent "textend")
+    ACL_check("split complete flushed" ACL_logString() "textend")
     ACL_check("split complete residual" ACL_displayBuf "")
     ; '<' that is NOT a tag prefix flushes immediately
-    ACL_logContent = "" ACL_displayBuf = "" ACL_inExecBlock = nil
+    ACL_logContent = nil ACL_displayBuf = "" ACL_inExecBlock = nil
     ACL_streamToDisplay("x < 5 is true")
-    ACL_check("lt flush"       ACL_logContent "x < 5 is true")
+    ACL_check("lt flush"       ACL_logString() "x < 5 is true")
     ACL_check("lt residual"    ACL_displayBuf "")
     ; '<' non-tag followed by real partial tag
-    ACL_logContent = "" ACL_displayBuf = "" ACL_inExecBlock = nil
+    ACL_logContent = nil ACL_displayBuf = "" ACL_inExecBlock = nil
     ACL_streamToDisplay(" 5 < 7 so <allegro_")
-    ACL_check("mixed flushed"  ACL_logContent " 5 < 7 so ")
+    ACL_check("mixed flushed"  ACL_logString() " 5 < 7 so ")
     ACL_check("mixed held"     ACL_displayBuf "<allegro_")
     ; code inside exec block containing '<' doesn't confuse close-tag search
-    ACL_logContent = "" ACL_displayBuf = "" ACL_inExecBlock = nil
+    ACL_logContent = nil ACL_displayBuf = "" ACL_inExecBlock = nil
     ACL_streamToDisplay("hi<allegro_execute>x < 5</allegro_execute>bye")
-    ACL_check("lt in code flushed" ACL_logContent "hibye")
+    ACL_check("lt in code flushed" ACL_logString() "hibye")
     ACL_check("lt in code residual" ACL_displayBuf "")
     ; newlines around exec blocks are trimmed
-    ACL_logContent = "" ACL_displayBuf = "" ACL_inExecBlock = nil
+    ACL_logContent = nil ACL_displayBuf = "" ACL_inExecBlock = nil
     ACL_streamToDisplay("before\n\n<allegro_execute>code</allegro_execute>\n\nafter")
-    ACL_check("nl trim flushed" ACL_logContent "before\n\nafter")
+    ACL_check("nl trim flushed" ACL_logString() "before\n\nafter")
     ACL_check("nl trim residual" ACL_displayBuf "")
     ; manual mode: block goes to pendingManual, not execQueue
-    ACL_logContent = "" ACL_displayBuf = "" ACL_inExecBlock = nil
+    ACL_logContent = nil ACL_displayBuf = "" ACL_inExecBlock = nil
     ACL_execQueue = nil ACL_pendingManual = nil
     let(((savedMode ACL_mode))
       ACL_mode = "manual"
@@ -1355,14 +1356,14 @@ procedure(ACL_runTests()
       ACL_check("manual pending" ACL_pendingManual '("code1"))
       ACL_check("manual queue"   ACL_execQueue nil)
       ; display freezes while pending
-      ACL_check("manual frozen"  nindex(ACL_logContent "more") nil)
+      ACL_check("manual frozen"  nindex(ACL_logString() "more") nil)
       ACL_check("manual held"    ACL_displayBuf "more")
       ; reject clears and drains
       ACL_handleReject(nil)
       ACL_check("reject cleared" ACL_pendingManual nil)
       ACL_check("reject drained" ACL_displayBuf "")
       ; approve clears and drains
-      ACL_logContent = "" ACL_displayBuf = "" ACL_inExecBlock = nil
+      ACL_logContent = nil ACL_displayBuf = "" ACL_inExecBlock = nil
       ACL_pendingManual = nil
       ACL_streamToDisplay("a<allegro_execute>(plus 1 2)</allegro_execute>b")
       ACL_handleApprove()
