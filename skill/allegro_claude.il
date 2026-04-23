@@ -608,7 +608,7 @@ procedure(ACL_streamToDisplay(text)
   ACL_drainDisplayBuf())
 
 procedure(ACL_drainDisplayBuf()
-  prog((pos safe)
+  prog((pos)
     while(and(ACL_displayBuf strlen(ACL_displayBuf) > 0)
       if(ACL_inExecBlock then
         pos = nindex(ACL_displayBuf ACL_tagClose)
@@ -623,10 +623,18 @@ procedure(ACL_drainDisplayBuf()
           ACL_displayBuf = substring(ACL_displayBuf (pos + strlen(ACL_tagOpen)))
           ACL_inExecBlock = t
         else
-          safe = strlen(ACL_displayBuf) - strlen(ACL_tagOpen) + 1
-          when(safe > 0
-            ACL_logWrite(substring(ACL_displayBuf 1 safe))
-            ACL_displayBuf = substring(ACL_displayBuf (safe + 1)))
+          ; No complete open tag. Check if the buffer ends with a
+          ; partial prefix of ACL_tagOpen by finding the last '<'.
+          let((tail tailPos)
+            tail = rindex(ACL_displayBuf "<")
+            if(and(tail substring(ACL_tagOpen 1 strlen(tail)) == tail) then
+              tailPos = strlen(ACL_displayBuf) - strlen(tail) + 1
+              when(tailPos > 1
+                ACL_logWrite(substring(ACL_displayBuf 1 (tailPos - 1))))
+              ACL_displayBuf = tail
+            else
+              ACL_logWrite(ACL_displayBuf)
+              ACL_displayBuf = ""))
           return(nil))))))
 
 procedure(ACL_flushDisplay()
@@ -1195,22 +1203,43 @@ procedure(ACL_runTests()
     ACL_form = savedForm)
 
   printf("\n--- Display Streaming ---\n")
-  let(((savedForm ACL_form))
-    ACL_form = nil  ; disable log writes for this test
-    ACL_displayBuf = ""
-    ACL_inExecBlock = nil
+  let(((savedForm ACL_form) (savedLog ACL_logContent))
+    ACL_form = nil
+    ; plain text: flushes immediately, nothing held back
+    ACL_logContent = "" ACL_displayBuf = "" ACL_inExecBlock = nil
     ACL_streamToDisplay("hello world")
-    ACL_check("plain text buf" ACL_displayBuf "hello world")
-    ACL_displayBuf = ""
-    ACL_inExecBlock = nil
+    ACL_check("plain flush"    ACL_logContent "hello world")
+    ACL_check("plain residual" ACL_displayBuf "")
+    ; exec block in one chunk: text before/after visible, code hidden
+    ACL_logContent = "" ACL_displayBuf = "" ACL_inExecBlock = nil
     ACL_streamToDisplay("before<allegro_execute>secret</allegro_execute>after")
-    ACL_check("after exec strip" ACL_displayBuf "after")
-    ACL_displayBuf = ""
-    ACL_inExecBlock = nil
+    ACL_check("exec flushed"   ACL_logContent "beforeafter")
+    ACL_check("exec residual"  ACL_displayBuf "")
+    ; tag split across chunks
+    ACL_logContent = "" ACL_displayBuf = "" ACL_inExecBlock = nil
     ACL_streamToDisplay("text<allegro_ex")
+    ACL_check("split flushed"  ACL_logContent "text")
+    ACL_check("split held"     ACL_displayBuf "<allegro_ex")
     ACL_streamToDisplay("ecute>hidden</allegro_execute>end")
-    ACL_check("cross-chunk" ACL_displayBuf "end")
-    ACL_form = savedForm)
+    ACL_check("split complete flushed" ACL_logContent "textend")
+    ACL_check("split complete residual" ACL_displayBuf "")
+    ; '<' that is NOT a tag prefix flushes immediately
+    ACL_logContent = "" ACL_displayBuf = "" ACL_inExecBlock = nil
+    ACL_streamToDisplay("x < 5 is true")
+    ACL_check("lt flush"       ACL_logContent "x < 5 is true")
+    ACL_check("lt residual"    ACL_displayBuf "")
+    ; '<' non-tag followed by real partial tag
+    ACL_logContent = "" ACL_displayBuf = "" ACL_inExecBlock = nil
+    ACL_streamToDisplay(" 5 < 7 so <allegro_")
+    ACL_check("mixed flushed"  ACL_logContent " 5 < 7 so ")
+    ACL_check("mixed held"     ACL_displayBuf "<allegro_")
+    ; code inside exec block containing '<' doesn't confuse close-tag search
+    ACL_logContent = "" ACL_displayBuf = "" ACL_inExecBlock = nil
+    ACL_streamToDisplay("hi<allegro_execute>x < 5</allegro_execute>bye")
+    ACL_check("lt in code flushed" ACL_logContent "hibye")
+    ACL_check("lt in code residual" ACL_displayBuf "")
+    ACL_form = savedForm
+    ACL_logContent = savedLog)
 
   printf("\n--- Form File ---\n")
   let((formPath formHandle)
