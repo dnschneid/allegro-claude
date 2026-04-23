@@ -420,7 +420,8 @@ procedure(ACL_startClaude(@optional resumeId fork)
       "--add-dir" ACL_shellQuote(pcbenvDir)
       "--add-dir" ACL_shellQuote(projectDir)
       "--allowedTools" ACL_shellQuote(strcat("Edit(" ACL_notesDir "/*)"))
-      "--model" "opus[1m]")
+      "--model" "opus[1m]"
+      "--effort" "max")
     when(resumeId
       args = append1(args "--resume")
       args = append1(args resumeId)
