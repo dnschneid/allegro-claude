@@ -578,8 +578,9 @@ procedure(ACL_processStreamLine(line)
               ACL_setStatus("Thinking...")))))
       ; Assistant message (complete, non-streaming)
       (etype == "assistant"
-        let((content block)
-          content = ACL_jGet(parsed "content")
+        let((msg content block)
+          msg = ACL_jGet(parsed "message")
+          content = when(msg ACL_jGet(msg "content"))
           when(content
             foreach(block content
               when(and(block ACL_jGet(block "type") == "text")
