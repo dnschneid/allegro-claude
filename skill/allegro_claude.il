@@ -1068,13 +1068,19 @@ procedure(ACL_handleNewSession()
   let((doc)
     doc = strcat(
       ACL_notesDir "/SPB" pcreReplace(pcreCompile("[^\\w]") axlVersion('fullVersion) "_" 0) ".md")
-    ACL_sendMessage(strcat("[Do the following **totally silently in the background**: "
-      "Read **all** of `" doc "` into your context. It is very large and requires reading in "
-      "chunks -- just do it, no narration, no status updates. "
-      "If the file does not exist yet: "
-      "1. Briefly apologize that you need to pre-read the Allegro documentation, and provide "
-      "extremely succinct progress updates (a few words at most) as you do it. "
-      "2. Spawn sub-agents (aim for <25 functions each) to thoroughly read through *all* of the "
+    unless(isFile(doc)
+      ACL_appendChat(strcat("No documentation cache exists for this version of Allegro.\n"
+        "I need to explore the install and accumulate the documentation. It'll take about an hour "
+        "to complete, but it's worth it -- I promise. Please keep this window open.\n"
+        "I can still help while this is going on, but I might be slower to respond.")))
+    ACL_sendMessage(
+      if(isFile(doc)
+        strcat("[CRITICAL: Read **every single line** of `" doc "` into your context. "
+          "It is very large and requires reading in chunks -- do it completely, totally silently, "
+          "no narration, and no status updates. Help the user while you do it.]")
+        strcat("[CRITICAL: Do the following steps exactly, giving only extremely succinct progress "
+      "updates -- as little status output as possible to avoid confusing the conversation:"
+      "1. Spawn sub-agents (aim for <25 functions each) to thoroughly read through *all* of the "
       "Allegro documentation you have access to and accumulate that knowledge into `" doc "` "
       "with extensive detail, sufficient to be able to reliably use every single API and interface "
       "on your first try, as well as understand and apply topics, concepts, and usages covered in "
@@ -1083,11 +1089,12 @@ procedure(ACL_handleNewSession()
       "enumerated in TOCs, and take special note of things that were omitted from the TOC. "
       "The agents should write incrementally to avoid timing out on large writes. "
       "This may take an hour and should result in a large file. "
-      "3. Once ready, read the entirety of `" doc "` into your context. "
-      "4. Clean up any remaining sub-agent files. "
+      "2. Once ready, read **every single line** of `" doc "` into your context. "
+      "It is very large and requires reading in chunks -- do it completely. "
+      "3. Clean up any remaining sub-agent files. "
       "Until all this is complete, **be very careful to check documentation** manually before "
-      "responding to queries, and warn the user that you haven't completed your survey yet.]")
-      ?isSynthetic t))
+      "responding to queries, and warn the user that you haven't completed your survey yet.]"))
+      ?isSynthetic t ?noQuery t))
   ACL_sendMessage(sprintf(nil "Current board: %L\nSay hello" axlGetDrawingName())
     ?isSynthetic t))
 
