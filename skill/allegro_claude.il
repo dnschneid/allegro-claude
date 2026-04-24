@@ -765,6 +765,7 @@ procedure(ACL_execBlock(code)
     let((docWarning)
       docWarning = ACL_checkFuncDocs(code)
       return(strcat(
+        sprintf(nil "Code: %s\n" code)
         if(docWarning sprintf(nil "WARNING: %s\n" docWarning) "")
         if(and(warnings length(warnings) > 0)
           sprintf(nil "Warnings:\n%s\n" buildString(warnings "\n")) "")
