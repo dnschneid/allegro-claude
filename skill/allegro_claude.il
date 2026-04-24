@@ -714,24 +714,6 @@ procedure(ACL_flushDisplay()
 procedure(ACL_stripWS(code)
   pcreReplace(pcreCompile("^\\s+|\\s+$") code "" 0))
 
-procedure(ACL_extractExecBlocks(text)
-  ; Find all <allegro_execute>...</allegro_execute> blocks in text.
-  prog((blocks openLen closeLen rest openPos closePos code)
-    openLen = strlen(ACL_tagOpen)
-    closeLen = strlen(ACL_tagClose)
-    rest = text
-    while(and(rest strlen(rest) > 0)
-      openPos = nindex(rest ACL_tagOpen)
-      unless(openPos return(reverse(blocks)))
-      rest = substring(rest (openPos + openLen))
-      closePos = nindex(rest ACL_tagClose)
-      unless(closePos return(reverse(blocks)))
-      code = substring(rest 1 (closePos - 1))
-      when(and(code strlen(code) > 0)
-        blocks = cons(code blocks))
-      rest = substring(rest (closePos + closeLen)))
-    return(reverse(blocks))))
-
 procedure(ACL_execBlock(code)
   ; Execute one SKILL block with error handling.
   ; Returns result string including any printed output.
@@ -1251,37 +1233,6 @@ procedure(ACL_runTests()
     parsed = car(ACL_jParse(orig))
     ACL_check("rt type"    ACL_jGet(parsed "type")     "user_message")
     ACL_check("rt content" ACL_jGet(parsed "content")  "hello\nworld"))
-
-  printf("\n--- Execute Block Extraction ---\n")
-  ACL_check("no blocks"
-    ACL_extractExecBlocks("just text")
-    nil)
-  ACL_check("one block"
-    ACL_extractExecBlocks("text<allegro_execute>code1</allegro_execute>more")
-    '("code1"))
-  ACL_check("nindex close"
-    nindex("a</allegro_execute>rest" "</allegro_execute>")
-    2)
-  ACL_check("substr after close"
-    substring("a</allegro_execute>mid" (2 + strlen("</allegro_execute>")))
-    "mid")
-  ACL_check("extract one"
-    ACL_extractExecBlocks("<allegro_execute>a</allegro_execute>")
-    '("a"))
-  ACL_check("extract one+tail"
-    ACL_extractExecBlocks("<allegro_execute>a</allegro_execute>mid")
-    '("a"))
-  ACL_check("two blocks"
-    ACL_extractExecBlocks(
-      "<allegro_execute>a</allegro_execute>mid<allegro_execute>b</allegro_execute>")
-    '("a" "b"))
-  ACL_check("multiline block"
-    ACL_extractExecBlocks(
-      "<allegro_execute>line1\nline2</allegro_execute>")
-    '("line1\nline2"))
-  ACL_check("unclosed"
-    ACL_extractExecBlocks("text<allegro_execute>dangling")
-    nil)
 
   printf("\n--- SKILL Execution ---\n")
   let(((savedForm ACL_form))
