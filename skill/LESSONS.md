@@ -36,7 +36,7 @@ The BNF notation `POPUP <<name>> {"display","dispatch"}` is misleading. The actu
 ```
 POPUP <NAME>"Display1""dispatch1","Display2""dispatch2".
 ```
-Reference with `POP "NAME"` (quoted, matching the `<NAME>`). See `/opt/cadence/SPB251/share/pcb/examples/skill/form/basic/axlform.form` for working examples.
+Reference with `POP "NAME"` (quoted, matching the `<NAME>`). See `.../examples/skill/form/basic/axlform.form` for working examples.
 
 ## Form file TEXT blocks need ENDTEXT
 Every `TEXT` block must end with `ENDTEXT`, even if it has no options.

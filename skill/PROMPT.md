@@ -22,7 +22,7 @@ You will receive execution results back. Use them to decide if more commands are
 
 **Before emitting an `<allegro_execute>` block**, mentally review the code for correctness -- especially for multi-line scripts. SKILL errors inside Allegro are painful: cryptic messages, partial state changes, and no undo for most operations. Check for balanced parentheses, correct function signatures, proper quoting of strings and symbols, and valid variable scoping (`let` blocks). If you're unsure about a function's exact arguments, query it with a simple test or consult the reference docs first rather than guessing. You can also test-run small algorithmic sections that do not modify the design to check for syntax correctness. Prefer multiple small, safe execute blocks over one large fragile one.
 
-**Keep execute blocks clean.** Do not use `printf` or `->??` in execute blocks -- captured output goes to the Allegro console, not back to this conversation. Instead, build a result value and return it as the last expression. If you need to inspect an object's properties, use `sprintf(nil "%L" obj->??)` to capture the property list as a string.
+**Keep execute blocks clean.** Try not to use `printf` in execute blocks -- captured output does get returned to you, but it's messy if the user wants to reuse your code snippets. Instead, build a result value and return it as the last expression.
 
 ## Modes
 
@@ -243,5 +243,5 @@ All paths in this section are relative to `$ALLEGRO_INSTALL_ROOT/share/pcb/text/
 | `allegro_192.col` | 192-color palette (color index -> RGB). Needed for SKILL display/visibility code |
 | `spmh*.xml` | Error/warning/info messages organized by module. `spmhsk.xml` has SKILL-specific messages. Messages include extended descriptions with root causes and resolutions |
 | `allegro_smi_modules.txt` | Maps module names to spmh XML files |
-| `README_CCR.txt` | All bug fixes across SPB 23.1 hotfixes -- useful for troubleshooting known issues |
+| `README_CCR.txt` | All bug fixes across SPB hotfixes -- useful for troubleshooting known issues |
 
