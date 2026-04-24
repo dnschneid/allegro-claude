@@ -255,6 +255,7 @@ defvar(ACL_bignumRe  pcreCompile("^-?\\d{10,}$"))
 defvar(ACL_homeDir      strcat(or(getShellEnvVar("HOME") getShellEnvVar("USERPROFILE")) "/.allegro_claude"))
 defvar(ACL_notesDir       strcat(ACL_homeDir "/notes"))
 defvar(ACL_sessionsFile strcat(ACL_homeDir "/sessions.json"))
+defvar(ACL_settingsFile strcat(ACL_homeDir "/settings.json"))
 defvar(ACL_logDir       strcat(ACL_homeDir "/logs"))
 defvar(ACL_sessionLogDir ACL_logDir)
 
@@ -367,6 +368,36 @@ procedure(ACL_shellQuote(s)
   if(ACL_isWindows
     strcat("\"" pcreReplace(pcreCompile("\"") s "\\\"" 0) "\"")
     strcat("'" pcreReplace(pcreCompile("'") s "'\\''" 0) "'")))
+
+; ============================================================
+; 4b. Settings Persistence
+; ============================================================
+
+procedure(ACL_loadSettings(path)
+  let((text parsed)
+    text = ACL_readFile(path)
+    when(strlen(text) > 0
+      parsed = ACL_jParse(text)
+      when(parsed car(parsed)))))
+
+procedure(ACL_saveSettings(path settings)
+  let((tmp fp)
+    tmp = sprintf(nil "%s.tmp.%d" path stringToTime(getCurrentTime()))
+    fp = outfile(tmp)
+    when(fp
+      fprintf(fp "%s\n" ACL_jsonVal(settings))
+      close(fp)
+      renameFile(tmp path))))
+
+procedure(ACL_currentSettings()
+  list(list("mode" ACL_mode)))
+
+procedure(ACL_applySettings(settings)
+  let((val)
+    val = ACL_jGet(settings "mode")
+    when(val
+      ACL_mode = val
+      when(ACL_form axlFormSetField(ACL_form "mode" val)))))
 
 ; ============================================================
 ; 5. Session Management
@@ -676,10 +707,13 @@ procedure(ACL_drainDisplayBuf()
               "\n\nType 'approve' or 'reject' in the chat input."))
             ACL_setStatus("Awaiting approval...")
           else
-            ACL_logWrite(sprintf(nil "[exec: %s]\n\n"
-              if(strlen(code) > ACL_logCodeLimit
-                strcat(substring(code 1 (ACL_logCodeLimit - 3)) "...")
-                code)))
+            ACL_logWrite(
+              if(ACL_mode == "quiet"
+                "\n"
+                sprintf(nil "[exec: %s]\n\n"
+                  if(and(ACL_mode != "verbose" strlen(code) > ACL_logCodeLimit)
+                    strcat(substring(code 1 (ACL_logCodeLimit - 3)) "...")
+                    code))))
             ACL_execQueue = append1(or(ACL_execQueue nil) code)
             unless(ACL_execTimer
               ACL_execTimer = axlUIWTimerAdd(nil 1 t 'ACL_executeQueued))))
@@ -849,6 +883,9 @@ procedure(ACL_formCB(form)
             ACL_sendMessage(val ?uuid sprintf(nil "user%d" ACL_promptId)))))
       (field == "mode"
         ACL_mode = val
+        ACL_saveSettings(ACL_settingsFile ACL_currentSettings())
+        when(ACL_sessionLogDir
+          ACL_saveSettings(strcat(ACL_sessionLogDir "/settings.json") ACL_currentSettings()))
         ACL_setStatus(sprintf(nil "Mode: %s" val)))
       (field == "record"
         ACL_toggleRecording(form))
@@ -1096,6 +1133,10 @@ procedure(ACL_handleRestoreSession(sid)
             when(and(m car(m) car(m) > ACL_cmdSeq)
               ACL_cmdSeq = car(m)))))
       ACL_logReset()
+      ACL_applySettings(or(
+        ACL_loadSettings(strcat(ACL_sessionLogDir "/settings.json"))
+        ACL_loadSettings(ACL_settingsFile)
+        nil))
       ACL_startClaude(sid)
       ACL_appendChat(sprintf(nil "Restored session: %s" sid))
       ACL_setStatus("Ready")
@@ -1130,7 +1171,8 @@ procedure(ACL_openPanel()
     ACL_form = axlFormCreate('ACL_form formFile nil 'ACL_formCB t t)
     when(ACL_form
       axlFormDefaultButton(ACL_form "send")
-      axlFormSetField(ACL_form "mode" "auto")
+      ACL_applySettings(or(ACL_loadSettings(ACL_settingsFile) nil))
+      axlFormSetField(ACL_form "mode" ACL_mode)
       axlFormSetField(ACL_form "loglines" sprintf(nil "%d" ACL_logLineLimit))
       axlFormSetField(ACL_form "statuslabel" "Starting...")
       axlFormDisplay(ACL_form)
@@ -1238,13 +1280,13 @@ procedure(ACL_runTests()
     ACL_form = nil
     ACL_check("exec simple"
       ACL_execBlock("(plus 40 2)")
-      "Result: 42")
+      "Code: (plus 40 2)\nResult: 42")
     ACL_check("exec empty"
-      ACL_execBlock("  ")
+      ACL_execBlock("")
       "(empty block)")
     ACL_check("exec with output"
       ACL_execBlock("printf(\"hello\\n\") 99")
-      "Output:\nhello\n\nResult: 99")
+      "Code: printf(\"hello\\n\") 99\nOutput:\nhello\n\nResult: 99")
     let((errResult)
       errResult = ACL_execBlock("(undefined_function_xyz)")
       ACL_check("exec error"
@@ -1272,10 +1314,10 @@ procedure(ACL_runTests()
     ACL_logContent = nil
     ACL_logWrite("a\nb\nc\nd\ne\n")
     ACL_check("tail trunc" ACL_logTail(3) "...\nc\nd\ne\n")
-    ; exec block in one chunk: text before/after visible, code hidden
+    ; exec block in one chunk: auto mode shows [exec: ...] preview
     ACL_logContent = nil ACL_displayBuf = "" ACL_inExecBlock = nil
     ACL_streamToDisplay("before<allegro_execute>secret</allegro_execute>after")
-    ACL_check("exec flushed"   ACL_logString() "beforeafter")
+    ACL_check("exec flushed"   ACL_logString() "before[exec: secret]\n\nafter")
     ACL_check("exec residual"  ACL_displayBuf "")
     ; tag split across chunks
     ACL_logContent = nil ACL_displayBuf = "" ACL_inExecBlock = nil
@@ -1283,7 +1325,7 @@ procedure(ACL_runTests()
     ACL_check("split flushed"  ACL_logString() "text")
     ACL_check("split held"     ACL_displayBuf "<allegro_ex")
     ACL_streamToDisplay("ecute>hidden</allegro_execute>end")
-    ACL_check("split complete flushed" ACL_logString() "textend")
+    ACL_check("split complete flushed" ACL_logString() "text[exec: hidden]\n\nend")
     ACL_check("split complete residual" ACL_displayBuf "")
     ; '<' that is NOT a tag prefix flushes immediately
     ACL_logContent = nil ACL_displayBuf = "" ACL_inExecBlock = nil
@@ -1298,13 +1340,40 @@ procedure(ACL_runTests()
     ; code inside exec block containing '<' doesn't confuse close-tag search
     ACL_logContent = nil ACL_displayBuf = "" ACL_inExecBlock = nil
     ACL_streamToDisplay("hi<allegro_execute>x < 5</allegro_execute>bye")
-    ACL_check("lt in code flushed" ACL_logString() "hibye")
+    ACL_check("lt in code flushed" ACL_logString() "hi[exec: x < 5]\n\nbye")
     ACL_check("lt in code residual" ACL_displayBuf "")
-    ; newlines around exec blocks are trimmed
+    ; newlines around exec blocks
     ACL_logContent = nil ACL_displayBuf = "" ACL_inExecBlock = nil
     ACL_streamToDisplay("before\n\n<allegro_execute>code</allegro_execute>\n\nafter")
-    ACL_check("nl trim flushed" ACL_logString() "before\n\nafter")
+    ACL_check("nl trim flushed" ACL_logString() "before\n\n[exec: code]\n\nafter")
     ACL_check("nl trim residual" ACL_displayBuf "")
+    ; quiet mode: exec preview is omitted entirely
+    ACL_logContent = nil ACL_displayBuf = "" ACL_inExecBlock = nil
+    ACL_execQueue = nil
+    let(((savedMode ACL_mode))
+      ACL_mode = "quiet"
+      ACL_streamToDisplay("hi<allegro_execute>secret</allegro_execute>bye")
+      ACL_check("quiet flushed" ACL_logString() "hi\nbye")
+      ACL_check("quiet residual" ACL_displayBuf "")
+      ACL_mode = savedMode)
+    ; verbose mode: exec preview is shown in full (no truncation)
+    ACL_logContent = nil ACL_displayBuf = "" ACL_inExecBlock = nil
+    ACL_execQueue = nil
+    let(((savedMode ACL_mode) (savedLimit ACL_logCodeLimit))
+      ACL_mode = "verbose"
+      ACL_logCodeLimit = 10
+      ACL_streamToDisplay("a<allegro_execute>longcodehere</allegro_execute>b")
+      ACL_check("verbose full" ACL_logString() "a[exec: longcodehere]\n\nb")
+      ACL_check("verbose residual" ACL_displayBuf "")
+      ; auto mode truncates the same code
+      ACL_logContent = nil ACL_displayBuf = "" ACL_inExecBlock = nil
+      ACL_execQueue = nil
+      ACL_mode = "auto"
+      ACL_streamToDisplay("a<allegro_execute>longcodehere</allegro_execute>b")
+      ACL_check("auto trunc" ACL_logString() "a[exec: longcod...]\n\nb")
+      ACL_check("auto trunc residual" ACL_displayBuf "")
+      ACL_logCodeLimit = savedLimit
+      ACL_mode = savedMode)
     ; manual mode: block goes to pendingManual, not execQueue
     ACL_logContent = nil ACL_displayBuf = "" ACL_inExecBlock = nil
     ACL_execQueue = nil ACL_pendingManual = nil
@@ -1337,6 +1406,27 @@ procedure(ACL_runTests()
     formHandle = axlFormCreate('ACL_testForm formPath nil nil nil)
     ACL_check("form parse" and(formHandle t) t)
     when(formHandle axlFormClose(formHandle)))
+
+  printf("\n--- Settings ---\n")
+  let((tmpFile settings loaded (savedMode ACL_mode))
+    tmpFile = strcat(ACL_sessionLogDir "/test_settings.json")
+    ; Round-trip save/load
+    settings = list(list("mode" "verbose"))
+    ACL_saveSettings(tmpFile settings)
+    loaded = ACL_loadSettings(tmpFile)
+    ACL_check("settings roundtrip" loaded settings)
+    ACL_check("settings get mode" ACL_jGet(loaded "mode") "verbose")
+    ; currentSettings reflects ACL_mode
+    ACL_mode = "quiet"
+    ACL_check("currentSettings" ACL_currentSettings() list(list("mode" "quiet")))
+    ; applySettings updates ACL_mode
+    ACL_applySettings(list(list("mode" "manual")))
+    ACL_check("applySettings" ACL_mode "manual")
+    ; Load nonexistent file returns nil
+    ACL_check("load missing" ACL_loadSettings("/tmp/nonexistent_acl_test.json") nil)
+    ; Cleanup
+    deleteFile(tmpFile)
+    ACL_mode = savedMode)
 
   printf("\n--- IPC ---\n")
   let((proc buf ready)

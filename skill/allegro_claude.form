@@ -12,7 +12,7 @@ HEADER "Claude AI Assistant"
 
 DEFAULT send
 
-POPUP <MODE>"Auto""auto","Manual""manual".
+POPUP <MODE>"Auto""auto","Quiet""quiet","Verbose""verbose","Manual""manual".
 
 TILE
 
