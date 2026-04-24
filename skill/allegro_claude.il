@@ -214,6 +214,7 @@ procedure(ACL_normPath(path)
     pcreReplace(pcreCompile("\\\\") path "/" 0)
     path))
 
+defvar(ACL_fast nil)                ; set to t to skip preloading Allegro docs
 defvar(ACL_enableRawLog nil)       ; helps with debugging streams
 defvar(ACL_form nil)
 defvar(ACL_logContent nil)          ; accumulated log chunks (newest first)
@@ -390,14 +391,16 @@ procedure(ACL_saveSettings(path settings)
       renameFile(tmp path))))
 
 procedure(ACL_currentSettings()
-  list(list("mode" ACL_mode)))
+  list(list("mode" ACL_mode) list("fast" or(ACL_fast 'false))))
 
 procedure(ACL_applySettings(settings)
   let((val)
     val = ACL_jGet(settings "mode")
     when(val
       ACL_mode = val
-      when(ACL_form axlFormSetField(ACL_form "mode" val)))))
+      when(ACL_form axlFormSetField(ACL_form "mode" val))))
+  ACL_fast = ACL_jGet(settings "fast")
+)
 
 ; ============================================================
 ; 5. Session Management
@@ -1084,7 +1087,7 @@ procedure(ACL_handleNewSession()
   ACL_setStatus("Starting...")
   ; Preloading all Allegro documentation for significantly better accuracy.
   ; Generating the docs can take an hour. Loaded docs consumes ~200k tokens of context.
-  let((doc)
+  unless(ACL_fast let((doc)
     doc = strcat(
       ACL_notesDir "/SPB" pcreReplace(pcreCompile("[^\\w]") axlVersion('fullVersion) "_" 0) ".md")
     unless(isFile(doc)
@@ -1113,7 +1116,7 @@ procedure(ACL_handleNewSession()
       "3. Clean up any remaining sub-agent files. "
       "Until all this is complete, **be very careful to check documentation** manually before "
       "responding to queries, and warn the user that you haven't completed your survey yet.]"))
-      ?isSynthetic t ?noQuery t))
+      ?isSynthetic t ?noQuery t)))
   ACL_sendMessage(sprintf(nil "Current board: %L\nSay hello" axlGetDrawingName())
     ?isSynthetic t))
 
