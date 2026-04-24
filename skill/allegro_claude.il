@@ -8,7 +8,8 @@
 ;   --input-format stream-json and --output-format stream-json.
 ;   SKILL writes JSON user messages to claude's stdin and parses
 ;   streaming JSON responses from stdout via the async dataHandler.
-;
+;   Claude has an allegro_execute skill that uses a minimal python MCP
+;   server to exchange SKILL commands and output via files.
 
 ; ============================================================
 ; 1. JSON Parser
@@ -228,26 +229,19 @@ defvar(ACL_sessionSaved nil)       ; true after first successful reply
 defvar(ACL_mode "auto")
 defvar(ACL_lineBuf "")
 defvar(ACL_responseBuf "")
-defvar(ACL_displayBuf "")
-defvar(ACL_inExecBlock nil)
-defvar(ACL_pendingManual nil)
 defvar(ACL_lastCmdTime 0)
 defvar(ACL_recording nil)
 defvar(ACL_journalFile nil)
-defvar(ACL_cmdSeq 0)
 defvar(ACL_gotText nil)          ; set to t when any text arrives
 defvar(ACL_streamingMsgId nil)    ; message ID currently being streamed
 defvar(ACL_streamedMsgLen nil)    ; alist of (msgId . textLen) for streamed messages
 defvar(ACL_hadToolUse nil)       ; true if tool_use occurred since last text block
-defvar(ACL_execQueue nil)        ; queued exec blocks for deferred execution
-defvar(ACL_execTimer nil)        ; one-shot timer for deferred exec
 defvar(ACL_promptId 1)            ; counter for message UUIDs
 defvar(ACL_synthId 0)             ; counter for synthetic message UUIDs
 defvar(ACL_pendingInput nil)      ; text being sent (nil = not queued)
 defvar(ACL_autoUpdateInput nil)   ; t to enable auto-polling of input edits
-
-defvar(ACL_tagOpen "<allegro_execute>")
-defvar(ACL_tagClose "</allegro_execute>")
+defvar(ACL_mcpDir nil)            ; MCP IPC + log directory (per-launch)
+defvar(ACL_mcpTimer nil)          ; repeating poll timer (nil = not running)
 
 defvar(ACL_approveRe pcreCompile("^\\s*approve\\s*$" pcreGenCompileOptBits(?caseLess t)))
 defvar(ACL_rejectRe  pcreCompile("^\\s*reject\\s*$"  pcreGenCompileOptBits(?caseLess t)))
@@ -442,10 +436,26 @@ procedure(ACL_getBoardSessions(boardPath)
 ; ============================================================
 
 procedure(ACL_startClaude(@optional resumeId fork)
-  let((cmd promptFile fp installRoot projectDir args)
+  let((cmd promptFile fp installRoot projectDir args mcpConfigFile)
     ACL_stopClaude()
     createDir(ACL_homeDir)
     createDir(ACL_notesDir)
+    createDir(ACL_logDir)
+    ; ACL_mcpDir is set lazily once the session ID arrives via stream.
+    ; Both sides derive ACL_logDir/<sessionId>/ independently.
+    ACL_mcpDir = nil
+    ; Write MCP config for Claude CLI. Pass the base log dir; the MCP
+    ; server discovers its session UUID from CLAUDE_LAUNCHER_SESSION_FILE
+    ; and constructs the same per-session subdirectory.
+    mcpConfigFile = ACL_normPath(strcat(ACL_homeDir "/mcp_config.json"))
+    fp = outfile(mcpConfigFile)
+    when(fp
+      fprintf(fp "%s" ACL_jsonObj(list("mcpServers"
+        list(list("allegro" list(
+          list("command" if(ACL_isWindows "python" "python3"))
+          list("args" list(ACL_normPath(strcat(ACL_scriptDir "allegro_mcp.py"))))
+          list("env" list(list("ALLEGRO_MCP_DIR" ACL_normPath(ACL_logDir))))))))))
+      close(fp))
     promptFile = ACL_normPath(strcat(ACL_homeDir "/PROMPT.md"))
     fp = outfile(promptFile)
     when(fp
@@ -464,13 +474,15 @@ procedure(ACL_startClaude(@optional resumeId fork)
       "--include-partial-messages"
       "--replay-user-messages"
       "--append-system-prompt-file" ACL_shellQuote(promptFile)
+      "--mcp-config" ACL_shellQuote(mcpConfigFile)
       "--add-dir" ACL_shellQuote(installRoot)
       "--add-dir" ACL_shellQuote(ACL_homeDir)
       "--add-dir" ACL_shellQuote(ACL_scriptDir)
       "--add-dir" ACL_shellQuote(siteDir)
       "--add-dir" ACL_shellQuote(pcbenvDir)
       "--add-dir" ACL_shellQuote(projectDir)
-      "--allowedTools" ACL_shellQuote(strcat("Edit(" ACL_notesDir "/*)"))
+      "--allowedTools" ACL_shellQuote(strcat(
+        "Edit(" ACL_notesDir "/*),mcp__allegro__allegro_execute"))
       "--model" "opus[1m]"
       "--effort" "max")
     when(resumeId
@@ -482,9 +494,6 @@ procedure(ACL_startClaude(@optional resumeId fork)
       when(fp fprintf(fp "\n--- %s ---\n" getCurrentTime()) close(fp)))
     ACL_lineBuf = ""
     ACL_responseBuf = ""
-    ACL_displayBuf = ""
-    ACL_inExecBlock = nil
-    ACL_execQueue = nil
     ACL_streamingMsgId = nil
     ACL_streamedMsgLen = nil
     ACL_promptId = 1
@@ -504,6 +513,7 @@ procedure(ACL_stopClaude()
     ipcSignalProcess(ACL_claude 'TERM))
   ACL_claude = nil
   ACL_pendingInput = nil
+  ACL_mcpCleanup()
   when(ACL_form axlFormSetField(ACL_form "send" "Send")))
 
 procedure(ACL_ensureClaude()
@@ -530,6 +540,68 @@ procedure(ACL_sendMessage(text @key (uuid nil) (isSynthetic nil) (noQuery nil))
       when(isSynthetic pairs = append(pairs list(list("isSynthetic" t))))
       when(noQuery pairs = append(pairs list(list("shouldQuery" 'false))))
       ipcWriteProcess(ACL_claude strcat(ACL_jsonVal(pairs) "\n")))))
+
+; ============================================================
+; 6b. MCP File IPC
+; ============================================================
+
+procedure(ACL_mcpPoll(@rest args)
+  ; Execute every .il in the queue/ subdir, write a sibling .out, then
+  ; move both files back to the parent (atomically publishes completion
+  ; and clears the queue). Files in the parent dir form a persistent
+  ; log of the launch. Repeating timer: armed by ACL_mcpKick, cancelled
+  ; by ACL_mcpStopPoll.
+  when(and(ACL_mcpDir ACL_claude ipcIsAliveProcess(ACL_claude))
+    let((queueDir files base)
+      queueDir = strcat(ACL_mcpDir "/queue")
+      files = errset(getDirFiles(queueDir))
+      when(and(files car(files))
+        foreach(f sort(car(files) 'alphalessp)
+          when(and(strlen(f) > 3
+                   substring(f (strlen(f) - 2)) == ".il")
+            base = substring(f 1 (strlen(f) - 3))
+            let((code result inPath outName outPath)
+              inPath = strcat(queueDir "/" f)
+              code = ACL_readFile(inPath)
+              when(ACL_mode != "quiet"
+                ACL_logWrite(sprintf(nil "\n\n[exec: %s]\n\n"
+                  if(and(ACL_mode != "verbose"
+                         strlen(code) > ACL_logCodeLimit)
+                    strcat(substring(code 1 (ACL_logCodeLimit - 3)) "...")
+                    code))))
+              result = errset(ACL_execBlock(code))
+              result = if(result car(result)
+                "*error* SKILL execution failed unexpectedly")
+              outName = strcat(base ".out")
+              outPath = strcat(queueDir "/" outName)
+              ACL_mcpWriteFile(outPath result)
+              ; Publish: move both files out of queue/
+              renameFile(outPath strcat(ACL_mcpDir "/" outName))
+              renameFile(inPath strcat(ACL_mcpDir "/" f)))))))))
+
+procedure(ACL_mcpKick()
+  ; Start the MCP poll timer if not already running. Called from the
+  ; stream handler when a tool_use block begins. Cannot run ACL_execBlock
+  ; directly here -- evalstring inside IPC handlers deadlocks.
+  unless(ACL_mcpTimer
+    ACL_mcpTimer = axlUIWTimerAdd(nil 50 nil 'ACL_mcpPoll)))
+
+procedure(ACL_mcpStopPoll()
+  when(ACL_mcpTimer
+    errset(axlUIWTimerRemove(ACL_mcpTimer))
+    ACL_mcpTimer = nil))
+
+procedure(ACL_mcpWriteFile(path content)
+  let((fp)
+    fp = outfile(path)
+    when(fp
+      fprintf(fp "%s" content)
+      close(fp))))
+
+procedure(ACL_mcpCleanup()
+  ; Just stop polling. Keep files (they're the persistent log).
+  ACL_mcpStopPoll()
+  ACL_mcpDir = nil)
 
 ; ============================================================
 ; 7. Stream Event Processing
@@ -565,6 +637,10 @@ procedure(ACL_processStreamLine(line)
       ACL_sessionLogDir = strcat(ACL_logDir "/" ACL_sessionId)
       createDir(ACL_logDir)
       createDir(ACL_sessionLogDir)
+      ; MCP IPC lives in the same per-session dir; queue/ subdir is
+      ; where Python publishes pending commands.
+      ACL_mcpDir = ACL_sessionLogDir
+      createDir(strcat(ACL_mcpDir "/queue"))
     )
     cond(
       ; System events (init, api_retry, etc.)
@@ -616,14 +692,11 @@ procedure(ACL_processStreamLine(line)
               cblock = ACL_jGet(event "content_block")
               cond(
                 (and(cblock ACL_jGet(cblock "type") == "tool_use")
-                  ; Force-flush ALL pending display text before tool execution
-                  when(and(ACL_displayBuf strlen(ACL_displayBuf) > 0
-                           null(ACL_inExecBlock))
-                    ACL_logWrite(ACL_displayBuf)
-                    ACL_displayBuf = "")
                   ACL_hadToolUse = t
+                  ACL_mcpKick()
                   ACL_setStatus(sprintf(nil "Using %s..."
-                    or(ACL_jGet(cblock "name") "tool"))))
+                    pcreReplace(pcreCompile("^.*__")
+                      or(ACL_jGet(cblock "name") "tool") "" 0))))
                 (and(cblock ACL_jGet(cblock "type") == "text")
                   ; Add separator only if a tool_use occurred since last text
                   when(ACL_hadToolUse
@@ -670,7 +743,6 @@ procedure(ACL_processStreamLine(line)
                     axlFormSetField(ACL_form "userinput" "")
                     axlFormSetField(ACL_form "send" "Send")
                     axlFormSetActiveField(ACL_form "userinput"))
-                  ACL_drainDisplayBuf()
                   ACL_appendChat(sprintf(nil "\n\nYou: %s" content)))
                 (substring(uuid 1 4) != "user"
                   let((stripped)
@@ -680,6 +752,7 @@ procedure(ACL_processStreamLine(line)
                     ACL_appendChat(sprintf(nil "\n[%s]" stripped)))))))))
       ; Result (response complete)
       (etype == "result"
+        ACL_mcpStopPoll()
         ACL_flushDisplay()
         ACL_onResponseComplete()))))
 
@@ -689,67 +762,13 @@ procedure(ACL_processStreamLine(line)
 
 procedure(ACL_streamToDisplay(text)
   ACL_gotText = t
-  ACL_displayBuf = strcat(ACL_displayBuf text)
-  ACL_drainDisplayBuf())
-
-procedure(ACL_drainDisplayBuf()
-  prog((pos code)
-    while(and(ACL_displayBuf strlen(ACL_displayBuf) > 0
-              null(ACL_pendingManual))
-      if(ACL_inExecBlock then
-        pos = nindex(ACL_displayBuf ACL_tagClose)
-        unless(pos return(nil))
-        code = ACL_stripWS(substring(ACL_displayBuf 1 (pos - 1)))
-        ACL_displayBuf = or(substring(ACL_displayBuf (pos + strlen(ACL_tagClose))) "")
-        ACL_inExecBlock = nil
-        when(and(code strlen(code) > 0)
-          if(ACL_mode == "manual" then
-            ACL_pendingManual = append1(or(ACL_pendingManual nil) code)
-            ACL_appendChat(strcat("Proposed commands:\n"
-              buildString(ACL_formatNumbered(ACL_pendingManual "  ") "\n")
-              "\n\nType 'approve' or 'reject' in the chat input."))
-            ACL_setStatus("Awaiting approval...")
-          else
-            ACL_logWrite(
-              if(ACL_mode == "quiet"
-                "\n"
-                sprintf(nil "[exec: %s]\n\n"
-                  if(and(ACL_mode != "verbose" strlen(code) > ACL_logCodeLimit)
-                    strcat(substring(code 1 (ACL_logCodeLimit - 3)) "...")
-                    code))))
-            ACL_execQueue = append1(or(ACL_execQueue nil) code)
-            unless(ACL_execTimer
-              ACL_execTimer = axlUIWTimerAdd(nil 1 t 'ACL_executeQueued))))
-      else
-        pos = nindex(ACL_displayBuf ACL_tagOpen)
-        if(pos then
-          when(pos > 1
-            ACL_logWrite(substring(ACL_displayBuf 1 (pos - 1))))
-          ACL_displayBuf = or(substring(ACL_displayBuf (pos + strlen(ACL_tagOpen))) "")
-          ACL_inExecBlock = t
-        else
-          ; No complete open tag. Check if the buffer ends with a
-          ; partial prefix of ACL_tagOpen by finding the last '<'.
-          let((tail tailPos)
-            tail = rindex(ACL_displayBuf "<")
-            if(and(tail substring(ACL_tagOpen 1 strlen(tail)) == tail) then
-              tailPos = strlen(ACL_displayBuf) - strlen(tail) + 1
-              when(tailPos > 1
-                ACL_logWrite(substring(ACL_displayBuf 1 (tailPos - 1))))
-              ACL_displayBuf = tail
-            else
-              ACL_logWrite(ACL_displayBuf)
-              ACL_displayBuf = ""))
-          return(nil))))))
+  ACL_logWrite(text))
 
 procedure(ACL_flushDisplay()
-  when(and(ACL_displayBuf strlen(ACL_displayBuf) > 0 null(ACL_inExecBlock))
-    ACL_logWrite(ACL_displayBuf))
-  ACL_displayBuf = ""
-  ACL_inExecBlock = nil)
+  nil)
 
 ; ============================================================
-; 9. Execute Block Extraction & Execution
+; 9. SKILL Execution
 ; ============================================================
 
 procedure(ACL_stripWS(code)
@@ -758,38 +777,37 @@ procedure(ACL_stripWS(code)
 procedure(ACL_execBlock(code)
   ; Execute one SKILL block with error handling.
   ; Returns result string including any printed output.
-  prog((result err preview output port warnings)
+  prog((result preview output port warnings)
     when(or(null(code) strlen(code) == 0)
       return("(empty block)"))
+    ; Check if axl* functions used are defined
+    let((docError)
+      docError = ACL_checkFuncDocs(code)
+      when(docError
+        return(sprintf(nil "ERROR: %s" docError))))
     ACL_setStatus("Executing SKILL...")
-    ACL_logCmd(code)
     ; Execute with:
     ;   poport redirect to capture printf output
     ;   muffleWarnings to capture warnings
     ;   errsetstring to capture errors as strings (nil=suppress console)
     port = outstring()
-    err = muffleWarnings(let(((poport port))
+    result = muffleWarnings(let(((poport port))
       errsetstring(code nil)))
     output = getOutstring(port)
     close(port)
     warnings = getMuffleWarnings()
-    ; err is list(result) on success, nil on error
-    if(err then
-      result = car(err)
+    ; result is list(result) on success, nil on error
+    if(result then
+      result = car(result)
     else
       result = sprintf(nil "*error* %L" or(errset.errset "unknown error")))
     ACL_lastCmdTime = stringToTime(getCurrentTime())
-    ; Check if axl* functions used are defined
-    let((docWarning)
-      docWarning = ACL_checkFuncDocs(code)
-      return(strcat(
-        sprintf(nil "Code: %s\n" code)
-        if(docWarning sprintf(nil "WARNING: %s\n" docWarning) "")
-        if(and(warnings length(warnings) > 0)
-          sprintf(nil "Warnings:\n%s\n" buildString(warnings "\n")) "")
-        if(and(output strlen(output) > 0)
-          sprintf(nil "Output:\n%s\n" output) "")
-        sprintf(nil "Result: %L" result))))))
+    return(strcat(
+      if(and(warnings length(warnings) > 0)
+        sprintf(nil "Warnings:\n%s\n" buildString(warnings "\n")) "")
+      if(and(output strlen(output) > 0)
+        sprintf(nil "Output:\n%s\n" output) "")
+      sprintf(nil "Result: %L" result)))))
 
 procedure(ACL_checkFuncDocs(code)
   ; Check if axl* function names used in code are actually defined.
@@ -814,57 +832,16 @@ procedure(ACL_checkFuncDocs(code)
         rest = substring(rest end))
       pos = when(rest nindex(rest "axl")))
     when(missing
-      sprintf(nil "Undefined functions: %s. These do not exist. Read algroskill/algroskill.json to find correct function names."
+      sprintf(nil "Undefined functions: %s. These do not exist. Check the Allegro documentation."
         buildString(missing ", ")))))
-
-procedure(ACL_logCmd(code)
-  ; Log command to file for reference.
-  when(ACL_sessionId
-    errset(let((fp)
-      ACL_cmdSeq++
-      fp = outfile(sprintf(nil "%s/cmd_%06d.il" ACL_sessionLogDir ACL_cmdSeq))
-      when(fp fprintf(fp "%s\n" code) close(fp))))))
 
 ; ============================================================
 ; 10. Response Complete Handler
 ; ============================================================
 
-procedure(ACL_formatNumbered(items @optional (prefix ""))
-  ; Format list items as numbered lines.
-  let((i) i = 0
-    mapcar(lambda((item) i++ sprintf(nil "%s%d. %s" prefix i item))
-      items)))
-
 procedure(ACL_onResponseComplete()
   ACL_responseBuf = ""
-  unless(ACL_pendingManual
-    ACL_setStatus("Ready")))
-
-procedure(ACL_sendResults(results)
-  let((resultText msg preview)
-    resultText = strcat("Execution results:\n"
-      buildString(ACL_formatNumbered(results "Result ") "\n"))
-    msg = strcat(resultText
-      "\n\nContinue if more commands are needed, "
-      "or summarize the outcome.")
-    when(ACL_mode == "manual"
-      preview = if(strlen(resultText) > ACL_resultTruncLimit
-        strcat(substring(resultText 1 (ACL_resultTruncLimit - 4)) "\n...")
-        resultText)
-      ACL_appendChat(preview))
-    ACL_setStatus("Thinking...")
-    ACL_sendMessage(msg ?isSynthetic t)))
-
-procedure(ACL_executeQueued(@rest args)
-  ; Called by axlUIWTimerAdd (args: window timerId elapsedTime).
-  ; Executes queued blocks and sends results back to Claude.
-  let((blocks results)
-    ACL_execTimer = nil
-    blocks = ACL_execQueue
-    ACL_execQueue = nil
-    when(blocks
-      results = mapcar('ACL_execBlock blocks)
-      ACL_sendResults(results))))
+  ACL_setStatus("Ready"))
 
 ; ============================================================
 ; 11. Form Callback
@@ -917,15 +894,6 @@ procedure(ACL_doSend(form)
           axlFormSetField(form "userinput" "")
           axlFormSetActiveField(form "userinput")
           ACL_handleReject())
-        ; Any other text while manual approval pending acts as reject + new input
-        (ACL_pendingManual
-          ACL_handleReject(nil)
-          axlFormSetField(form "userinput" "")
-          axlFormSetActiveField(form "userinput")
-          ACL_appendChat(sprintf(nil "\n\nYou: %s" text))
-          ACL_handleUserMessage(text)
-          ACL_promptId++
-          ACL_pendingInput = nil)
         ; Already queued - re-send if text changed
         (ACL_pendingInput
           unless(text == ACL_pendingInput
@@ -990,7 +958,6 @@ procedure(ACL_pollInput(@rest args)
 procedure(ACL_handleUserMessage(text)
   ACL_setStatus("Thinking...")
   ACL_responseBuf = ""
-  ACL_execQueue = nil
   ACL_pendingInput = text
   let((elapsed prefix systemUuid userUuid)
     elapsed = stringToTime(getCurrentTime()) - ACL_lastCmdTime
@@ -999,7 +966,7 @@ procedure(ACL_handleUserMessage(text)
         "[The board may have been edited. Re-query the design instead of relying on memory.] "
         "")
       if(ACL_mode == "manual"
-        " [MANUAL MODE: List all commands you would execute as <allegro_execute> blocks. I will review and approve first.]"
+        " [MANUAL MODE: Describe what you would do and the SKILL code, but do NOT call allegro_execute yet. Wait for approval.]"
         ""))
     userUuid = sprintf(nil "user%d" ACL_promptId)
     ; Send system prefix as synthetic (not displayed, no response generated)
@@ -1011,24 +978,19 @@ procedure(ACL_handleUserMessage(text)
     when(ACL_autoUpdateInput ACL_startInputPoll())))
 
 procedure(ACL_handleApprove()
-  when(ACL_pendingManual
-    ACL_setStatus("Executing...")
-    let((results)
-      results = mapcar('ACL_execBlock ACL_pendingManual)
-      ACL_pendingManual = nil
-      ACL_drainDisplayBuf()
-      ACL_sendResults(results))))
+  ACL_appendChat("Approved.")
+  ACL_setStatus("Executing...")
+  ACL_sendMessage(
+    "Approved. Go ahead and execute the proposed commands."
+    ?isSynthetic t))
 
 procedure(ACL_handleReject(@optional (notify t))
-  when(ACL_pendingManual
-    ACL_pendingManual = nil
-    ACL_drainDisplayBuf()
-    ACL_appendChat("Rejected.")
-    when(notify
-      ACL_setStatus("Thinking...")
-      ACL_sendMessage(
-        "The user rejected the proposed commands. Ask what they'd like instead."
-        ?isSynthetic t))))
+  ACL_appendChat("Rejected.")
+  when(notify
+    ACL_setStatus("Thinking...")
+    ACL_sendMessage(
+      "The user rejected the proposed commands. Ask what they'd like instead."
+      ?isSynthetic t)))
 
 procedure(ACL_handleJournal(contents)
   ACL_setStatus("Analyzing...")
@@ -1121,20 +1083,11 @@ procedure(ACL_handleNewSession()
     ?isSynthetic t))
 
 procedure(ACL_handleRestoreSession(sid)
-  let((info files)
+  let((info)
     info = ACL_getSession(sid)
     if(info then
       ACL_sessionId = sid
       ACL_sessionLogDir = strcat(ACL_logDir "/" ACL_sessionId)
-      ; Find highest existing command sequence number
-      ACL_cmdSeq = 0
-      files = errset(getDirFiles(ACL_sessionLogDir))
-      when(and(files car(files))
-        foreach(f car(files)
-          let((m)
-            m = errset(atoi(pcreReplace(pcreCompile("^cmd_0*") f "" 0)))
-            when(and(m car(m) car(m) > ACL_cmdSeq)
-              ACL_cmdSeq = car(m)))))
       ACL_logReset()
       ACL_applySettings(or(
         ACL_loadSettings(strcat(ACL_sessionLogDir "/settings.json"))
@@ -1283,13 +1236,13 @@ procedure(ACL_runTests()
     ACL_form = nil
     ACL_check("exec simple"
       ACL_execBlock("(plus 40 2)")
-      "Code: (plus 40 2)\nResult: 42")
+      "Result: 42")
     ACL_check("exec empty"
       ACL_execBlock("")
       "(empty block)")
     ACL_check("exec with output"
       ACL_execBlock("printf(\"hello\\n\") 99")
-      "Code: printf(\"hello\\n\") 99\nOutput:\nhello\n\nResult: 99")
+      "Output:\nhello\n\nResult: 99")
     let((errResult)
       errResult = ACL_execBlock("(undefined_function_xyz)")
       ACL_check("exec error"
@@ -1300,13 +1253,12 @@ procedure(ACL_runTests()
   printf("\n--- Display Streaming ---\n")
   let(((savedForm ACL_form) (savedLog ACL_logContent))
     ACL_form = nil
-    ; plain text: flushes immediately, nothing held back
-    ACL_logContent = nil ACL_displayBuf = "" ACL_inExecBlock = nil
+    ; plain text goes straight to log
+    ACL_logContent = nil
     ACL_streamToDisplay("hello world")
     ACL_check("plain flush"    ACL_logString() "hello world")
-    ACL_check("plain residual" ACL_displayBuf "")
     ; partial line continuation via rplaca
-    ACL_logContent = nil ACL_displayBuf = "" ACL_inExecBlock = nil
+    ACL_logContent = nil
     ACL_logWrite("hel")
     ACL_logWrite("lo\nwor")
     ACL_logWrite("ld")
@@ -1317,91 +1269,48 @@ procedure(ACL_runTests()
     ACL_logContent = nil
     ACL_logWrite("a\nb\nc\nd\ne\n")
     ACL_check("tail trunc" ACL_logTail(3) "...\nc\nd\ne\n")
-    ; exec block in one chunk: auto mode shows [exec: ...] preview
-    ACL_logContent = nil ACL_displayBuf = "" ACL_inExecBlock = nil
-    ACL_streamToDisplay("before<allegro_execute>secret</allegro_execute>after")
-    ACL_check("exec flushed"   ACL_logString() "before[exec: secret]\n\nafter")
-    ACL_check("exec residual"  ACL_displayBuf "")
-    ; tag split across chunks
-    ACL_logContent = nil ACL_displayBuf = "" ACL_inExecBlock = nil
-    ACL_streamToDisplay("text<allegro_ex")
-    ACL_check("split flushed"  ACL_logString() "text")
-    ACL_check("split held"     ACL_displayBuf "<allegro_ex")
-    ACL_streamToDisplay("ecute>hidden</allegro_execute>end")
-    ACL_check("split complete flushed" ACL_logString() "text[exec: hidden]\n\nend")
-    ACL_check("split complete residual" ACL_displayBuf "")
-    ; '<' that is NOT a tag prefix flushes immediately
-    ACL_logContent = nil ACL_displayBuf = "" ACL_inExecBlock = nil
-    ACL_streamToDisplay("x < 5 is true")
-    ACL_check("lt flush"       ACL_logString() "x < 5 is true")
-    ACL_check("lt residual"    ACL_displayBuf "")
-    ; '<' non-tag followed by real partial tag
-    ACL_logContent = nil ACL_displayBuf = "" ACL_inExecBlock = nil
-    ACL_streamToDisplay(" 5 < 7 so <allegro_")
-    ACL_check("mixed flushed"  ACL_logString() " 5 < 7 so ")
-    ACL_check("mixed held"     ACL_displayBuf "<allegro_")
-    ; code inside exec block containing '<' doesn't confuse close-tag search
-    ACL_logContent = nil ACL_displayBuf = "" ACL_inExecBlock = nil
-    ACL_streamToDisplay("hi<allegro_execute>x < 5</allegro_execute>bye")
-    ACL_check("lt in code flushed" ACL_logString() "hi[exec: x < 5]\n\nbye")
-    ACL_check("lt in code residual" ACL_displayBuf "")
-    ; newlines around exec blocks
-    ACL_logContent = nil ACL_displayBuf = "" ACL_inExecBlock = nil
-    ACL_streamToDisplay("before\n\n<allegro_execute>code</allegro_execute>\n\nafter")
-    ACL_check("nl trim flushed" ACL_logString() "before\n\n[exec: code]\n\nafter")
-    ACL_check("nl trim residual" ACL_displayBuf "")
-    ; quiet mode: exec preview is omitted entirely
-    ACL_logContent = nil ACL_displayBuf = "" ACL_inExecBlock = nil
-    ACL_execQueue = nil
-    let(((savedMode ACL_mode))
-      ACL_mode = "quiet"
-      ACL_streamToDisplay("hi<allegro_execute>secret</allegro_execute>bye")
-      ACL_check("quiet flushed" ACL_logString() "hi\nbye")
-      ACL_check("quiet residual" ACL_displayBuf "")
-      ACL_mode = savedMode)
-    ; verbose mode: exec preview is shown in full (no truncation)
-    ACL_logContent = nil ACL_displayBuf = "" ACL_inExecBlock = nil
-    ACL_execQueue = nil
-    let(((savedMode ACL_mode) (savedLimit ACL_logCodeLimit))
-      ACL_mode = "verbose"
-      ACL_logCodeLimit = 10
-      ACL_streamToDisplay("a<allegro_execute>longcodehere</allegro_execute>b")
-      ACL_check("verbose full" ACL_logString() "a[exec: longcodehere]\n\nb")
-      ACL_check("verbose residual" ACL_displayBuf "")
-      ; auto mode truncates the same code
-      ACL_logContent = nil ACL_displayBuf = "" ACL_inExecBlock = nil
-      ACL_execQueue = nil
-      ACL_mode = "auto"
-      ACL_streamToDisplay("a<allegro_execute>longcodehere</allegro_execute>b")
-      ACL_check("auto trunc" ACL_logString() "a[exec: longcod...]\n\nb")
-      ACL_check("auto trunc residual" ACL_displayBuf "")
-      ACL_logCodeLimit = savedLimit
-      ACL_mode = savedMode)
-    ; manual mode: block goes to pendingManual, not execQueue
-    ACL_logContent = nil ACL_displayBuf = "" ACL_inExecBlock = nil
-    ACL_execQueue = nil ACL_pendingManual = nil
-    let(((savedMode ACL_mode))
-      ACL_mode = "manual"
-      ACL_streamToDisplay("hi<allegro_execute>code1</allegro_execute>more")
-      ACL_check("manual pending" ACL_pendingManual '("code1"))
-      ACL_check("manual queue"   ACL_execQueue nil)
-      ; display freezes while pending
-      ACL_check("manual frozen"  nindex(ACL_logString() "more") nil)
-      ACL_check("manual held"    ACL_displayBuf "more")
-      ; reject clears and drains
-      ACL_handleReject(nil)
-      ACL_check("reject cleared" ACL_pendingManual nil)
-      ACL_check("reject drained" ACL_displayBuf "")
-      ; approve clears and drains
-      ACL_logContent = nil ACL_displayBuf = "" ACL_inExecBlock = nil
-      ACL_pendingManual = nil
-      ACL_streamToDisplay("a<allegro_execute>(plus 1 2)</allegro_execute>b")
-      ACL_handleApprove()
-      ACL_check("approve cleared" ACL_pendingManual nil)
-      ACL_check("approve drained" ACL_displayBuf "")
-      ACL_mode = savedMode)
     ACL_form = savedForm
     ACL_logContent = savedLog)
+
+  printf("\n--- MCP File IPC ---\n")
+  let(((savedForm ACL_form) (savedDir ACL_mcpDir) (savedClaude ACL_claude))
+    ACL_form = nil
+    ACL_mcpDir = strcat(ACL_homeDir "/mcp_test")
+    createDir(ACL_mcpDir)
+    createDir(strcat(ACL_mcpDir "/queue"))
+    ; Need a live process for ACL_mcpPoll guard
+    ACL_claude = ipcBeginProcess("cat" "" nil nil)
+    ipcWaitForProcess(ACL_claude)
+    ; Drop a queued cmd file; poll should execute, write .out, and move both
+    let((fp queuePath outPath result)
+      queuePath = strcat(ACL_mcpDir "/queue/cmd_99.il")
+      fp = outfile(queuePath)
+      when(fp fprintf(fp "(plus 40 2)") close(fp))
+      ACL_mcpPoll()
+      outPath = strcat(ACL_mcpDir "/cmd_99.out")
+      ACL_check("mcp out exists" and(isFile(outPath) t) t)
+      ACL_check("mcp queue cleared"
+        and(isFile(strcat(ACL_mcpDir "/queue/cmd_99.il")) t) nil)
+      ACL_check("mcp cmd preserved"
+        and(isFile(strcat(ACL_mcpDir "/cmd_99.il")) t) t)
+      result = ACL_readFile(outPath)
+      ACL_check("mcp out content" result "Result: 42"))
+    ; Re-poll: empty queue, nothing happens
+    ACL_mcpPoll()
+    ACL_check("mcp idle ok"
+      and(isFile(strcat(ACL_mcpDir "/cmd_99.out")) t) t)
+    ; Clean up
+    ipcKillProcess(ACL_claude)
+    let((files)
+      foreach(d list(strcat(ACL_mcpDir "/queue") ACL_mcpDir)
+        files = errset(getDirFiles(d))
+        when(and(files car(files))
+          foreach(f car(files)
+            when(and(f f != "." f != "..")
+              errset(deleteFile(strcat(d "/" f))))))))
+    ACL_mcpDir = savedDir
+    ACL_claude = savedClaude
+    ACL_form = savedForm)
 
   printf("\n--- Form File ---\n")
   let((formPath formHandle)
@@ -1421,7 +1330,8 @@ procedure(ACL_runTests()
     ACL_check("settings get mode" ACL_jGet(loaded "mode") "verbose")
     ; currentSettings reflects ACL_mode
     ACL_mode = "quiet"
-    ACL_check("currentSettings" ACL_currentSettings() list(list("mode" "quiet")))
+    ACL_check("currentSettings" ACL_currentSettings()
+      list(list("mode" "quiet") list("fast" 'false)))
     ; applySettings updates ACL_mode
     ACL_applySettings(list(list("mode" "manual")))
     ACL_check("applySettings" ACL_mode "manual")
@@ -1467,17 +1377,34 @@ procedure(ACL_runTests()
         unless(ACL_gotText ipcSleep(1)))
       ACL_check("claude response" ACL_gotText t)
       ; SKILL execution round-trip test:
-      ; Ask Claude to use <allegro_execute> to run a SKILL expression
+      ; Ask Claude to use the allegro_execute MCP tool. We pump
+      ; ACL_mcpPoll() manually because axlUIWTimer callbacks don't
+      ; fire reliably under -nograph + ipcSleep in the batch harness.
       printf("  Testing SKILL execution round-trip...\n")
       ACL_responseBuf = ""
       ACL_gotText = nil
-      ACL_sendMessage("Execute this SKILL expression using <allegro_execute> tags and report the result: (plus 40 2)")
-      for(i 1 120
-        unless(ACL_gotText ipcSleep(1)))
+      ACL_sendMessage("Execute this SKILL expression using the allegro_execute tool and report the result: (plus 40 2)")
+      for(i 1 180
+        unless(ACL_gotText
+          when(ACL_mcpDir ACL_mcpPoll())
+          ipcSleep(1)))
       ACL_check("skill exec response" ACL_gotText t)
-      ; The response should contain 42 somewhere (from evalstring of (plus 40 2))
-      when(ACL_gotText
-        printf("  SKILL exec result received\n"))
+      ; Inspect actual artifacts: at least one cmd_*.out should exist
+      ; and contain "42" somewhere in the result.
+      let((files outContent foundExec)
+        files = errset(getDirFiles(ACL_sessionLogDir))
+        foundExec = nil
+        outContent = ""
+        when(and(files car(files))
+          foreach(f car(files)
+            when(and(strlen(f) > 4
+                     substring(f (strlen(f) - 3)) == ".out")
+              foundExec = t
+              outContent = strcat(outContent
+                ACL_readFile(strcat(ACL_sessionLogDir "/" f))))))
+        ACL_check("mcp tool was called" foundExec t)
+        ACL_check("mcp result contains 42"
+          and(nindex(outContent "42") t) t))
       ACL_stopClaude()
       ACL_check("claude stop" ACL_claude nil)
     else

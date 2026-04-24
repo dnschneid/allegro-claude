@@ -1,6 +1,6 @@
 # SKILL Pitfalls
 
-Common mistakes when writing SKILL code are included here. **Review these before emitting `<allegro_execute>` blocks.**
+Common mistakes when writing SKILL code are included here. **Review these before calling `allegro_execute`.**
 
 Your own notes are in `$ALLEGRO_CLAUDE_NOTES/LESSONS.md` and are copied below. Update the file without prompting as you learn new unituitive behaviors about SKILL and Allegro.
 
