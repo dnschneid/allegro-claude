@@ -676,6 +676,10 @@ procedure(ACL_drainDisplayBuf()
               "\n\nType 'approve' or 'reject' in the chat input."))
             ACL_setStatus("Awaiting approval...")
           else
+            ACL_logWrite(sprintf(nil "[exec: %s]\n\n"
+              if(strlen(code) > ACL_logCodeLimit
+                strcat(substring(code 1 (ACL_logCodeLimit - 3)) "...")
+                code)))
             ACL_execQueue = append1(or(ACL_execQueue nil) code)
             unless(ACL_execTimer
               ACL_execTimer = axlUIWTimerAdd(nil 1 t 'ACL_executeQueued))))
@@ -718,15 +722,10 @@ procedure(ACL_execBlock(code)
   ; Execute one SKILL block with error handling.
   ; Returns result string including any printed output.
   prog((result err preview output port warnings)
-    code = ACL_stripWS(code)
     when(or(null(code) strlen(code) == 0)
       return("(empty block)"))
     ACL_setStatus("Executing SKILL...")
     ACL_logCmd(code)
-    preview = if(strlen(code) > ACL_logCodeLimit
-      strcat(substring(code 1 (ACL_logCodeLimit - 3)) "...")
-      code)
-    ACL_logWrite(sprintf(nil "[exec: %s]\n\n" preview))
     ; Execute with:
     ;   poport redirect to capture printf output
     ;   muffleWarnings to capture warnings
