@@ -100,3 +100,39 @@ Use `color -globvis off` to turn everything off, then `color -vis "CLASS/SUBCLAS
 
 ## `axlDBGetDesign()` property names differ from docs
 The docs list `->vias`, `->branches`, `->ratTs`, `->comps`, and `->xnets` as design properties, but **these properties do not exist**. SKILL silently returns nil for nonexistent properties, making it look like an empty list. The actual property for extended nets is `->xnet` (singular, not `xnets`). `->pins` exists but is always nil. To enumerate vias or pins, use the selection API (`axlSetFindFilter`/`axlAddSelectAll`/`axlGetSelSet`). To get branches, access per-net via `net->branches`. Use `->components` not `->comps`. Use `->xnet` not `->xnets`. Use `obj->?` to discover valid properties before guessing.
+
+## Never invoke Cadence binaries directly from a shell
+Tools like `specctra`, `allegro`, etc. are normally invoked through Allegro's command shell (e.g. `axlShellPost("specctra")`) or via Cadence's launcher scripts. Running the `.../bin/...` binary directly:
+- Bypasses Cadence env setup (license server discovery, CDS_INST_DIR, paths)
+- Has no access to the loaded design in the running Allegro session
+- Often hits glibc/library mismatches under `LD_LIBRARY_PATH` quirks
+- Skips the integration that imports the routed `.ses` back into the design
+
+If you need to drive an external Cadence tool, dispatch it as an Allegro command from the live session, not as a subprocess.
+
+## Net pin/route topology lives nested, not flat
+`net->branches->children` returns pins and (when routed) a `path` object. The `path` is a *container* — its actual segments are in `path->segments` (a list of `line`/`arc`/`via` dbids). Don't conclude a net is "unrouted" just because the immediate branch children are pins; always drill into the path's segments. A 54-segment serpentine route shows up as a single `path` child of a single `branch`.
+
+## Rats don't tell the whole story about a net
+A single ratsnest line on a net does NOT mean the net is unrouted. It means there's exactly one unconnected pin-pair. The net can be 95% routed with two stub paths and one small gap — the rat just bridges that gap. Always inspect existing `branches`/`paths` before assuming the autorouter needs to start from scratch.
+
+## DP partner geometry is the routing template
+For a diff pair where one side is routed and the other has a small gap, the right move is to read the partner net's geometry in the gap region (X/Y range, layer, width), then lay down a parallel trace at the existing DP gap distance. Don't bother with Specctra for one stub — `axlPathStart` + `axlDBCreatePath` does it in two calls.
+
+## Watch arc endpoint orientation when joining clines
+A standalone arc segment has TWO endpoints — picking the wrong one creates a slope where you wanted a straight line. Before connecting a new segment to an existing arc, check both `(car arc->startEnd)` and `(cadr arc->startEnd)` and pick the endpoint that gives the geometry you actually want. The "obvious" endpoint (e.g. the higher Y on a vertical run) may be the *outer* end of a fanout arc, not the inner end that matches your target X.
+
+## Deleting a single merged cline segment works cleanly
+`axlDBCreatePath` merges new clines with adjacent existing ones, so an "added segment" becomes part of a longer path. To remove it, find the segment dbid in `path->segments` and call `axlDeleteObject(seg)` — it removes just that segment without disturbing the rest. Don't try to delete the whole merged path and rebuild.
+
+## `axlDBCreatePath` returns `(dbids t)` even when DRCs aren't real
+The second element of the result is a "DRCs were created" flag, but it's conservative — Allegro reports `t` whenever the operation *could* have produced DRCs, not only when it actually did. Always re-query DRC count via `axlSetFindFilter` with `"DRCS"` (not `"DRCERRORS"`) to get the real count.
+
+## To find rats, count branches — there is no "rat" objType
+Branch children have objType `"pin"`, `"path"`, `"via"`, `"tee"`, or `"shape"` — never `"rat"`, `"ratsnest"`, or `"rat_t"`. Searching for those returns nothing even when the canvas clearly shows a rat. The actual signal that a net has a visible rat is `length(net->branches) > 1`: each gap in routing splits the net into another branch, with the rat spanning the gap. The find-filter keyword `"RATSNESTS"` also works via `axlAddSelectAll`, but for "is this net partially routed" the branch-count check is the direct test.
+
+## SKILL find-filter keyword for DRCs is `"DRCS"`
+Not `"DRCERRORS"`, not `"drc_errors"`. The keyword list is documented in `axlSetFindFilter.html`. When in doubt, read the table — guessing wastes a round-trip.
+
+## `let` body that ends in a `foreach` returns nil
+`let((...) foreach(... ))` evaluates to nil because `foreach` returns nil. To return a value from a `let` block that drives a loop, accumulate into a variable and reference it as the last expression: `let((acc) acc=nil foreach(... acc=cons(...)) acc)`. Same pattern for `while`.
