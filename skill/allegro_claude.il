@@ -781,7 +781,7 @@ procedure(ACL_stripWS(code)
 procedure(ACL_execBlock(code)
   ; Execute one SKILL block with error handling.
   ; Returns result string including any printed output.
-  prog((result preview output port warnings)
+  prog((result preview output port warnings msgCtx shellMsgs)
     when(or(null(code) strlen(code) == 0)
       return("(empty block)"))
     ; Check if axl* functions used are defined
@@ -793,10 +793,14 @@ procedure(ACL_execBlock(code)
     ; Execute with:
     ;   poport redirect to capture printf output
     ;   muffleWarnings to capture warnings
+    ;   axlMsgContext to capture Allegro shell errors (axlShellPost etc)
     ;   errsetstring to capture errors as strings (nil=suppress console)
     port = outstring()
+    msgCtx = axlMsgContextStart("allegro_execute")
     result = muffleWarnings(let(((poport port))
       errsetstring(code nil)))
+    shellMsgs = axlMsgContextGetString(msgCtx)
+    axlMsgContextFinish(msgCtx)
     output = getOutstring(port)
     close(port)
     warnings = getMuffleWarnings()
@@ -807,6 +811,8 @@ procedure(ACL_execBlock(code)
       result = sprintf(nil "*error* %L" or(errset.errset "unknown error")))
     ACL_lastCmdTime = stringToTime(getCurrentTime())
     return(strcat(
+      if(and(shellMsgs length(shellMsgs) > 0)
+        sprintf(nil "Allegro messages:\n%s\n" buildString(shellMsgs "\n")) "")
       if(and(warnings length(warnings) > 0)
         sprintf(nil "Warnings:\n%s\n" buildString(warnings "\n")) "")
       if(and(output strlen(output) > 0)

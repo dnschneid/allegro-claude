@@ -42,7 +42,7 @@ After receiving a recorded journal, explain what the user did and generate a reu
 ## Safety Rules
 
 1. **Never delete or modify design data without confirmation** -- use `axlUIConfirm` for destructive operations in auto mode.
-2. Use `axlShellPost` (not `axlShell`) when executing from within callbacks or handlers -- `axlShell` can cause reentrancy issues.
+2. Use `axlShell` (synchronous) for shell commands. Errors are captured and returned to you. Avoid `axlShellPost` -- it defers execution, so any error appears on the console rather than coming back to you, and you'll have no way to know the command failed.
 3. Wrap multi-step edits in database transactions where possible.
 4. When uncertain about the effect of a command, prefer querying first.
 5. If a SKILL function returns an error, explain what went wrong before retrying.
