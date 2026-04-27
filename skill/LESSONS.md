@@ -1,3 +1,105 @@
+# Arc segment API
+
+## axlPathArcCenter creates a true arc segment, but the endpoint AND center MUST be exactly equidistant from the start
+If the center isn't equidistant from start and end (within Allegro's accuracy tolerance), the arc silently degrades to a straight-line segment — segment will exist on the net, but `seg->arcCenter` and `seg->arcRadius` will be nil and `seg->objType` will be `"line"` instead of `"arc"`. Compute the perpendicular bisector center carefully. Verify after creation by reading `seg->objType` (looking for `"arc"`) or `seg->xy` (the arc center).
+
+## Arc path segments use `xy` for center, `radius` for radius, `isClockwise` for direction
+Despite the function being called axlPath**Arc**Center, the resulting segment's center is read via `seg->xy` not `seg->arcCenter`. Other arc properties: `seg->radius`, `seg->isClockwise`, `seg->isCircle`, `seg->objType == "arc"`.
+
+## Arc bow direction follows from center side AND clockwise flag — easy to get backwards
+For an arc from p1 to p2 with center C, the SHORT (minor) arc passes through the apex on the OPPOSITE side of the chord from C. To make the arc bow toward direction D from the chord, place center C in direction -D from the chord midpoint. Then to actually trace the minor arc:
+- If center is "above" chord (north) and you're going west→east: use **CCW** (g_clockwise=nil) — minor arc bows south
+- If center is "above" chord and you're going east→west: use **CW** (g_clockwise=t) — minor arc bows south
+- General rule: CW vs CCW depends on which endpoint is "first" relative to center; trial-and-error after computing center is fastest.
+
+Verify by reading back `seg->bBox` after creation: if the apex bbox is on the wrong side, flip the g_clockwise flag and retry.
+
+# Routing strategies
+
+## Use Allegro's interactive `add connect` engine when DRC-clean diff pair routing matters
+Programmatic SKILL routing is good for: completing simple stubs, mirroring partner geometry mostly-correctly, bridging gaps in mostly-routed nets. For DRC-clean diff pair routing across a complex board, use `add connect` interactively — it knows about gather, swap, gap maintenance, length matching, and pad keepouts.
+
+## When connecting across two component layers at the same XY, you need a fanout
+Two SMD components on opposite layers can have a pin at exactly the same (x, y) but on different copper layers. They're not electrically connected — you need:
+- A short trace fanning OUT to free space on the source layer
+- A through via at the fanout endpoint
+- A trace coming back IN on the destination layer
+The fanout direction must avoid neighboring component pads. Check `comp->symbol->layer` for the layer (TOP / BOTTOM) — the design symbol layer tells you which side the SMD pads land on.
+
+## Mirror a partner net's path as the route plan, then only edit what doesn't fit
+For diff pair routing where the partner is fully routed, the cleanest programmatic approach is:
+1. Chain the partner's segments end-to-end starting from the partner's pin nearest your start pin
+2. Generate the parallel offset path (see "parallel offset construction" below)
+3. Add entry/exit stubs from your pins to the offset path (small arcs work well)
+4. Address remaining DRCs by tweaking specific segments
+
+This gets you to "geometry close enough that Allegro's interactive `slide` / `add connect replace etch` can finish it" much faster than building from scratch.
+
+## Parallel offset construction (the math that actually works)
+
+For each segment of the partner, generate a corresponding parallel segment offset by `gap_centerline` to one side ("right of travel" or "left of travel"):
+
+**Line segment** from `s` to `e`:
+- Travel direction: `d = (e - s) / |e - s|`
+- Right perpendicular (rotate travel vector 90° CW): `n = (d.y, -d.x)`
+- Offset endpoints: `s' = s + offset * n`, `e' = e + offset * n`
+
+**Arc segment** with center `C`, radius `r`, going CCW (or CW):
+- Same center, new radius
+- For "P right of N traveling forward":
+  - CCW arc: right of travel = outside the curve → `r' = r + offset`
+  - CW arc: right of travel = inside the curve → `r' = r - offset`
+- New start: `s' = C + (s - C) * (r' / r)` (project along radius vector)
+- New end: `e' = C + (e - C) * (r' / r)`
+- Same direction flag
+
+When chaining the partner's segments end-to-end and a segment is found in reverse direction, **flip the cw flag** along with swapping start/end (an arc traversed backward looks CW↔CCW reversed).
+
+If you do this correctly with proper line/arc differentiation, gap is constant along the parallel run — zero DiffPair Minimum Gap violations.
+
+## Naively offsetting all vertices in X by a constant doesn't work
+Shifting all of N's vertices by `+0.31` in X gives correct gap only where N runs vertically. Where N is diagonal, the perpendicular distance to N is `0.31 / √2 ≈ 0.22mm` — too close. Always offset perpendicular to the local segment direction.
+
+## Treating arcs as straight-line approximations doesn't work either
+If you only walk `seg->startEnd` (ignoring `seg->objType == "arc"` and `seg->xy` center), you'll lay down chord lines where N has arcs. Gap fluctuates. Always check the segment type and offset arcs as arcs.
+
+## Serpentines on the partner = length-matching only, NOT coupled
+When the partner has a serpentine wiggle, that section is intentionally uncoupled — the length adjustment lives entirely on the partner. Don't mirror the wiggle. Two strategies, in increasing order of cleanliness:
+
+1. **Chord replacement**: replace the serpentine in N's chain with a single straight chord from its start to its end. Offset P perpendicular to that chord. Some DiffPair Min Gap violations remain (against N's bumps near the chord) — these are conventionally waived.
+
+2. **Follow the entry/exit jogs (PREFERRED)**: A serpentine usually has short jogs on each side that bring N from its main spine direction onto the serpentine baseline. If P mirrors those entry and exit jogs, P sits exactly `gap` below the baseline. The middle of P becomes a single STRAIGHT horizontal at `baseline_y - gap`, with constant gap to N's lowest bumps. **Zero DiffPair Min Gap violations** because the high bumps are further away than the low bumps and the low bumps are exactly at gap distance.
+
+   Construction: keep N's segs 0..k where seg k ends on the baseline. Replace segs k+1..m-1 (the wiggle) with a single straight line from seg k's end to seg m's start. Keep seg m..end (where seg m is the exit jog).
+
+## Identify the serpentine programmatically
+The serpentine is the contiguous sub-chain where N's segments oscillate in one coordinate (e.g., Y bounces between two values). Look for: many short segments, alternating arc directions, Y-coordinates returning to the same values. The first segment AFTER the serpentine resumes the trajectory of the segment BEFORE it — confirm by checking that seg `m`'s direction continues seg `k-1`'s direction.
+
+## Iterate DRC count to know if you're winning
+Track DRC count after each design change. With diff pair routing, the mix of DRC types is informative:
+- Lots of "DiffPair Minimum Gap" → your offset construction is wrong
+- Lots of "Line to Line Spacing" / "Line to Thru Via Spacing" → your trace is hitting other nets (entry/exit stub design issue)
+- "Line to SMD Pin Spacing" → trace too close to a pad in the entry/exit area
+
+DRC type breakdown points to which part of your plan needs adjustment. Don't just look at total count.
+
+## Width matters: gap = centerline_offset - line_width
+A 0.31mm centerline offset between two 0.0914mm wide traces gives 0.31 - 0.0914 = 0.219mm edge-to-edge. If the rule requires 0.2159mm edge-to-edge, you have only 0.003mm margin — any vertex-quantization or arc-mirror imprecision will fail. Use a comfortable margin, e.g. centerline 0.35mm to give 0.259mm gap edge-to-edge.
+
+# Net topology
+
+## A path is gone after `axlDeleteObject` but the dbid you got back stays in your variable
+After deleting a path, re-querying `net->branches` shows it gone, but the dbid reference you stored returns `dbid:removed`. Don't reuse old dbids — always re-query.
+
+## When a transaction `mark` is held but never committed, subsequent SKILL `axlDB` writes go into limbo
+If you call `axlDBTransactionStart('foo)` and then forget to commit/rollback, your subsequent path creates may appear to succeed (return a dbid) but won't show up in `net->branches`. Always commit:
+```
+mark = axlDBTransactionStart('foo)
+... do work ...
+axlDBTransactionCommit(mark)
+```
+Or if you don't need transaction semantics, don't open one — direct `axlDBCreate*` calls auto-commit.
+
 # SKILL Pitfalls
 
 Common mistakes when writing SKILL code are included here. **Review these before calling `allegro_execute`.**
@@ -136,3 +238,22 @@ Not `"DRCERRORS"`, not `"drc_errors"`. The keyword list is documented in `axlSet
 
 ## `let` body that ends in a `foreach` returns nil
 `let((...) foreach(... ))` evaluates to nil because `foreach` returns nil. To return a value from a `let` block that drives a loop, accumulate into a variable and reference it as the last expression: `let((acc) acc=nil foreach(... acc=cons(...)) acc)`. Same pattern for `while`.
+
+## DB-modifying SKILL functions silently return nil when an interactive command is active
+If `axlDBCreatePath`, `axlDBCreateLine`, `axlDBTransactionStart`, etc. all return nil with no error and no errset info, there is likely an interactive Allegro command in progress (e.g. `add connect` was started or a dialog is visible). SKILL DB writes are blocked until that command completes/cancels. Symptoms:
+- `axlDBTransactionStart('mark)` returns nil instead of an integer mark
+- `axlDBCreate*` returns nil silently (not an error)
+- `errset.errset` is nil — no error captured
+- `axlUIAppMode('inAppMode)` returns t
+
+To recover: ask the user to cancel/finish the active command (F9 / `cancel` / `done` in Allegro's command window), or try `axlShellPost("cancel")` followed by `ipcSleep(1)` and re-check `axlUIAppMode('inAppMode)` is nil before retrying. The `inAppMode` flag may be sticky even after the command clears — try a small no-op create (e.g. a throwaway line on `BOARD GEOMETRY/DIMENSION`) to test whether DB writes are actually working before concluding the command is still blocking.
+
+## drcupdate is asynchronous — wait before reading DRC counts
+`axlShellPost("drcupdate")` queues the recompute but returns immediately. Querying DRC count right after returns stale (often 0) results until the recompute finishes. Always `ipcSleep(5)` or more before reading via `axlAddSelectAll` on the DRC find filter. For a large board (~1000 nets) wait 5-8 seconds. If you see suspiciously low DRC counts after a change you know created violations, sleep more and re-query.
+
+## Coordinate accessors (xCoord, yCoord) and `:` infix don't compose well in nested contexts
+SKILL's `:` infix for forming xy points fails when its operand is a function call result. E.g., `xCoord(car(shifted)):yCoord(car(shifted))` errors with "not a function". Workaround: extract scalar values to local vars first, then build with `list(x y)` not `x:y`. The colon syntax is for literal/simple expressions only.
+
+## `when`/`if` reject chained-accessor expressions in some contexts
+`when(c->net && c->net->name == "X" ...)` may parse as not-a-function. Workaround: nest `when`s, or assign the chain to a local first.
+
