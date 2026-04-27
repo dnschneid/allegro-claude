@@ -1087,6 +1087,10 @@ procedure(ACL_handleSessionPick()
           ACL_handleRestoreSession(sid)
           ACL_handleForkSession(sid))))))
 
+procedure(ACL_basename(path)
+  ; Last path component of a "/"-or-"\"-separated path.
+  pcreReplace(pcreCompile("^.*[/\\\\]") path "" 0))
+
 procedure(ACL_findOrPlanDocs()
   ; Look for the cached Allegro docs file across known locations.
   ; Filename is "SPB<sanitized-version>.md". We try the exact version
@@ -1125,35 +1129,72 @@ procedure(ACL_handleNewSession()
   ACL_setStatus("Starting...")
   ; Preloading all Allegro documentation for significantly better accuracy.
   ; Generating the docs can take an hour. Loaded docs consumes ~200k tokens of context.
-  unless(ACL_fast let((doc)
+  unless(ACL_fast let((doc choice generate)
     doc = ACL_findOrPlanDocs()
+    generate = nil
     unless(isFile(doc)
-      ACL_appendChat(strcat("No documentation cache exists for this version of Allegro.\n"
-        "I need to explore the install and accumulate the documentation. It'll take about an hour "
-        "to complete, but it's worth it -- I promise. Please keep this window open.\n"
-        "I can still help while this is going on, but I might be slower to respond.")))
-    ACL_sendMessage(
-      if(isFile(doc)
-        strcat("[CRITICAL: Read **every single line** of `" doc "` into your context. "
-          "It is very large and requires reading in chunks -- do it completely, totally silently, "
-          "no narration, and no status updates. Help the user while you do it.]")
-        strcat("[CRITICAL: Do the following steps exactly, giving only extremely succinct progress "
-      "updates -- as little status output as possible to avoid confusing the conversation:"
-      "1. Spawn sub-agents (aim for <25 functions each) to thoroughly read through *all* of the "
-      "Allegro documentation you have access to and accumulate that knowledge into `" doc "` "
-      "with extensive detail, sufficient to be able to reliably use every single API and interface "
-      "on your first try, as well as understand and apply topics, concepts, and usages covered in "
-      "more free-form documentation and examples. "
-      "The agents should take extra time to ensure complete coverage of all of the interfaces "
-      "enumerated in TOCs, and take special note of things that were omitted from the TOC. "
-      "The agents should write incrementally to avoid timing out on large writes. "
-      "This may take an hour and should result in a large file. "
-      "2. Once ready, read **every single line** of `" doc "` into your context. "
-      "It is very large and requires reading in chunks -- do it completely. "
-      "3. Clean up any remaining sub-agent files. "
-      "Until all this is complete, **be very careful to check documentation** manually before "
-      "responding to queries, and warn the user that you haven't completed your survey yet.]"))
-      ?isSynthetic t ?noQuery t)))
+      ; No cache exists. Ask the user (Yes / No / Cancel = Never ask again)
+      ; before kicking off the ~1hr documentation crawl.
+      choice = axlUIYesNoCancel(strcat(
+        "No Allegro documentation cache exists for this version.\n\n"
+        "Generating it takes about an hour and >>100M tokens, but dramatically improves "
+        "accuracy. The result is written to:\n  " doc "\n\n"
+        "Generate the cache now?\n\n"
+        "Yes      - generate\n"
+        "No       - skip this time (you will get tips on bringing in a cache)\n"
+        "Cancel   - never ask again (sets fast mode)")
+        "Allegro Claude: documentation cache" 'yes)
+      cond(
+        (choice == 1
+          ; Yes -- proceed with generation
+          generate = t
+          ACL_appendChat(strcat(
+            "Generating Allegro documentation cache. It'll take about an "
+            "hour but is worth it. Please keep this window open. I can "
+            "still help while this is going on, but I might be slower to "
+            "respond.")))
+        (choice == 2
+          ; Cancel -- never ask again, persist fast mode
+          ACL_fast = t
+          ACL_saveSettings(ACL_settingsFile ACL_currentSettings())
+          ACL_appendChat(strcat(
+            "Skipping documentation cache permanently (fast mode). "
+            "Edit " ACL_settingsFile " to re-enable.")))
+        (t
+          ; No -- skip this session, but explain where the file is
+          ; expected so the user can drop in a pre-built copy.
+          ACL_appendChat(strcat(
+            "Skipping documentation cache for this session. If you "
+            "already have a cache file, place it at any of:\n"
+            "  " ACL_notesDir "/\n"
+            "  " ACL_normPath(axlGetVariable("allegro_pcbenv")) "/\n"
+            "  " ACL_normPath(axlGetVariable("allegro_site")) "/\n"
+            "  " ACL_scriptDir "\n"
+            "named " ACL_basename(doc) " (or the version-without-hotfix "
+            "equivalent).")))))
+    when(or(isFile(doc) generate)
+      ACL_sendMessage(
+        if(isFile(doc)
+          strcat("[CRITICAL: Read **every single line** of `" doc "` into your context. "
+            "It is very large and requires reading in chunks -- do it completely, totally silently, "
+            "no narration, and no status updates. Help the user while you do it.]")
+          strcat("[CRITICAL: Do the following steps exactly, giving only extremely succinct progress "
+            "updates -- as little status output as possible to avoid confusing the conversation: "
+            "1. Spawn sub-agents (aim for <25 functions each) to thoroughly read through *all* of the "
+            "Allegro documentation you have access to and accumulate that knowledge into `" doc "` "
+            "with extensive detail, sufficient to be able to reliably use every single API and interface "
+            "on your first try, as well as understand and apply topics, concepts, and usages covered in "
+            "more free-form documentation and examples. "
+            "The agents should take extra time to ensure complete coverage of all of the interfaces "
+            "enumerated in TOCs, and take special note of things that were omitted from the TOC. "
+            "The agents should write incrementally to avoid timing out on large writes. "
+            "This may take an hour and should result in a large file. "
+            "2. Once ready, read **every single line** of `" doc "` into your context. "
+            "It is very large and requires reading in chunks -- do it completely. "
+            "3. Clean up any remaining sub-agent files. "
+            "Until all this is complete, **be very careful to check documentation** manually before "
+            "responding to queries, and warn the user that you haven't completed your survey yet.]"))
+        ?isSynthetic t ?noQuery t))))
   ACL_sendMessage(sprintf(nil "Current board: %L\nSay hello" axlGetDrawingName())
     ?isSynthetic t))
 

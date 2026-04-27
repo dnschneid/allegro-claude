@@ -10,6 +10,8 @@ Integrating Claude into the Allegro PCB designer environment.
 
 In Allegro SKILL (or in an ilinit), `load(".../allegro-claude/skill/allegro_claude.il")` then launch with the `claude` command.
 
+Claude does its best work when it pre-loads the Allegro documentation, but this requires a massive (1MB pure markdown) cache. The cache differs by release and cannot be shared in this repo since the docs are only available to Cadence subscribers. Generating the cache is an extremely expensive operation -- taking an hour and consuming >>100M tokens. If you are in an organization, you should place any sourced or generated cache into `ALLEGRO_SITE` to avoid each user generating it themselves. Launching `claude` in Allegro will search for any cache and explain your options if it can't be found.
+
 ## Files
 
 ### skill/
