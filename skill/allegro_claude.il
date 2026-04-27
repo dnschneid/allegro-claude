@@ -756,7 +756,7 @@ procedure(ACL_processStreamLine(line)
                     axlFormSetField(ACL_form "userinput" "")
                     axlFormSetField(ACL_form "send" "Send")
                     axlFormSetActiveField(ACL_form "userinput"))
-                  ACL_appendChat(sprintf(nil "\n\nYou: %s" content)))
+                  ACL_appendChat(sprintf(nil "\n\nYou: %s\n" content)))
                 (substring(uuid 1 4) != "user"
                   let((stripped)
                     stripped = pcreReplace(
