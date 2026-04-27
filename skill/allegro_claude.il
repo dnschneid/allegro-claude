@@ -781,7 +781,7 @@ procedure(ACL_stripWS(code)
 procedure(ACL_execBlock(code)
   ; Execute one SKILL block with error handling.
   ; Returns result string including any printed output.
-  prog((result preview output port warnings msgCtx shellMsgs)
+  prog((result errInfo errMsg output port warnings shellMsgs jfile)
     when(or(null(code) strlen(code) == 0)
       return("(empty block)"))
     ; Check if axl* functions used are defined
@@ -790,34 +790,71 @@ procedure(ACL_execBlock(code)
       when(docError
         return(sprintf(nil "ERROR: %s" docError))))
     ACL_setStatus("Executing SKILL")
+    ; Capture Allegro shell messages via a temporary journal. This is
+    ; the only mechanism that catches errors from axlShell sub-commands
+    ; AND axlMsgPut output (errport/poport/errset/muffleWarnings/
+    ; axlMsgContext all miss them). Skip if the user has a recording
+    ; active -- we can't have two journals.
+    unless(ACL_recording
+      jfile = strcat(ACL_sessionLogDir "/exec_journal.scr")
+      errset(axlJournal(jfile)))
     ; Execute with:
     ;   poport redirect to capture printf output
     ;   muffleWarnings to capture warnings
-    ;   axlMsgContext to capture Allegro shell errors (axlShellPost etc)
     ;   errsetstring to capture errors as strings (nil=suppress console)
+    ; CRITICAL: capture errset.errset before doing anything else --
+    ; subsequent SKILL operations clobber it.
     port = outstring()
-    msgCtx = axlMsgContextStart("allegro_execute")
     result = muffleWarnings(let(((poport port))
       errsetstring(code nil)))
-    shellMsgs = axlMsgContextGetString(msgCtx)
-    axlMsgContextFinish(msgCtx)
+    errInfo = errset.errset
     output = getOutstring(port)
     close(port)
     warnings = getMuffleWarnings()
+    ; Stop journal and parse messages
+    when(jfile
+      errset(axlJournal('close))
+      shellMsgs = ACL_readJournalMsgs(jfile))
     ; result is list(result) on success, nil on error
     if(result then
-      result = car(result)
+      result = sprintf(nil "Result: %L" car(result))
     else
-      result = sprintf(nil "*error* %L" or(errset.errset "unknown error")))
+      ; errInfo format: ("funcName" lineNum t nil ("*Error* full message"))
+      errMsg = if(and(errInfo listp(errInfo) length(errInfo) >= 5
+                      listp(nth(4 errInfo)))
+        car(nth(4 errInfo))
+        "*error* unknown error")
+      result = errMsg)
     ACL_lastCmdTime = stringToTime(getCurrentTime())
     return(strcat(
-      if(and(shellMsgs length(shellMsgs) > 0)
-        sprintf(nil "Allegro messages:\n%s\n" buildString(shellMsgs "\n")) "")
+      if(and(shellMsgs strlen(shellMsgs) > 0)
+        sprintf(nil "Allegro messages:\n%s\n" shellMsgs) "")
       if(and(warnings length(warnings) > 0)
         sprintf(nil "Warnings:\n%s\n" buildString(warnings "\n")) "")
       if(and(output strlen(output) > 0)
         sprintf(nil "Output:\n%s\n" output) "")
-      sprintf(nil "Result: %L" result)))))
+      result))))
+
+procedure(ACL_readJournalMsgs(path)
+  ; Pull message lines from an Allegro journal. Lines start with "\\t "
+  ; (info: axlMsgPut output) or "\\e " (errors). Skip the journal
+  ; header/footer (start/end markers, host info, version banner).
+  let((fp line out msg trimmed)
+    out = ""
+    fp = infile(path)
+    when(fp
+      while(gets(line fp)
+        when(or(substring(line 1 3) == "\\t " substring(line 1 3) == "\\e ")
+          ; Strip "\t (HH:MM:SS) " or "\e (HH:MM:SS) " prefix
+          msg = pcreReplace(pcreCompile("^\\\\[te] \\(\\d+:\\d+:\\d+\\) ?")
+            line "" 0)
+          trimmed = pcreReplace(pcreCompile("^\\s+|\\s+$") msg "" 0)
+          ; Skip journal boilerplate lines
+          unless(or(strlen(trimmed) == 0
+                    pcreMatchp(pcreCompile("^(allegro [0-9]|Host=|CmdLine=|Journal (start|end))") trimmed))
+            out = strcat(out trimmed "\n"))))
+      close(fp))
+    out))
 
 procedure(ACL_checkFuncDocs(code)
   ; Check if axl* function names used in code are actually defined.
@@ -1256,7 +1293,25 @@ procedure(ACL_runTests()
     let((errResult)
       errResult = ACL_execBlock("(undefined_function_xyz)")
       ACL_check("exec error"
-        and(nindex(errResult "*error*") t)
+        and(nindex(errResult "*Error*") t)
+        t))
+    ; Allegro shell errors should be captured via the journal
+    let((shellResult)
+      shellResult = ACL_execBlock("axlShell(\"zoom bogus\")")
+      ACL_check("exec captures shell error"
+        and(nindex(shellResult "Command not found") t)
+        t))
+    ; SKILL error() message text should survive
+    let((errResult)
+      errResult = ACL_execBlock("error(\"my custom error\")")
+      ACL_check("exec preserves error msg"
+        and(nindex(errResult "my custom error") t)
+        t))
+    ; axlMsgPut output should be captured (journal)
+    let((msgResult)
+      msgResult = ACL_execBlock("axlMsgPut(\"a logged note\")")
+      ACL_check("exec captures axlMsgPut"
+        and(nindex(msgResult "a logged note") t)
         t))
     ACL_form = savedForm)
 
