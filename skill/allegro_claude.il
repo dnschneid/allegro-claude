@@ -487,6 +487,7 @@ procedure(ACL_startClaude(@optional resumeId fork)
       "--add-dir" ACL_shellQuote(projectDir)
       "--allowedTools" ACL_shellQuote(strcat(
         "Edit(" ACL_notesDir "/*),mcp__allegro__allegro_execute"))
+      "--disallowedTools" "AskUserQuestion"
       "--model" "opus[1m]"
       "--effort" "max")
     when(resumeId
