@@ -216,6 +216,7 @@ procedure(ACL_normPath(path)
     path))
 
 defvar(ACL_fast nil)                ; set to t to skip preloading Allegro docs
+defvar(ACL_claudeArgs "")            ; extra flags appended to claude CLI invocation
 defvar(ACL_enableRawLog nil)       ; helps with debugging streams
 defvar(ACL_form nil)
 defvar(ACL_logContent nil)          ; accumulated log chunks (newest first)
@@ -389,7 +390,9 @@ procedure(ACL_saveSettings(path settings)
       renameFile(tmp path))))
 
 procedure(ACL_currentSettings()
-  list(list("mode" ACL_mode) list("fast" or(ACL_fast 'false))))
+  list(list("mode" ACL_mode)
+       list("fast" or(ACL_fast 'false))
+       list("claudeArgs" or(ACL_claudeArgs ""))))
 
 procedure(ACL_applySettings(settings)
   let((val)
@@ -398,6 +401,9 @@ procedure(ACL_applySettings(settings)
       ACL_mode = val
       when(ACL_form axlFormSetField(ACL_form "mode" val))))
   ACL_fast = ACL_jGet(settings "fast")
+  let((ca)
+    ca = ACL_jGet(settings "claudeArgs")
+    when(stringp(ca) ACL_claudeArgs = ca))
 )
 
 ; ============================================================
@@ -495,6 +501,8 @@ procedure(ACL_startClaude(@optional resumeId fork)
       args = append1(args resumeId)
       when(fork args = append1(args "--fork-session")))
     cmd = buildString(args " ")
+    when(and(stringp(ACL_claudeArgs) strlen(ACL_claudeArgs) > 0)
+      cmd = strcat(cmd " " ACL_claudeArgs))
     let((fp) fp = outfile(strcat(ACL_homeDir "/raw.log") "a")
       when(fp fprintf(fp "\n--- %s ---\n" getCurrentTime()) close(fp)))
     ACL_lineBuf = ""
@@ -1581,10 +1589,15 @@ procedure(ACL_runTests()
     ; currentSettings reflects ACL_mode
     ACL_mode = "quiet"
     ACL_check("currentSettings" ACL_currentSettings()
-      list(list("mode" "quiet") list("fast" 'false)))
+      list(list("mode" "quiet") list("fast" 'false) list("claudeArgs" "")))
     ; applySettings updates ACL_mode
     ACL_applySettings(list(list("mode" "manual")))
     ACL_check("applySettings" ACL_mode "manual")
+    ; claudeArgs round-trips
+    let(((savedClaudeArgs ACL_claudeArgs))
+      ACL_applySettings(list(list("claudeArgs" "--debug api,hooks")))
+      ACL_check("applySettings claudeArgs" ACL_claudeArgs "--debug api,hooks")
+      ACL_claudeArgs = savedClaudeArgs)
     ; Load nonexistent file returns nil
     ACL_check("load missing" ACL_loadSettings("/tmp/nonexistent_acl_test.json") nil)
     ; Cleanup
