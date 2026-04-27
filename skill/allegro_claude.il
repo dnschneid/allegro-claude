@@ -1087,6 +1087,35 @@ procedure(ACL_handleSessionPick()
           ACL_handleRestoreSession(sid)
           ACL_handleForkSession(sid))))))
 
+procedure(ACL_findOrPlanDocs()
+  ; Look for the cached Allegro docs file across known locations.
+  ; Filename is "SPB<sanitized-version>.md". We try the exact version
+  ; (with hotfix, e.g. SPB25_1_2025_S020.md) first across all dirs,
+  ; then the version without the hotfix suffix (e.g. SPB25_1_2025.md).
+  ; Returns the first match found. If nothing matches, returns the
+  ; notes-dir path with the exact-version filename so the agent can
+  ; create it there.
+  let((exactName baseName dirs found)
+    exactName = strcat("SPB"
+      pcreReplace(pcreCompile("[^\\w]") axlVersion('fullVersion) "_" 0)
+      ".md")
+    ; Strip the hotfix suffix (trailing "_S<digits>" or "_HF<digits>")
+    baseName = pcreReplace(pcreCompile("_(S|HF)\\d+\\.md$")
+      exactName ".md" 0)
+    dirs = list(ACL_notesDir
+                ACL_normPath(axlGetVariable("allegro_pcbenv"))
+                ACL_normPath(axlGetVariable("allegro_site"))
+                ACL_scriptDir)
+    ; Exact filename in any dir wins; then the less-specific (no hotfix).
+    ; pcreReplace strips a trailing slash so the join is consistent.
+    foreach(name list(exactName baseName)
+      foreach(d dirs
+        when(and(d null(found))
+          let((path)
+            path = strcat(pcreReplace(pcreCompile("/$") d "" 0) "/" name)
+            when(isFile(path) found = path)))))
+    or(found strcat(ACL_notesDir "/" exactName))))
+
 procedure(ACL_handleNewSession()
   ACL_sessionId = nil
   ACL_sessionSaved = nil
@@ -1097,8 +1126,7 @@ procedure(ACL_handleNewSession()
   ; Preloading all Allegro documentation for significantly better accuracy.
   ; Generating the docs can take an hour. Loaded docs consumes ~200k tokens of context.
   unless(ACL_fast let((doc)
-    doc = strcat(
-      ACL_notesDir "/SPB" pcreReplace(pcreCompile("[^\\w]") axlVersion('fullVersion) "_" 0) ".md")
+    doc = ACL_findOrPlanDocs()
     unless(isFile(doc)
       ACL_appendChat(strcat("No documentation cache exists for this version of Allegro.\n"
         "I need to explore the install and accumulate the documentation. It'll take about an hour "
@@ -1383,6 +1411,121 @@ procedure(ACL_runTests()
     formHandle = axlFormCreate('ACL_testForm formPath nil nil nil)
     ACL_check("form parse" and(formHandle t) t)
     when(formHandle axlFormClose(formHandle)))
+
+  printf("\n--- Doc Lookup ---\n")
+  let(((savedNotes ACL_notesDir) (savedScript ACL_scriptDir)
+       (savedSite axlGetVariable("allegro_site"))
+       (savedPcb axlGetVariable("allegro_pcbenv"))
+       doc exactName baseName notesDir pcbDir siteDir scriptDir)
+    notesDir = strcat(ACL_homeDir "/doc_test_notes")
+    pcbDir = strcat(ACL_homeDir "/doc_test_pcbenv")
+    siteDir = strcat(ACL_homeDir "/doc_test_site")
+    scriptDir = strcat(ACL_homeDir "/doc_test_script/")
+    foreach(d list(notesDir pcbDir siteDir scriptDir) createDir(d))
+    ACL_notesDir = notesDir
+    ACL_scriptDir = scriptDir
+    axlSetVariable("allegro_pcbenv" pcbDir)
+    axlSetVariable("allegro_site" siteDir)
+    exactName = strcat("SPB"
+      pcreReplace(pcreCompile("[^\\w]") axlVersion('fullVersion) "_" 0) ".md")
+    baseName = pcreReplace(pcreCompile("_(S|HF)\\d+\\.md$")
+      exactName ".md" 0)
+    ; Helper closures via let-bound functions aren't great in SKILL,
+    ; so just inline a writer + cleaner.
+    let((fp p)
+      ; ---- 1. No files anywhere -> default to notesDir/exactName
+      doc = ACL_findOrPlanDocs()
+      ACL_check("doc default to notesDir"
+        doc strcat(notesDir "/" exactName))
+
+      ; ---- 2. Exact in scriptDir wins (alone)
+      p = strcat(scriptDir exactName)
+      fp = outfile(p) when(fp fprintf(fp "x") close(fp))
+      ACL_check("doc exact in scriptDir" ACL_findOrPlanDocs() p)
+      deleteFile(p)
+
+      ; ---- 3. Exact in siteDir wins (alone)
+      p = strcat(siteDir "/" exactName)
+      fp = outfile(p) when(fp fprintf(fp "x") close(fp))
+      ACL_check("doc exact in siteDir" ACL_findOrPlanDocs() p)
+      deleteFile(p)
+
+      ; ---- 4. Exact in pcbDir wins (alone)
+      p = strcat(pcbDir "/" exactName)
+      fp = outfile(p) when(fp fprintf(fp "x") close(fp))
+      ACL_check("doc exact in pcbDir" ACL_findOrPlanDocs() p)
+      deleteFile(p)
+
+      ; ---- 5. Exact in notesDir wins (alone)
+      p = strcat(notesDir "/" exactName)
+      fp = outfile(p) when(fp fprintf(fp "x") close(fp))
+      ACL_check("doc exact in notesDir" ACL_findOrPlanDocs() p)
+      deleteFile(p)
+
+      ; ---- 6. Dir priority: notesDir > pcbenv when both have exact
+      let((pNotes pPcb)
+        pNotes = strcat(notesDir "/" exactName)
+        pPcb = strcat(pcbDir "/" exactName)
+        fp = outfile(pNotes) when(fp fprintf(fp "n") close(fp))
+        fp = outfile(pPcb) when(fp fprintf(fp "p") close(fp))
+        ACL_check("doc notesDir beats pcbenv" ACL_findOrPlanDocs() pNotes)
+        deleteFile(pNotes) deleteFile(pPcb))
+
+      ; ---- 7. Dir priority: pcbenv > site
+      let((pPcb pSite)
+        pPcb = strcat(pcbDir "/" exactName)
+        pSite = strcat(siteDir "/" exactName)
+        fp = outfile(pPcb) when(fp fprintf(fp "p") close(fp))
+        fp = outfile(pSite) when(fp fprintf(fp "s") close(fp))
+        ACL_check("doc pcbenv beats site" ACL_findOrPlanDocs() pPcb)
+        deleteFile(pPcb) deleteFile(pSite))
+
+      ; ---- 8. Dir priority: site > scriptDir
+      let((pSite pScript)
+        pSite = strcat(siteDir "/" exactName)
+        pScript = strcat(scriptDir exactName)
+        fp = outfile(pSite) when(fp fprintf(fp "s") close(fp))
+        fp = outfile(pScript) when(fp fprintf(fp "x") close(fp))
+        ACL_check("doc site beats scriptDir" ACL_findOrPlanDocs() pSite)
+        deleteFile(pSite) deleteFile(pScript))
+
+      ; ---- 9. Exact in scriptDir beats base in notesDir
+      let((pExact pBase)
+        pExact = strcat(scriptDir exactName)
+        pBase = strcat(notesDir "/" baseName)
+        fp = outfile(pExact) when(fp fprintf(fp "e") close(fp))
+        fp = outfile(pBase) when(fp fprintf(fp "b") close(fp))
+        ACL_check("doc exact anywhere beats base in notes"
+          ACL_findOrPlanDocs() pExact)
+        deleteFile(pExact) deleteFile(pBase))
+
+      ; ---- 10. Base name found in notesDir when no exact exists
+      p = strcat(notesDir "/" baseName)
+      fp = outfile(p) when(fp fprintf(fp "x") close(fp))
+      ACL_check("doc base in notesDir" ACL_findOrPlanDocs() p)
+      deleteFile(p)
+
+      ; ---- 11. Base name found in scriptDir when nothing else
+      p = strcat(scriptDir baseName)
+      fp = outfile(p) when(fp fprintf(fp "x") close(fp))
+      ACL_check("doc base in scriptDir" ACL_findOrPlanDocs() p)
+      deleteFile(p)
+
+      ; ---- 12. Base in notesDir beats base in pcbenv (priority within base)
+      let((pNotes pPcb)
+        pNotes = strcat(notesDir "/" baseName)
+        pPcb = strcat(pcbDir "/" baseName)
+        fp = outfile(pNotes) when(fp fprintf(fp "n") close(fp))
+        fp = outfile(pPcb) when(fp fprintf(fp "p") close(fp))
+        ACL_check("doc base priority" ACL_findOrPlanDocs() pNotes)
+        deleteFile(pNotes) deleteFile(pPcb)))
+    axlSetVariable("allegro_site" savedSite)
+    axlSetVariable("allegro_pcbenv" savedPcb)
+    ACL_scriptDir = savedScript
+    ACL_notesDir = savedNotes
+    ; Best-effort cleanup (no-op if dirs aren't empty).
+    foreach(d list(notesDir pcbDir siteDir scriptDir)
+      errset(deleteDir(d))))
 
   printf("\n--- Settings ---\n")
   let((tmpFile settings loaded (savedMode ACL_mode))
