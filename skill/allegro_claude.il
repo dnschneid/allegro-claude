@@ -211,7 +211,7 @@ defvar(ACL_claude nil)
 defvar(ACL_isWindows (getShellEnvVar("OS") == "Windows_NT"))
 
 procedure(ACL_normPath(path)
-  if(and(path ACL_isWindows)
+  if(and(stringp(path) ACL_isWindows)
     pcreReplace(pcreCompile("\\\\") path "/" 0)
     path))
 
@@ -1123,7 +1123,7 @@ procedure(ACL_findOrPlanDocs()
     ; pcreReplace strips a trailing slash so the join is consistent.
     foreach(name list(exactName baseName)
       foreach(d dirs
-        when(and(d null(found))
+        when(and(stringp(d) null(found))
           let((path)
             path = strcat(pcreReplace(pcreCompile("/$") d "" 0) "/" name)
             when(isFile(path) found = path)))))
