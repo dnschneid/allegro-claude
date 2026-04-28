@@ -264,6 +264,11 @@ defvar(ACL_scriptDir
 ; 4. Utilities
 ; ============================================================
 
+procedure(ACL_renameOver(src dst)
+  ; renameFile fails on Windows if dst exists. Atomic on POSIX.
+  when(and(ACL_isWindows isFile(dst)) errset(deleteFile(dst)))
+  renameFile(src dst))
+
 procedure(ACL_readFile(path)
   prog((fp text line)
     fp = infile(path)
@@ -387,7 +392,7 @@ procedure(ACL_saveSettings(path settings)
     when(fp
       fprintf(fp "%s\n" ACL_jsonVal(settings))
       close(fp)
-      renameFile(tmp path))))
+      ACL_renameOver(tmp path))))
 
 procedure(ACL_currentSettings()
   list(list("mode" ACL_mode)
@@ -424,7 +429,7 @@ procedure(ACL_saveSessions(sessions)
     when(fp
       fprintf(fp "%s\n" ACL_jsonVal(sessions))
       close(fp)
-      renameFile(tmp ACL_sessionsFile))))
+      ACL_renameOver(tmp ACL_sessionsFile))))
 
 procedure(ACL_addSession(sid info)
   let((sessions)
@@ -591,8 +596,8 @@ procedure(ACL_mcpPoll(@rest args)
               outPath = strcat(queueDir "/" outName)
               ACL_mcpWriteFile(outPath result)
               ; Publish: move both files out of queue/
-              renameFile(outPath strcat(ACL_mcpDir "/" outName))
-              renameFile(inPath strcat(ACL_mcpDir "/" f)))))))))
+              ACL_renameOver(outPath strcat(ACL_mcpDir "/" outName))
+              ACL_renameOver(inPath strcat(ACL_mcpDir "/" f)))))))))
 
 procedure(ACL_mcpKick()
   ; Start the MCP poll timer if not already running. Called from the
