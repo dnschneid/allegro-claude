@@ -251,7 +251,7 @@ defvar(ACL_bignumRe  pcreCompile("^-?\\d{10,}$"))
 
 defvar(ACL_homeDir  ; use ~/.local/share to help with sandboxing
   strcat(or(getShellEnvVar("XDG_DATA_HOME")
-            strcat(or(getShellEnvVar("HOME") getShellEnvVar("USERPROFILE"))
+            strcat(or(getShellEnvVar("USERPROFILE") getShellEnvVar("HOME"))
                    "/.local/share"))
          "/allegro_claude"))
 defvar(ACL_notesDir       strcat(ACL_homeDir "/notes"))
