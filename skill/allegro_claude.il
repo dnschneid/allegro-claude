@@ -249,7 +249,11 @@ defvar(ACL_approveRe pcreCompile("^\\s*approve\\s*$" pcreGenCompileOptBits(?case
 defvar(ACL_rejectRe  pcreCompile("^\\s*reject\\s*$"  pcreGenCompileOptBits(?caseLess t)))
 defvar(ACL_bignumRe  pcreCompile("^-?\\d{10,}$"))
 
-defvar(ACL_homeDir      strcat(or(getShellEnvVar("HOME") getShellEnvVar("USERPROFILE")) "/.allegro_claude"))
+defvar(ACL_homeDir  ; use ~/.local/share to help with sandboxing
+  strcat(or(getShellEnvVar("XDG_DATA_HOME")
+            strcat(or(getShellEnvVar("HOME") getShellEnvVar("USERPROFILE"))
+                   "/.local/share"))
+         "/allegro_claude"))
 defvar(ACL_notesDir       strcat(ACL_homeDir "/notes"))
 defvar(ACL_sessionsFile strcat(ACL_homeDir "/sessions.json"))
 defvar(ACL_settingsFile strcat(ACL_homeDir "/settings.json"))
