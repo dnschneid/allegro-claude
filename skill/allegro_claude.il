@@ -273,6 +273,12 @@ procedure(ACL_renameOver(src dst)
   when(and(ACL_isWindows isFile(dst)) errset(deleteFile(dst)))
   renameFile(src dst))
 
+procedure(ACL_createDirP(path)
+  ; mkdir -p: createDir doesn't recurse, so walk parents first.
+  when(and(strlen(path) > 0 null(isDir(path)))
+    ACL_createDirP(pcreReplace(pcreCompile("/[^/]+$") path "" 0))
+    createDir(path)))
+
 procedure(ACL_readFile(path)
   prog((fp text line)
     fp = infile(path)
@@ -457,7 +463,7 @@ procedure(ACL_getBoardSessions(boardPath)
 procedure(ACL_startClaude(@optional resumeId fork)
   let((cmd promptFile fp installRoot projectDir args mcpConfigFile)
     ACL_stopClaude()
-    createDir(ACL_homeDir)
+    ACL_createDirP(ACL_homeDir)
     createDir(ACL_notesDir)
     createDir(ACL_logDir)
     ; ACL_mcpDir is set lazily once the session ID arrives via stream.
