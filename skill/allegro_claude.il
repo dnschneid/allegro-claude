@@ -948,11 +948,16 @@ procedure(ACL_execBlock(code)
     ;   poport redirect to capture printf output
     ;   muffleWarnings to capture warnings
     ;   errsetstring to capture errors as strings (nil=suppress console)
+    ;   progn() wrapper so multi-statement blocks all evaluate (without
+    ;     the wrapper, errsetstring evaluates only the first form and
+    ;     silently drops anything after, so e.g. `x = 5  foreach(...)  x`
+    ;     would never execute the foreach or read x back). The wrapper
+    ;     also makes the value of the LAST expression the result.
     ; CRITICAL: capture errset.errset before doing anything else --
     ; subsequent SKILL operations clobber it.
     port = outstring()
     result = muffleWarnings(let(((poport port))
-      errsetstring(code nil)))
+      errsetstring(strcat("progn(" code "\n)") nil)))
     errInfo = errset.errset
     output = getOutstring(port)
     close(port)
@@ -1553,6 +1558,19 @@ procedure(ACL_runTests()
       ACL_check("exec captures axlMsgPut"
         and(nindex(msgResult "a logged note") t)
         t))
+    ; Multi-statement blocks should all evaluate; result is the last
+    ; expression's value. (Without the progn wrapper, errsetstring
+    ; would only run the first form.)
+    ACL_check("exec multi-statement"
+      ACL_execBlock("x = 7\ny = 5\nx + y")
+      "Result: 12")
+    ACL_check("exec multi-statement side effects"
+      ACL_execBlock("acc = 0\nfor(i 1 4 acc = acc + i)\nacc")
+      "Result: 10")
+    ; A trailing line comment must not eat the closing paren we add.
+    ACL_check("exec trailing comment"
+      ACL_execBlock("(plus 1 2) ; comment with no trailing newline")
+      "Result: 3")
     ACL_form = savedForm)
 
   printf("\n--- Display Streaming ---\n")
