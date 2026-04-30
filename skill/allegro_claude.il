@@ -246,8 +246,11 @@ defvar(ACL_synthId 0)             ; counter for synthetic message UUIDs
 defvar(ACL_pendingInput nil)      ; text being sent (nil = not queued)
 defvar(ACL_autoUpdateInput nil)   ; t to enable auto-polling of input edits
 
-defvar(ACL_approveRe pcreCompile("^\\s*approve\\s*$" pcreGenCompileOptBits(?caseLess t)))
-defvar(ACL_rejectRe  pcreCompile("^\\s*reject\\s*$"  pcreGenCompileOptBits(?caseLess t)))
+; Match "approve"/"approved" (and similar light variants) at the
+; start of the message, optionally followed by punctuation and free
+; text. Anything captured in \1 is treated as extra prompting.
+defvar(ACL_approveRe pcreCompile("^\\s*approved?\\b[\\W]*(.*)$" pcreGenCompileOptBits(?caseLess t)))
+defvar(ACL_rejectRe  pcreCompile("^\\s*rejecte?d?\\b[\\W]*(.*)$"  pcreGenCompileOptBits(?caseLess t)))
 ; "No conversation found with session ID: <uuid>" -- claude prints this
 ; to stderr and exits when --resume is given a session it doesn't have.
 defvar(ACL_noSessionRe pcreCompile(
@@ -677,7 +680,7 @@ procedure(ACL_handleToolCall(block)
       ; (or `reject`). Otherwise schedule a deferred drain.
       if(ACL_mode == "manual"
         ACL_setStatus(
-          sprintf(nil "Manual: %d pending...send 'approve' or 'reject'" length(ACL_mcpPending))
+          sprintf(nil "Manual: %d pending...waiting for you to \"approve\" or \"reject\"" length(ACL_mcpPending))
         )
         ACL_mcpScheduleDrain()))))
 
@@ -1118,18 +1121,22 @@ procedure(ACL_formCB(form)
         ACL_handleSessionPick()))))
 
 procedure(ACL_doSend(form)
-  let((text)
+  let((text inManual)
     text = axlFormGetField(form "userinput")
+    inManual = and(ACL_mode == "manual" ACL_mcpPending)
     when(and(text strlen(text) > 0)
       cond(
-        (pcreMatchp(ACL_approveRe text)
+        ; approve/reject are only special-cased while we're actively
+        ; holding tool calls in manual mode -- otherwise they're
+        ; ordinary chat words that should reach claude.
+        (and(inManual pcreMatchp(ACL_approveRe text))
           axlFormSetField(form "userinput" "")
           axlFormSetActiveField(form "userinput")
-          ACL_handleApprove())
-        (pcreMatchp(ACL_rejectRe text)
+          ACL_handleApprove(pcreSubstitute(ACL_approveRe "\\1")))
+        (and(inManual pcreMatchp(ACL_rejectRe text))
           axlFormSetField(form "userinput" "")
           axlFormSetActiveField(form "userinput")
-          ACL_handleReject())
+          ACL_handleReject(pcreSubstitute(ACL_rejectRe "\\1")))
         ; Already queued - re-send if text changed
         (ACL_pendingInput
           unless(text == ACL_pendingInput
@@ -1209,36 +1216,41 @@ procedure(ACL_handleUserMessage(text)
     ; Start polling for input changes (if enabled)
     when(ACL_autoUpdateInput ACL_startInputPoll())))
 
-procedure(ACL_handleApprove()
-  ACL_appendChat("[Approved.]")
-  ; The tool_use blocks already arrived from claude; in manual mode
-  ; we just deferred execution. Drain the queue now. If nothing was
-  ; pending, fall back to nudging claude to proceed (covers the case
-  ; where it stopped after only describing what it would do).
-  if(ACL_mcpPending then
-    ACL_mcpScheduleDrain()
-  else
-    ACL_sendMessage(
-      "Approved. Go ahead and execute the proposed commands."
-      ?isSynthetic t)))
+procedure(ACL_handleApprove(@optional (extra ""))
+  ; Caller has already trimmed the leading "approve". Anything left
+  ; was extra prompting that doesn't fit the approve/reject channel
+  ; -- log it as discarded so the user knows it didn't reach claude.
+  if(and(stringp(extra) strlen(extra) > 0)
+    ACL_appendChat(sprintf(nil "[Approved. Additional prompting discarded: %s]" extra))
+    ACL_appendChat("[Approved.]"))
+  ACL_mcpScheduleDrain())
 
-procedure(ACL_handleReject()
-  ACL_appendChat("[Rejected.]")
-  ; Respond to each pending tool_use with a rejection result. Claude
-  ; receives this as the tool's output, so it sees the rejection
-  ; through the normal tool-use channel -- no separate user message
-  ; needed (which would compete with claude's in-flight turn).
-  let((pending)
-    pending = ACL_mcpPending
-    ACL_mcpPending = nil
-    foreach(entry pending
-      let((toolId ipcOutPath)
-        toolId = car(entry)
-        when(ACL_sessionLogDir
-          ipcOutPath = sprintf(nil "%s/tool_%s.out" ACL_sessionLogDir toolId)
-          ACL_mcpWriteFile(strcat(ipcOutPath ".tmp")
-            "*rejected by user* -- do not retry. Ask the user what they would like instead.")
-          ACL_renameOver(strcat(ipcOutPath ".tmp") ipcOutPath))))))
+procedure(ACL_handleReject(@optional (extra ""))
+  ; Caller has already trimmed the leading "reject". If the user
+  ; added context, surface it as the chat line and pass it through to
+  ; claude as part of the tool's rejection result so claude knows
+  ; what to do next; otherwise use the bare "Rejected." form.
+  let((haveExtra reason chatLine)
+    haveExtra = and(stringp(extra) strlen(extra) > 0)
+    chatLine = if(haveExtra sprintf(nil "[Rejected. %s]" extra) "[Rejected.]")
+    reason = if(haveExtra
+      sprintf(nil "*rejected by user in manual mode* -- do not retry. The user said:\n\"%s\"\n. Respond accordingly." extra)
+      "*rejected by user in manual mode* -- do not retry. Ask the user what they would like instead.")
+    ACL_appendChat(chatLine)
+    ACL_setStatus("Thinking...")
+    ; Respond to each pending tool_use with the rejection result.
+    ; Claude receives this as the tool's output, so the rejection
+    ; rides the tool-use channel -- no separate user message needed.
+    let((pending)
+      pending = ACL_mcpPending
+      ACL_mcpPending = nil
+      foreach(entry pending
+        let((toolId ipcOutPath)
+          toolId = car(entry)
+          when(ACL_sessionLogDir
+            ipcOutPath = sprintf(nil "%s/tool_%s.out" ACL_sessionLogDir toolId)
+            ACL_mcpWriteFile(strcat(ipcOutPath ".tmp") reason)
+            ACL_renameOver(strcat(ipcOutPath ".tmp") ipcOutPath)))))))
 
 procedure(ACL_handleJournal(contents)
   ACL_setStatus("Analyzing...")
@@ -1734,6 +1746,28 @@ procedure(ACL_runTests()
       ACL_check("manual: reject .out content"
         ACL_readFile(strcat(ACL_sessionLogDir "/tool_toolu_manual_2.out"))
         "*rejected by user* -- do not retry. Ask the user what they would like instead.")
+
+      ; Reject WITH extra prompting -- chat shows the user's text and
+      ; the .out passes their words through to claude.
+      ACL_handleToolCall(list(list("id" "toolu_manual_3")
+                              list("name" "mcp__allegro__allegro_execute")
+                              list("input" list(list("code" "(plus 9 9)")))))
+      ACL_handleReject("but use snap_grid first")
+      ACL_check("manual: reject extra .out content"
+        ACL_readFile(strcat(ACL_sessionLogDir "/tool_toolu_manual_3.out"))
+        "*rejected by user* -- do not retry. The user said: \"but use snap_grid first\". Respond accordingly.")
+
+      ; approve/reject regexes accept variants and pass extras
+      ACL_check("approveRe bare" pcreMatchp(ACL_approveRe "approve") t)
+      ACL_check("approveRe ed+text"
+        and(pcreMatchp(ACL_approveRe "approved. good job")
+            pcreSubstitute(ACL_approveRe "\\1")) "good job")
+      ACL_check("rejectRe ed+text"
+        and(pcreMatchp(ACL_rejectRe "rejected, but try this instead")
+            pcreSubstitute(ACL_rejectRe "\\1")) "but try this instead")
+      ACL_check("approveRe doesn't match unrelated"
+        pcreMatchp(ACL_approveRe "what does approve do?") nil)
+
       ACL_mode = savedMode)
 
     ; Clean up
