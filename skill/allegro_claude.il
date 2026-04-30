@@ -228,7 +228,7 @@ defvar(ACL_logFile nil)            ; temp file for full log viewer
 defvar(ACL_logCodeLimit 250)       ; max chars for each code preview
 defvar(ACL_sessionId nil)
 defvar(ACL_sessionSaved nil)       ; true after first successful reply
-defvar(ACL_mode "auto")
+defvar(ACL_mode "quiet")
 defvar(ACL_lineBuf "")
 defvar(ACL_streamErrorCount 0)   ; increments when ACL_processStreamLine throws
 defvar(ACL_responseBuf "")
