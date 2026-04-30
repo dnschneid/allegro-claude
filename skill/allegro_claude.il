@@ -364,7 +364,14 @@ procedure(ACL_openLogDir()
       system(sprintf(nil "xdg-open '%s' &" ACL_sessionLogDir)))))
 
 procedure(ACL_setStatus(text)
-  when(ACL_form
+  ; While manual mode is holding pending tool calls, the user needs
+  ; to see "Manual: N pending" persistently -- suppress any other
+  ; status update that would clobber it. Once the queue drains or
+  ; the mode changes, status is open again.
+  when(and(ACL_form
+           or(pcreMatchp("^Manual:" text)
+              ACL_mode != "manual"
+              null(ACL_mcpPending)))
     axlFormSetField(ACL_form "statuslabel"
       if((strlen(text) > ACL_statusTruncLimit)
         strcat(substring(text 1 ACL_statusTruncLimit-3) "...")
@@ -657,17 +664,23 @@ procedure(ACL_handleToolCall(block)
       ACL_mcpCmdSeq = ACL_mcpCmdSeq + 1
       seq = ACL_mcpCmdSeq
       when(ACL_mode != "quiet"
-        ACL_logWrite(sprintf(nil "\n\n[exec cmd_%d.il: %s]\n\n"
+        ACL_logWrite(sprintf(nil "\n\n[cmd_%d.il:\n%s]\n\n"
           seq
-          if(and(ACL_mode != "verbose"
+          if(and(ACL_mode == "snippets"
                  strlen(code) > ACL_logCodeLimit)
             strcat(substring(code 1 (ACL_logCodeLimit - 3)) "...")
             code))))
       when(ACL_sessionLogDir
         ACL_mcpWriteFile(sprintf(nil "%s/cmd_%d.il" ACL_sessionLogDir seq) code))
       ACL_mcpPending = append(ACL_mcpPending list(list(toolId code seq)))
-      unless(ACL_mcpExecTimer
-        ACL_mcpExecTimer = axlUIWTimerAdd(nil 1 t 'ACL_mcpDrainPending)))))
+      ; In manual mode, hold the queue until the user types `approve`
+      ; (or `reject`). Otherwise arm the one-shot drain timer.
+      if(ACL_mode == "manual"
+        ACL_setStatus(
+          sprintf(nil "Manual: %d pending...send 'approve' or 'reject'" length(ACL_mcpPending))
+        )
+        when(null(ACL_mcpExecTimer)
+          ACL_mcpExecTimer = axlUIWTimerAdd(nil 1 t 'ACL_mcpDrainPending))))))
 
 procedure(ACL_mcpDrainPending(@rest args)
   ACL_mcpExecTimer = nil
@@ -1074,7 +1087,13 @@ procedure(ACL_formCB(form)
         ACL_saveSettings(ACL_settingsFile ACL_currentSettings())
         when(ACL_sessionLogDir
           ACL_saveSettings(strcat(ACL_sessionLogDir "/settings.json") ACL_currentSettings()))
-        ACL_setStatus(sprintf(nil "Mode: %s" val)))
+        ACL_setStatus(sprintf(nil "Mode: %s" val))
+        ; Switching out of manual mode releases any held tool calls.
+        ; Drain handles an empty queue gracefully. Done after the
+        ; status update so "Mode: auto" lands before any execution
+        ; output starts displacing it.
+        when(val != "manual"
+          ACL_mcpDrainPending()))
       (field == "record"
         ACL_toggleRecording(form))
       (field == "fulllog"
@@ -1169,15 +1188,11 @@ procedure(ACL_handleUserMessage(text)
   ACL_setStatus("Thinking...")
   ACL_responseBuf = ""
   ACL_pendingInput = text
-  let((elapsed prefix systemUuid userUuid)
+  let((elapsed prefix userUuid)
     elapsed = stringToTime(getCurrentTime()) - ACL_lastCmdTime
-    prefix = strcat(
-      if(and(ACL_lastCmdTime elapsed > 60)
-        "[The board may have been edited. Re-query the design instead of relying on memory.] "
-        "")
-      if(ACL_mode == "manual"
-        " [MANUAL MODE: Describe what you would do and the SKILL code, but do NOT call allegro_execute yet. Wait for approval.]"
-        ""))
+    prefix = if(and(ACL_lastCmdTime elapsed > 60)
+      "[The board may have been edited. Re-query the design instead of relying on memory.] "
+      "")
     userUuid = sprintf(nil "user%d-%d" ACL_uuidEpoch ACL_promptId)
     ; Send system prefix as synthetic (not displayed, no response generated)
     (when (strlen(prefix) > 0)
@@ -1188,19 +1203,35 @@ procedure(ACL_handleUserMessage(text)
     when(ACL_autoUpdateInput ACL_startInputPoll())))
 
 procedure(ACL_handleApprove()
-  ACL_appendChat("Approved.")
-  ACL_setStatus("Executing...")
-  ACL_sendMessage(
-    "Approved. Go ahead and execute the proposed commands."
-    ?isSynthetic t))
-
-procedure(ACL_handleReject(@optional (notify t))
-  ACL_appendChat("Rejected.")
-  when(notify
-    ACL_setStatus("Thinking...")
+  ACL_appendChat("[Approved.]")
+  ; The tool_use blocks already arrived from claude; in manual mode
+  ; we just deferred execution. Drain the queue now. If nothing was
+  ; pending, fall back to nudging claude to proceed (covers the case
+  ; where it stopped after only describing what it would do).
+  if(ACL_mcpPending then
+    ACL_mcpDrainPending()
+  else
     ACL_sendMessage(
-      "The user rejected the proposed commands. Ask what they'd like instead."
+      "Approved. Go ahead and execute the proposed commands."
       ?isSynthetic t)))
+
+procedure(ACL_handleReject()
+  ACL_appendChat("[Rejected.]")
+  ; Respond to each pending tool_use with a rejection result. Claude
+  ; receives this as the tool's output, so it sees the rejection
+  ; through the normal tool-use channel -- no separate user message
+  ; needed (which would compete with claude's in-flight turn).
+  let((pending)
+    pending = ACL_mcpPending
+    ACL_mcpPending = nil
+    foreach(entry pending
+      let((toolId ipcOutPath)
+        toolId = car(entry)
+        when(ACL_sessionLogDir
+          ipcOutPath = sprintf(nil "%s/tool_%s.out" ACL_sessionLogDir toolId)
+          ACL_mcpWriteFile(strcat(ipcOutPath ".tmp")
+            "*rejected by user* -- do not retry. Ask the user what they would like instead.")
+          ACL_renameOver(strcat(ipcOutPath ".tmp") ipcOutPath))))))
 
 procedure(ACL_handleJournal(contents)
   ACL_setStatus("Analyzing...")
@@ -1665,6 +1696,37 @@ procedure(ACL_runTests()
     ; Nonexistent dir -> 0 (errset swallows)
     ACL_check("scan max seq nonexistent dir"
       ACL_mcpScanMaxSeq(strcat(ACL_homeDir "/no_such_dir_42")) 0)
+
+    ; --- Manual mode: tool calls are HELD until approve/reject ---
+    let(((savedMode ACL_mode))
+      ACL_mode = "manual"
+      ACL_mcpPending = nil
+      ACL_handleToolCall(list(list("id" "toolu_manual_1")
+                              list("name" "mcp__allegro__allegro_execute")
+                              list("input" list(list("code" "(plus 5 5)")))))
+      ACL_check("manual: queued" length(ACL_mcpPending) 1)
+      ACL_check("manual: timer NOT armed" ACL_mcpExecTimer nil)
+      ; Approve drains the queue.
+      ACL_handleApprove()
+      ACL_check("manual: approve drained" ACL_mcpPending nil)
+      ACL_check("manual: approve wrote .out"
+        and(isFile(strcat(ACL_sessionLogDir "/tool_toolu_manual_1.out")) t) t)
+
+      ; Reject writes a rejection .out for each pending so the MCP
+      ; server doesn't hang polling.
+      ACL_handleToolCall(list(list("id" "toolu_manual_2")
+                              list("name" "mcp__allegro__allegro_execute")
+                              list("input" list(list("code" "(plus 7 7)")))))
+      ACL_check("manual: queued again" length(ACL_mcpPending) 1)
+      ACL_handleReject()
+      ACL_check("manual: reject cleared" ACL_mcpPending nil)
+      ACL_check("manual: reject wrote .out"
+        and(isFile(strcat(ACL_sessionLogDir "/tool_toolu_manual_2.out")) t) t)
+      ACL_check("manual: reject .out content"
+        ACL_readFile(strcat(ACL_sessionLogDir "/tool_toolu_manual_2.out"))
+        "*rejected by user* -- do not retry. Ask the user what they would like instead.")
+      ACL_mode = savedMode)
+
     ; Clean up
     let((files)
       files = errset(getDirFiles(ACL_sessionLogDir))
