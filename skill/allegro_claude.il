@@ -222,7 +222,7 @@ defvar(ACL_form nil)
 defvar(ACL_logContent nil)          ; accumulated log chunks (newest first)
 defvar(ACL_logTruncLimit 12500)    ; max chars shown in form field
 defvar(ACL_resultTruncLimit 150)   ; max chars shown for results in manual mode
-defvar(ACL_statusTruncLimit 16)    ; max chars for the status bar to avoid weirdness
+defvar(ACL_statusTruncLimit 200)   ; max chars for the status bar (sanity cap; STRFILLIN scrolls)
 defvar(ACL_logLineLimit 50)        ; max lines shown in form field
 defvar(ACL_logFile nil)            ; temp file for full log viewer
 defvar(ACL_logCodeLimit 250)       ; max chars for each code preview
@@ -934,7 +934,8 @@ procedure(ACL_execBlock(code)
       docError = ACL_checkFuncDocs(code)
       when(docError
         return(sprintf(nil "ERROR: %s" docError))))
-    ACL_setStatus("Executing SKILL")
+    ACL_setStatus(strcat("Executing SKILL: "
+      pcreReplace(pcreCompile("\\s+") code " " 0)))
     ; Capture Allegro shell messages via a temporary journal. This is
     ; the only mechanism that catches errors from axlShell sub-commands
     ; AND axlMsgPut output (errport/poport/errset/muffleWarnings/
