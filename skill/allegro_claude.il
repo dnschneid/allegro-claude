@@ -230,6 +230,7 @@ defvar(ACL_sessionId nil)
 defvar(ACL_sessionSaved nil)       ; true after first successful reply
 defvar(ACL_mode "auto")
 defvar(ACL_lineBuf "")
+defvar(ACL_streamErrorCount 0)   ; increments when ACL_processStreamLine throws
 defvar(ACL_responseBuf "")
 defvar(ACL_lastCmdTime 0)
 defvar(ACL_recording nil)
@@ -242,8 +243,6 @@ defvar(ACL_promptId 1)            ; counter for message UUIDs
 defvar(ACL_synthId 0)             ; counter for synthetic message UUIDs
 defvar(ACL_pendingInput nil)      ; text being sent (nil = not queued)
 defvar(ACL_autoUpdateInput nil)   ; t to enable auto-polling of input edits
-defvar(ACL_mcpDir nil)            ; MCP IPC + log directory (per-launch)
-defvar(ACL_mcpTimer nil)          ; repeating poll timer (nil = not running)
 
 defvar(ACL_approveRe pcreCompile("^\\s*approve\\s*$" pcreGenCompileOptBits(?caseLess t)))
 defvar(ACL_rejectRe  pcreCompile("^\\s*reject\\s*$"  pcreGenCompileOptBits(?caseLess t)))
@@ -487,9 +486,8 @@ procedure(ACL_startClaude(@optional resumeId fork)
     ACL_createDirP(ACL_homeDir)
     createDir(ACL_notesDir)
     createDir(ACL_logDir)
-    ; ACL_mcpDir is set lazily once the session ID arrives via stream.
-    ; Both sides derive ACL_logDir/<sessionId>/ independently.
-    ACL_mcpDir = nil
+    ACL_mcpPending = nil
+    ACL_mcpCmdSeq = 0
     ; Write MCP config for Claude CLI. Pass the base log dir; the MCP
     ; server discovers its session UUID from CLAUDE_LAUNCHER_SESSION_FILE
     ; and constructs the same per-session subdirectory.
@@ -574,7 +572,6 @@ procedure(ACL_stopClaude()
     ipcSignalProcess(ACL_claude 'TERM))
   ACL_claude = nil
   ACL_pendingInput = nil
-  ACL_mcpCleanup()
   when(ACL_form axlFormSetField(ACL_form "send" "Send")))
 
 procedure(ACL_ensureClaude()
@@ -604,53 +601,67 @@ procedure(ACL_sendMessage(text @key (uuid nil) (isSynthetic nil) (noQuery nil))
 
 ; ============================================================
 ; 6b. MCP File IPC
+;
+; SKILL extracts the code from claude's tool_use stream block, runs it
+; locally, and writes the result to a file the Python MCP server polls.
+; cmd_NNN.il / cmd_NNN.out files in ACL_sessionLogDir form a readable
+; per-session log of every executed command.
 ; ============================================================
 
-procedure(ACL_mcpPoll(@rest args)
-  ; Execute every .il in the queue/ subdir, write a sibling .out, then
-  ; move both files back to the parent (atomically publishes completion
-  ; and clears the queue). Files in the parent dir form a persistent
-  ; log of the launch. Repeating timer: armed by ACL_mcpKick, cancelled
-  ; by ACL_mcpStopPoll.
-  when(and(ACL_mcpDir ACL_claude ipcIsAliveProcess(ACL_claude))
-    let((queueDir files base)
-      queueDir = strcat(ACL_mcpDir "/queue")
-      files = errset(getDirFiles(queueDir))
-      when(and(files car(files))
-        foreach(f sort(car(files) 'alphalessp)
-          when(and(strlen(f) > 3
-                   substring(f (strlen(f) - 2)) == ".il")
-            base = substring(f 1 (strlen(f) - 3))
-            let((code result inPath outName outPath)
-              inPath = strcat(queueDir "/" f)
-              code = ACL_readFile(inPath)
-              when(ACL_mode != "quiet"
-                ACL_logWrite(sprintf(nil "\n\n[exec: %s]\n\n"
-                  if(and(ACL_mode != "verbose"
-                         strlen(code) > ACL_logCodeLimit)
-                    strcat(substring(code 1 (ACL_logCodeLimit - 3)) "...")
-                    code))))
-              result = errset(ACL_execBlock(code))
-              result = if(result car(result)
-                "*error* SKILL execution failed unexpectedly")
-              outName = strcat(base ".out")
-              outPath = strcat(queueDir "/" outName)
-              ACL_mcpWriteFile(outPath result)
-              ; Publish: move both files out of queue/
-              ACL_renameOver(outPath strcat(ACL_mcpDir "/" outName))
-              ACL_renameOver(inPath strcat(ACL_mcpDir "/" f)))))))))
+; Pending tool calls captured from the stream, waiting for top-level
+; execution. Each entry: (tool_use_id code seq).
+defvar(ACL_mcpPending nil)
+defvar(ACL_mcpExecTimer nil)
+defvar(ACL_mcpCmdSeq 0)
 
-procedure(ACL_mcpKick()
-  ; Start the MCP poll timer if not already running. Called from the
-  ; stream handler when a tool_use block begins. Cannot run ACL_execBlock
-  ; directly here -- evalstring inside IPC handlers deadlocks.
-  unless(ACL_mcpTimer
-    ACL_mcpTimer = axlUIWTimerAdd(nil 50 nil 'ACL_mcpPoll)))
+procedure(ACL_handleToolCall(block)
+  ; Called from the stream handler when a complete tool_use block for
+  ; our allegro_execute tool arrives. Logs the command and queues it
+  ; for top-level execution -- we can't run ACL_execBlock here because
+  ; evalstring inside a dataHandler deadlocks.
+  ;
+  ; The cmd_<seq>.il file is written here in stream context (which is
+  ; single-threaded with respect to other stream events), so the
+  ; readable log can't get interleaved oddly even if execution hangs.
+  let((toolId input code seq)
+    toolId = ACL_jGet(block "id")
+    input = ACL_jGet(block "input")
+    code = when(input ACL_jGet(input "code"))
+    when(and(stringp(toolId) stringp(code))
+      ACL_mcpCmdSeq = ACL_mcpCmdSeq + 1
+      seq = ACL_mcpCmdSeq
+      when(ACL_mode != "quiet"
+        ACL_logWrite(sprintf(nil "\n\n[exec: %s]\n\n"
+          if(and(ACL_mode != "verbose"
+                 strlen(code) > ACL_logCodeLimit)
+            strcat(substring(code 1 (ACL_logCodeLimit - 3)) "...")
+            code))))
+      when(ACL_sessionLogDir
+        ACL_mcpWriteFile(sprintf(nil "%s/cmd_%d.il" ACL_sessionLogDir seq) code))
+      ACL_mcpPending = append(ACL_mcpPending list(list(toolId code seq)))
+      unless(ACL_mcpExecTimer
+        ACL_mcpExecTimer = axlUIWTimerAdd(nil 1 t 'ACL_mcpDrainPending)))))
 
-procedure(ACL_mcpStopPoll()
-  when(ACL_mcpTimer
-    errset(axlUIWTimerRemove(ACL_mcpTimer))
-    ACL_mcpTimer = nil))
+procedure(ACL_mcpDrainPending(@rest args)
+  ACL_mcpExecTimer = nil
+  let((pending)
+    pending = ACL_mcpPending
+    ACL_mcpPending = nil
+    foreach(entry pending
+      let((toolId code seq result ipcOutPath)
+        toolId = car(entry)
+        code = cadr(entry)
+        seq = caddr(entry)
+        result = errset(ACL_execBlock(code))
+        result = if(result car(result)
+          "*error* SKILL execution failed unexpectedly")
+        when(ACL_sessionLogDir
+          ACL_mcpWriteFile(sprintf(nil "%s/cmd_%d.out" ACL_sessionLogDir seq) result)
+          ; The IPC file the Python MCP server polls for: keyed by
+          ; tool_use_id. Atomic publish via temp + rename.
+          ipcOutPath = sprintf(nil "%s/tool_%s.out" ACL_sessionLogDir toolId)
+          ACL_mcpWriteFile(strcat(ipcOutPath ".tmp") result)
+          ACL_renameOver(strcat(ipcOutPath ".tmp") ipcOutPath))))))
 
 procedure(ACL_mcpWriteFile(path content)
   let((fp)
@@ -658,11 +669,6 @@ procedure(ACL_mcpWriteFile(path content)
     when(fp
       fprintf(fp "%s" content)
       close(fp))))
-
-procedure(ACL_mcpCleanup()
-  ; Just stop polling. Keep files (they're the persistent log).
-  ACL_mcpStopPoll()
-  ACL_mcpDir = nil)
 
 ; ============================================================
 ; 7. Stream Event Processing
@@ -681,6 +687,7 @@ procedure(ACL_claudeDataHandler(id data)
       ACL_lineBuf = or(substring(ACL_lineBuf (pos + 1)) "")
       when(and(line strlen(line) > 0)
         unless(errset(ACL_processStreamLine(line))
+          ACL_streamErrorCount++
           printf("*Warning* ACL: stream error: %L\n" errset.errset)
           axlFlushDisplay()))
       pos = nindex(ACL_lineBuf "\n"))))
@@ -698,10 +705,6 @@ procedure(ACL_processStreamLine(line)
       ACL_sessionLogDir = strcat(ACL_logDir "/" ACL_sessionId)
       createDir(ACL_logDir)
       createDir(ACL_sessionLogDir)
-      ; MCP IPC lives in the same per-session dir; queue/ subdir is
-      ; where Python publishes pending commands.
-      ACL_mcpDir = ACL_sessionLogDir
-      createDir(strcat(ACL_mcpDir "/queue"))
     )
     cond(
       ; System events (init, api_retry, etc.)
@@ -760,7 +763,6 @@ procedure(ACL_processStreamLine(line)
               cond(
                 (and(cblock ACL_jGet(cblock "type") == "tool_use")
                   ACL_hadToolUse = t
-                  ACL_mcpKick()
                   ACL_setStatus(sprintf(nil "Using %s..."
                     pcreReplace(pcreCompile("^.*__")
                       or(ACL_jGet(cblock "name") "tool") "" 0))))
@@ -786,7 +788,16 @@ procedure(ACL_processStreamLine(line)
             foreach(block content
               when(and(block ACL_jGet(block "type") == "text")
                 text = ACL_jGet(block "text")
-                when(text fullText = strcat(fullText text))))
+                when(text fullText = strcat(fullText text)))
+              ; Tool calls for our allegro_execute MCP tool can be
+              ; satisfied locally -- we extract the code from the
+              ; stream and execute it ourselves, writing the result
+              ; where the Python MCP server polls for it. This
+              ; eliminates the SKILL queue-poll loop and the round
+              ; trip through Python's queue/cmd file write.
+              when(and(block ACL_jGet(block "type") == "tool_use"
+                       ACL_jGet(block "name") == "mcp__allegro__allegro_execute")
+                ACL_handleToolCall(block)))
             when(strlen(fullText) > seenLen
               newText = substring(fullText (seenLen + 1))
               when(and(newText strlen(newText) > 0)
@@ -819,7 +830,6 @@ procedure(ACL_processStreamLine(line)
                     ACL_appendChat(sprintf(nil "\n[%s]" stripped)))))))))
       ; Result (response complete)
       (etype == "result"
-        ACL_mcpStopPoll()
         ACL_flushDisplay()
         ACL_onResponseComplete()))))
 
@@ -1465,43 +1475,61 @@ procedure(ACL_runTests()
     ACL_logContent = savedLog)
 
   printf("\n--- MCP File IPC ---\n")
-  let(((savedForm ACL_form) (savedDir ACL_mcpDir) (savedClaude ACL_claude))
+  let(((savedForm ACL_form) (savedSessionDir ACL_sessionLogDir)
+       (savedSeq ACL_mcpCmdSeq) (savedPending ACL_mcpPending))
     ACL_form = nil
-    ACL_mcpDir = strcat(ACL_homeDir "/mcp_test")
-    createDir(ACL_mcpDir)
-    createDir(strcat(ACL_mcpDir "/queue"))
-    ; Need a live process for ACL_mcpPoll guard
-    ACL_claude = ipcBeginProcess("cat" "" nil nil)
-    ipcWaitForProcess(ACL_claude)
-    ; Drop a queued cmd file; poll should execute, write .out, and move both
-    let((fp queuePath outPath result)
-      queuePath = strcat(ACL_mcpDir "/queue/cmd_99.il")
-      fp = outfile(queuePath)
-      when(fp fprintf(fp "(plus 40 2)") close(fp))
-      ACL_mcpPoll()
-      outPath = strcat(ACL_mcpDir "/cmd_99.out")
-      ACL_check("mcp out exists" and(isFile(outPath) t) t)
-      ACL_check("mcp queue cleared"
-        and(isFile(strcat(ACL_mcpDir "/queue/cmd_99.il")) t) nil)
-      ACL_check("mcp cmd preserved"
-        and(isFile(strcat(ACL_mcpDir "/cmd_99.il")) t) t)
-      result = ACL_readFile(outPath)
-      ACL_check("mcp out content" result "Result: 42"))
-    ; Re-poll: empty queue, nothing happens
-    ACL_mcpPoll()
-    ACL_check("mcp idle ok"
-      and(isFile(strcat(ACL_mcpDir "/cmd_99.out")) t) t)
+    ACL_sessionLogDir = strcat(ACL_homeDir "/mcp_test")
+    ACL_mcpCmdSeq = 0
+    ACL_mcpPending = nil
+    createDir(ACL_sessionLogDir)
+    ; Simulate a tool_use block arriving from claude. ACL_handleToolCall
+    ; queues + arms a one-shot timer; we drain manually.
+    ACL_handleToolCall(list(list("id" "toolu_test_42")
+                            list("name" "mcp__allegro__allegro_execute")
+                            list("input" list(list("code" "(plus 40 2)")))))
+    ACL_check("queued one"
+      length(ACL_mcpPending) 1)
+    ACL_mcpDrainPending()
+    ACL_check("pending cleared" ACL_mcpPending nil)
+    ACL_check("seq advanced" ACL_mcpCmdSeq 1)
+    ACL_check("cmd il written"
+      and(isFile(strcat(ACL_sessionLogDir "/cmd_1.il")) t) t)
+    ACL_check("cmd out written"
+      and(isFile(strcat(ACL_sessionLogDir "/cmd_1.out")) t) t)
+    ACL_check("ipc out written"
+      and(isFile(strcat(ACL_sessionLogDir "/tool_toolu_test_42.out")) t) t)
+    ACL_check("cmd il content"
+      ACL_readFile(strcat(ACL_sessionLogDir "/cmd_1.il")) "(plus 40 2)")
+    ACL_check("ipc out content"
+      ACL_readFile(strcat(ACL_sessionLogDir "/tool_toolu_test_42.out"))
+      "Result: 42")
+    ; Multiple queued at once should all execute on one drain
+    ACL_handleToolCall(list(list("id" "toolu_a") list("name" "mcp__allegro__allegro_execute")
+                            list("input" list(list("code" "(plus 1 1)")))))
+    ACL_handleToolCall(list(list("id" "toolu_b") list("name" "mcp__allegro__allegro_execute")
+                            list("input" list(list("code" "(plus 2 2)")))))
+    ACL_check("queued two" length(ACL_mcpPending) 2)
+    ACL_mcpDrainPending()
+    ACL_check("seq advanced again" ACL_mcpCmdSeq 3)
+    ACL_check("ipc a" ACL_readFile(strcat(ACL_sessionLogDir "/tool_toolu_a.out"))
+      "Result: 2")
+    ACL_check("ipc b" ACL_readFile(strcat(ACL_sessionLogDir "/tool_toolu_b.out"))
+      "Result: 4")
+    ; Block missing required fields is ignored
+    ACL_handleToolCall(list(list("name" "mcp__allegro__allegro_execute")
+                            list("input" list(list("code" "(plus 9 9)")))))
+    ACL_check("missing id ignored" ACL_mcpPending nil)
     ; Clean up
-    ipcKillProcess(ACL_claude)
     let((files)
-      foreach(d list(strcat(ACL_mcpDir "/queue") ACL_mcpDir)
-        files = errset(getDirFiles(d))
-        when(and(files car(files))
-          foreach(f car(files)
-            when(and(f f != "." f != "..")
-              errset(deleteFile(strcat(d "/" f))))))))
-    ACL_mcpDir = savedDir
-    ACL_claude = savedClaude
+      files = errset(getDirFiles(ACL_sessionLogDir))
+      when(and(files car(files))
+        foreach(f car(files)
+          when(and(f f != "." f != "..")
+            errset(deleteFile(strcat(ACL_sessionLogDir "/" f)))))))
+    errset(deleteDir(ACL_sessionLogDir))
+    ACL_sessionLogDir = savedSessionDir
+    ACL_mcpCmdSeq = savedSeq
+    ACL_mcpPending = savedPending
     ACL_form = savedForm)
 
   printf("\n--- Form File ---\n")
@@ -1699,6 +1727,7 @@ procedure(ACL_runTests()
       if(ACL_isWindows "where claude >NUL 2>&1"
         "env -u LD_LIBRARY_PATH which claude > /dev/null 2>&1")))
     if(and(claudeExists car(claudeExists) == 0) then
+      ACL_streamErrorCount = 0
       ACL_startClaude()
       ACL_check("claude start" and(ACL_claude ipcIsAliveProcess(ACL_claude) t) t)
       ; End-to-end: send message and wait for response via ipcSleep
@@ -1712,16 +1741,15 @@ procedure(ACL_runTests()
         unless(ACL_gotText ipcSleep(1)))
       ACL_check("claude response" ACL_gotText t)
       ; SKILL execution round-trip test:
-      ; Ask Claude to use the allegro_execute MCP tool. We pump
-      ; ACL_mcpPoll() manually because axlUIWTimer callbacks don't
-      ; fire reliably under -nograph + ipcSleep in the batch harness.
+      ; Tool calls are now executed directly from the stream handler
+      ; via a one-shot timer (no more SKILL queue-poll).
       printf("  Testing SKILL execution round-trip...\n")
       ACL_responseBuf = ""
       ACL_gotText = nil
       ACL_sendMessage("Execute this SKILL expression using the allegro_execute tool and report the result: (plus 40 2)")
       for(i 1 180
         unless(ACL_gotText
-          when(ACL_mcpDir ACL_mcpPoll())
+          ACL_mcpDrainPending()
           ipcSleep(1)))
       ACL_check("skill exec response" ACL_gotText t)
       ; Inspect actual artifacts: at least one cmd_*.out should exist
@@ -1742,6 +1770,7 @@ procedure(ACL_runTests()
           and(nindex(outContent "42") t) t))
       ACL_stopClaude()
       ACL_check("claude stop" ACL_claude nil)
+      ACL_check("no stream errors" ACL_streamErrorCount 0)
     else
       printf("  SKIP: claude not in PATH\n")))
 
