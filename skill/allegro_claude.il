@@ -239,7 +239,9 @@ defvar(ACL_gotText nil)          ; set to t when any text arrives
 defvar(ACL_streamingMsgId nil)    ; message ID currently being streamed
 defvar(ACL_streamedMsgLen nil)    ; alist of (msgId . textLen) for streamed messages
 defvar(ACL_hadToolUse nil)       ; true if tool_use occurred since last text block
-defvar(ACL_promptId 1)            ; counter for message UUIDs
+defvar(ACL_promptId 1)            ; counter for message UUIDs (combined with launch epoch)
+defvar(ACL_uuidEpoch 0)           ; per-launch component to keep uuids unique across restarts
+defvar(ACL_resumeIsFork nil)      ; t if the current launch was --fork-session (skip session migrate)
 defvar(ACL_synthId 0)             ; counter for synthetic message UUIDs
 defvar(ACL_pendingInput nil)      ; text being sent (nil = not queued)
 defvar(ACL_autoUpdateInput nil)   ; t to enable auto-polling of input edits
@@ -459,13 +461,16 @@ procedure(ACL_removeSession(sid)
 procedure(ACL_handleStaleSession(stderrLine)
   ; Called from the stderr handler when claude reports an unknown
   ; --resume id. Strip the id from sessions.json so we don't try to
-  ; restore it next time.
+  ; restore it next time, and clear ACL_sessionId so the next
+  ; ACL_ensureClaude starts fresh instead of looping on the bad id.
   when(pcreMatchp(ACL_noSessionRe stderrLine)
     let((sid)
       sid = pcreSubstitute(ACL_noSessionRe "\\1")
       when(and(stringp(sid) strlen(sid) > 0)
         printf("ACL: removing stale session id %s from sessions.json\n" sid)
-        ACL_removeSession(sid)))))
+        ACL_removeSession(sid)
+        when(ACL_sessionId == sid
+          ACL_sessionId = nil)))))
 
 procedure(ACL_getSession(sid)
   cadr(assoc(sid or(ACL_loadSessions() nil))))
@@ -475,6 +480,16 @@ procedure(ACL_getBoardSessions(boardPath)
     normBoard = ACL_normPath(boardPath)
     setof(pair or(ACL_loadSessions() nil)
       ACL_normPath(ACL_jGet(cadr(pair) "board")) == normBoard)))
+
+procedure(ACL_sortSessionsByTime(sessions)
+  ; Sort session entries newest-first by their "time" field.
+  ; Each entry is (sid info-alist); time is a string-encoded epoch second.
+  sort(copy(sessions)
+    lambda((a b)
+      let((ta tb)
+        ta = atoi(or(ACL_jGet(cadr(a) "time") "0"))
+        tb = atoi(or(ACL_jGet(cadr(b) "time") "0"))
+        ta > tb))))
 
 ; ============================================================
 ; 6. Claude Process Management
@@ -540,6 +555,7 @@ procedure(ACL_startClaude(@optional resumeId fork)
       "--disallowedTools" "AskUserQuestion"
       "--model" "opus[1m]"
       "--effort" "max")
+    ACL_resumeIsFork = and(resumeId fork t)
     when(resumeId
       args = append1(args "--resume")
       args = append1(args resumeId)
@@ -554,6 +570,7 @@ procedure(ACL_startClaude(@optional resumeId fork)
     ACL_streamingMsgId = nil
     ACL_streamedMsgLen = nil
     ACL_promptId = 1
+    ACL_uuidEpoch = stringToTime(getCurrentTime())
     ACL_pendingInput = nil
     ACL_claude = ipcBeginProcess(cmd ""
       'ACL_claudeDataHandler
@@ -670,6 +687,37 @@ procedure(ACL_mcpWriteFile(path content)
       fprintf(fp "%s" content)
       close(fp))))
 
+procedure(ACL_copyDirFiles(srcDir dstDir)
+  ; Copy regular files (skip dotfiles like . and ..) from srcDir into
+  ; dstDir, which must already exist. Used when forking a session so
+  ; the fork inherits the parent's readable cmd_<n>.il / .out logs
+  ; without stealing them.
+  let((files in out line)
+    files = errset(getDirFiles(srcDir))
+    when(and(files car(files))
+      foreach(f car(files)
+        when(and(f f != "." f != "..")
+          in = infile(strcat(srcDir "/" f))
+          out = outfile(strcat(dstDir "/" f))
+          when(and(in out)
+            while(gets(line in) fprintf(out "%s" line))
+            close(in) close(out)))))))
+
+procedure(ACL_mcpScanMaxSeq(dir)
+  ; Find the highest N from cmd_<N>.il files in dir, so a restored
+  ; session continues numbering instead of overwriting prior logs.
+  let((files high re m n)
+    high = 0
+    re = pcreCompile("^cmd_(\\d+)\\.il$")
+    files = errset(getDirFiles(dir))
+    when(and(files car(files))
+      foreach(f car(files)
+        when(pcreMatchp(re f)
+          m = pcreSubstitute(re "\\1")
+          n = atoi(m)
+          when(and(n n > high) high = n))))
+    high))
+
 ; ============================================================
 ; 7. Stream Event Processing
 ; ============================================================
@@ -698,14 +746,38 @@ procedure(ACL_processStreamLine(line)
     unless(parsed return(nil))
     parsed = car(parsed)
     etype = ACL_jGet(parsed "type")
-    ; Capture session ID from any event
-    sid = ACL_jGet(parsed "session_id")
-    when(and(sid sid != ACL_sessionId)
-      ACL_sessionId = sid
-      ACL_sessionLogDir = strcat(ACL_logDir "/" ACL_sessionId)
-      createDir(ACL_logDir)
-      createDir(ACL_sessionLogDir)
-    )
+    subtype = ACL_jGet(parsed "subtype")
+    ; Capture the session id from the `system/init` event. Other
+    ; events either don't carry a sid (stream events) or carry a
+    ; transient per-hook id (SessionStart hook events) that would
+    ; trip the new-session branch below spuriously.
+    sid = when(and(etype == "system" subtype == "init")
+      ACL_jGet(parsed "session_id"))
+    when(sid
+      ; New sid (fresh session or fork) -- set up the log dir, copying
+      ; parent files for forks. Same sid (resume) -- nothing to do
+      ; here, the dir already exists.
+      when(sid != ACL_sessionId
+        let((newDir oldDir)
+          newDir = strcat(ACL_logDir "/" sid)
+          oldDir = when(ACL_sessionId strcat(ACL_logDir "/" ACL_sessionId))
+          ACL_sessionId = sid
+          createDir(ACL_logDir)
+          createDir(newDir)
+          ; Fork (--fork-session): claude assigns a fresh sid distinct
+          ; from the parent. Copy parent log files into the fork's dir
+          ; so the new session inherits the readable history. The
+          ; parent's sessions.json entry is left alone; the fork
+          ; registers itself on its first text response under the
+          ; CURRENT board (handleForkSession reset ACL_sessionSaved).
+          when(and(ACL_resumeIsFork oldDir isDir(oldDir))
+            ACL_copyDirFiles(oldDir newDir))
+          ACL_sessionLogDir = newDir))
+      ; Always seed cmd seq from existing files: critical for resume
+      ; (sid didn't change so the block above is a no-op) and harmless
+      ; for fresh sessions (dir is empty). Forks land here too after
+      ; the parent files were copied.
+      ACL_mcpCmdSeq = ACL_mcpScanMaxSeq(ACL_sessionLogDir))
     cond(
       ; System events (init, api_retry, etc.)
       (etype == "system"
@@ -980,7 +1052,7 @@ procedure(ACL_formCB(form)
         when(ACL_pendingInput
           when((val != ACL_pendingInput)
             ACL_pendingInput = val
-            ACL_sendMessage(val ?uuid sprintf(nil "user%d" ACL_promptId)))))
+            ACL_sendMessage(val ?uuid sprintf(nil "user%d-%d" ACL_uuidEpoch ACL_promptId)))))
       (field == "mode"
         ACL_mode = val
         ACL_saveSettings(ACL_settingsFile ACL_currentSettings())
@@ -1018,7 +1090,7 @@ procedure(ACL_doSend(form)
         (ACL_pendingInput
           unless(text == ACL_pendingInput
             ACL_pendingInput = text
-            ACL_sendMessage(text ?uuid sprintf(nil "user%d" ACL_promptId))))
+            ACL_sendMessage(text ?uuid sprintf(nil "user%d-%d" ACL_uuidEpoch ACL_promptId))))
         ; New message - send (queue or echo depending on auto-update mode)
         (t
           if(ACL_autoUpdateInput then
@@ -1067,7 +1139,7 @@ procedure(ACL_pollInput(@rest args)
       text = axlFormGetField(ACL_form "userinput")
       when((text != ACL_pendingInput)
         ACL_pendingInput = text
-        ACL_sendMessage(text ?uuid sprintf(nil "user%d" ACL_promptId))))
+        ACL_sendMessage(text ?uuid sprintf(nil "user%d-%d" ACL_uuidEpoch ACL_promptId))))
     ; Re-schedule while still queued
     ACL_startInputPoll()))
 
@@ -1088,7 +1160,7 @@ procedure(ACL_handleUserMessage(text)
       if(ACL_mode == "manual"
         " [MANUAL MODE: Describe what you would do and the SKILL code, but do NOT call allegro_execute yet. Wait for approval.]"
         ""))
-    userUuid = sprintf(nil "user%d" ACL_promptId)
+    userUuid = sprintf(nil "user%d-%d" ACL_uuidEpoch ACL_promptId)
     ; Send system prefix as synthetic (not displayed, no response generated)
     (when (strlen(prefix) > 0)
       ACL_sendMessage(prefix ?isSynthetic t ?noQuery t))
@@ -1269,19 +1341,27 @@ procedure(ACL_handleNewSession()
 procedure(ACL_handleRestoreSession(sid)
   let((info)
     info = ACL_getSession(sid)
-    if(info then
+    if(null(info) then
+      ; Session not in our sessions.json -- nothing to restore.
+      ACL_handleNewSession()
+    else
       ACL_sessionId = sid
       ACL_sessionLogDir = strcat(ACL_logDir "/" ACL_sessionId)
+      ACL_sessionSaved = t
       ACL_logReset()
       ACL_applySettings(or(
         ACL_loadSettings(strcat(ACL_sessionLogDir "/settings.json"))
         ACL_loadSettings(ACL_settingsFile)
         nil))
       ACL_startClaude(sid)
-      ACL_appendChat(sprintf(nil "Restored session: %s" sid))
-      ACL_setStatus("Ready")
-    else
-      ACL_appendChat(sprintf(nil "Session not found: %s" sid)))))
+      ; If claude rejected the --resume id, the stderr handler has
+      ; already cleared ACL_sessionId. Recover into a fresh session
+      ; instead of leaving the user staring at a blank dialog.
+      if(null(ACL_sessionId) then
+        ACL_handleNewSession()
+      else
+        ACL_appendChat(sprintf(nil "Restored session: %s" sid))
+        ACL_setStatus("Ready")))))
 
 procedure(ACL_handleForkSession(sid)
   prog((info oldBoard)
@@ -1290,14 +1370,23 @@ procedure(ACL_handleForkSession(sid)
       ACL_appendChat(sprintf(nil "Session not found: %s" sid))
       return(nil))
     oldBoard = or(ACL_jGet(info "board") "unknown")
+    ; Reset save state so the fork registers itself with the CURRENT
+    ; board (not the parent's) on its first text response.
+    ACL_sessionId = nil
+    ACL_sessionSaved = nil
     ACL_logReset()
     ACL_startClaude(sid t)
-    ACL_responseBuf = ""
-    ACL_sendMessage(sprintf(nil
-      "The target board has changed from \"%s\" to \"%s\". Disregard any previous design-specific information and re-query the new design as needed."
-      oldBoard axlGetDrawingName())
-      ?isSynthetic t)
-    ACL_appendChat(sprintf(nil "Forked from session: %s" sid))))
+    ; If claude rejected the --resume id, fall through to a fresh
+    ; session so the user isn't left staring at a dead dialog.
+    if(null(ACL_sessionId) then
+      ACL_handleNewSession()
+    else
+      ACL_responseBuf = ""
+      ACL_sendMessage(sprintf(nil
+        "The target board has changed from \"%s\" to \"%s\". Disregard any previous design-specific information and re-query the new design as needed."
+        oldBoard axlGetDrawingName())
+        ?isSynthetic t)
+      ACL_appendChat(sprintf(nil "Forked from session: %s" sid)))))
 
 ; ============================================================
 ; 15. Open Panel & Registration
@@ -1326,15 +1415,17 @@ procedure(ACL_openPanel()
         ACL_setStatus(if(and(ACL_claude ipcIsAliveProcess(ACL_claude))
           "Ready" "Starting..."))
       else
-        let((sessions board)
+        let((sessions board mostRecent)
           board = axlGetDrawingName()
           sessions = when(board ACL_getBoardSessions(board))
-          ; FIXME: session loading is janky right now, so bypass
-          ;if(sessions then
-          ;  ACL_handleSessionPick()
-          ;else
-            ACL_handleNewSession()
-        )))))
+          ; Auto-resume the most recent session for this board, if any.
+          ; If the session id is stale, the stderr handler clears it and
+          ; the next user action starts fresh via ACL_ensureClaude.
+          if(sessions then
+            mostRecent = car(ACL_sortSessionsByTime(sessions))
+            ACL_handleRestoreSession(car(mostRecent))
+          else
+            ACL_handleNewSession()))))))
 
 axlCmdRegister("claude" 'ACL_openPanel ?cmdType "general")
 regExitBefore('ACL_stopClaude)
@@ -1519,6 +1610,19 @@ procedure(ACL_runTests()
     ACL_handleToolCall(list(list("name" "mcp__allegro__allegro_execute")
                             list("input" list(list("code" "(plus 9 9)")))))
     ACL_check("missing id ignored" ACL_mcpPending nil)
+    ; ACL_mcpScanMaxSeq finds the highest existing N
+    ACL_check("scan max seq sees existing"
+      ACL_mcpScanMaxSeq(ACL_sessionLogDir) 3)
+    ; Empty dir -> 0
+    let((emptyDir)
+      emptyDir = strcat(ACL_homeDir "/mcp_test_empty")
+      createDir(emptyDir)
+      ACL_check("scan max seq empty dir"
+        ACL_mcpScanMaxSeq(emptyDir) 0)
+      errset(deleteDir(emptyDir)))
+    ; Nonexistent dir -> 0 (errset swallows)
+    ACL_check("scan max seq nonexistent dir"
+      ACL_mcpScanMaxSeq(strcat(ACL_homeDir "/no_such_dir_42")) 0)
     ; Clean up
     let((files)
       files = errset(getDirFiles(ACL_sessionLogDir))
@@ -1682,27 +1786,140 @@ procedure(ACL_runTests()
     ACL_mode = savedMode)
 
   printf("\n--- Sessions ---\n")
-  let(((savedFile ACL_sessionsFile) sample stale)
+  let(((savedFile ACL_sessionsFile) (savedSid ACL_sessionId) sample stale sorted)
     ACL_sessionsFile = strcat(ACL_homeDir "/sessions_test.json")
     sample = list(
-      list("aaaa-aaaa" list(list("board" "/tmp/foo.brd")))
-      list("bbbb-bbbb" list(list("board" "/tmp/bar.brd")))
-      list("cccc-cccc" list(list("board" "/tmp/baz.brd"))))
+      list("aaaa-aaaa" list(list("board" "/tmp/foo.brd") list("time" "100")))
+      list("bbbb-bbbb" list(list("board" "/tmp/bar.brd") list("time" "300")))
+      list("cccc-cccc" list(list("board" "/tmp/baz.brd") list("time" "200"))))
     ACL_saveSessions(sample)
     ACL_check("session preload" length(ACL_loadSessions()) 3)
+    ; Sort by time, newest first
+    sorted = ACL_sortSessionsByTime(ACL_loadSessions())
+    ACL_check("sort newest first" car(car(sorted)) "bbbb-bbbb")
+    ACL_check("sort middle" car(cadr(sorted)) "cccc-cccc")
+    ACL_check("sort oldest last" car(caddr(sorted)) "aaaa-aaaa")
     ; Detect a stale-session line and ensure removeSession works
     stale = "claude: No conversation found with session ID: bbbb-bbbb"
     ACL_check("noSessionRe matches" pcreMatchp(ACL_noSessionRe stale) t)
+    ; Stale handler also clears ACL_sessionId if it matches
+    ACL_sessionId = "bbbb-bbbb"
     ACL_handleStaleSession(stale)
     ACL_check("stale removed" length(ACL_loadSessions()) 2)
     ACL_check("right one removed" assoc("bbbb-bbbb" ACL_loadSessions()) nil)
+    ACL_check("sessionId cleared" ACL_sessionId nil)
     ACL_check("others kept" and(assoc("aaaa-aaaa" ACL_loadSessions())
                                 assoc("cccc-cccc" ACL_loadSessions()) t) t)
     ; Idempotent: removing a non-existent id is a no-op
     ACL_handleStaleSession(stale)
     ACL_check("idempotent" length(ACL_loadSessions()) 2)
+    ; sessionId NOT cleared when the stale id doesn't match the current one
+    ACL_sessionId = "different-id"
+    ACL_handleStaleSession(stale)
+    ACL_check("preserves unrelated sessionId" ACL_sessionId "different-id")
+    ACL_sessionId = savedSid
     deleteFile(ACL_sessionsFile)
     ACL_sessionsFile = savedFile)
+
+  printf("\n--- Session fork ---\n")
+  ; Drive ACL_processStreamLine with a synthetic init event and check
+  ; the fork path: parent log dir + sessions.json entry preserved,
+  ; parent files copied into the fork dir, fork's own sessions.json
+  ; entry deferred to its first-text save (so it gets the right board).
+  let(((savedFile ACL_sessionsFile) (savedSid ACL_sessionId)
+       (savedLogDir ACL_sessionLogDir) (savedFork ACL_resumeIsFork)
+       (savedSeq ACL_mcpCmdSeq) parentDir newDir)
+    ACL_sessionsFile = strcat(ACL_homeDir "/sessions_rekey_test.json")
+    ACL_sessionId = "rekey-old-2"
+    parentDir = strcat(ACL_logDir "/rekey-old-2")
+    ACL_createDirP(parentDir)
+    let((fp)
+      fp = outfile(strcat(parentDir "/cmd_3.il"))
+      when(fp fprintf(fp "(plus 2 2)") close(fp))
+      fp = outfile(strcat(parentDir "/cmd_3.out"))
+      when(fp fprintf(fp "Result: 4") close(fp)))
+    ACL_addSession("rekey-old-2" list(list("board" "/tmp/y.brd") list("time" "200")))
+    ACL_resumeIsFork = t
+    ACL_processStreamLine("{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"rekey-new-2\"}")
+    newDir = strcat(ACL_logDir "/rekey-new-2")
+    ACL_check("fork: id updated" ACL_sessionId "rekey-new-2")
+    ACL_check("fork: parent dir preserved" isDir(parentDir) t)
+    ACL_check("fork: parent cmd preserved"
+      and(isFile(strcat(parentDir "/cmd_3.il")) t) t)
+    ACL_check("fork: new dir present" isDir(newDir) t)
+    ACL_check("fork: cmd file copied to new"
+      and(isFile(strcat(newDir "/cmd_3.il")) t) t)
+    ACL_check("fork: copied content matches"
+      ACL_readFile(strcat(newDir "/cmd_3.il")) "(plus 2 2)")
+    ACL_check("fork: seq seeded from copied files" ACL_mcpCmdSeq 3)
+    ACL_check("fork: parent kept in sessions"
+      and(assoc("rekey-old-2" ACL_loadSessions()) t) t)
+    ; Fork should NOT pre-add the new sid: the first-text save path
+    ; registers it with the current board (not the parent's).
+    ACL_check("fork: new id NOT pre-added to sessions"
+      assoc("rekey-new-2" ACL_loadSessions()) nil)
+    ; cleanup
+    foreach(d list(parentDir newDir)
+      let((files)
+        files = errset(getDirFiles(d))
+        when(and(files car(files))
+          foreach(f car(files)
+            when(and(f f != "." f != "..")
+              errset(deleteFile(strcat(d "/" f))))))
+        errset(deleteDir(d))))
+
+    ACL_resumeIsFork = savedFork
+    ACL_mcpCmdSeq = savedSeq
+    ACL_sessionLogDir = savedLogDir
+    ACL_sessionId = savedSid
+    deleteFile(ACL_sessionsFile)
+    ACL_sessionsFile = savedFile)
+
+  printf("\n--- Resume seq seeding ---\n")
+  ; On resume claude returns the SAME sid, so the new-session branch
+  ; in ACL_processStreamLine doesn't fire. The seq must still be
+  ; reseeded from existing cmd_<N>.il files, otherwise tool_use
+  ; numbering restarts at 1 and overwrites prior turns.
+  let(((savedSid ACL_sessionId) (savedLogDir ACL_sessionLogDir)
+       (savedSeq ACL_mcpCmdSeq) sid logDir fp)
+    sid = "resume-seed-test"
+    logDir = strcat(ACL_logDir "/" sid)
+    ACL_createDirP(logDir)
+    fp = outfile(strcat(logDir "/cmd_7.il"))
+    when(fp fprintf(fp "(plus 1 1)") close(fp))
+    ; Simulate resume: ACL_startClaude reset seq to 0 and the sid
+    ; matches the one already set, so processStreamLine's rekey
+    ; block must NOT be the only place that seeds.
+    ACL_sessionId = sid
+    ACL_sessionLogDir = logDir
+    ACL_mcpCmdSeq = 0
+    ACL_processStreamLine(sprintf(nil
+      "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"%s\"}" sid))
+    ACL_check("resume: seq seeded from existing files" ACL_mcpCmdSeq 7)
+    errset(deleteFile(strcat(logDir "/cmd_7.il")))
+    errset(deleteDir(logDir))
+    ACL_mcpCmdSeq = savedSeq
+    ACL_sessionLogDir = savedLogDir
+    ACL_sessionId = savedSid)
+
+  printf("\n--- Hook session_id ignored ---\n")
+  ; SessionStart:resume hook events carry transient session_ids that must NOT
+  ; trigger our rekey logic. Only system/init should be authoritative.
+  let(((savedSid ACL_sessionId) (savedLogDir ACL_sessionLogDir))
+    ACL_sessionId = "real-sid"
+    ACL_sessionLogDir = strcat(ACL_logDir "/real-sid")
+    ACL_processStreamLine(strcat(
+      "{\"type\":\"system\",\"subtype\":\"hook_started\","
+      "\"hook_name\":\"SessionStart:resume\","
+      "\"session_id\":\"transient-bogus-id\"}"))
+    ACL_check("hook event ignored" ACL_sessionId "real-sid")
+    ACL_processStreamLine(strcat(
+      "{\"type\":\"system\",\"subtype\":\"hook_response\","
+      "\"hook_name\":\"SessionStart:resume\","
+      "\"session_id\":\"another-transient-bogus\"}"))
+    ACL_check("hook response ignored" ACL_sessionId "real-sid")
+    ACL_sessionLogDir = savedLogDir
+    ACL_sessionId = savedSid)
 
   printf("\n--- IPC ---\n")
   let((proc buf ready)
