@@ -354,6 +354,15 @@ procedure(ACL_showFullLog()
       close(fp)
     axlUIViewFileCreate(logfile "Claude - Full Log" nil '(50 120) nil ACL_form))))
 
+procedure(ACL_openLogDir()
+  ; Open the per-session log directory in the OS file explorer so the
+  ; user can browse cmd_<N>.il / cmd_<N>.out / tool_*.out files.
+  ; Allegro has no built-in "open in explorer", so shell out.
+  when(ACL_sessionLogDir
+    if(ACL_isWindows
+      system(sprintf(nil "cmd /c start \"\" \"%s\"" ACL_sessionLogDir))
+      system(sprintf(nil "xdg-open '%s' &" ACL_sessionLogDir)))))
+
 procedure(ACL_setStatus(text)
   when(ACL_form
     axlFormSetField(ACL_form "statuslabel"
@@ -648,7 +657,8 @@ procedure(ACL_handleToolCall(block)
       ACL_mcpCmdSeq = ACL_mcpCmdSeq + 1
       seq = ACL_mcpCmdSeq
       when(ACL_mode != "quiet"
-        ACL_logWrite(sprintf(nil "\n\n[exec: %s]\n\n"
+        ACL_logWrite(sprintf(nil "\n\n[exec cmd_%d.il: %s]\n\n"
+          seq
           if(and(ACL_mode != "verbose"
                  strlen(code) > ACL_logCodeLimit)
             strcat(substring(code 1 (ACL_logCodeLimit - 3)) "...")
@@ -1069,6 +1079,8 @@ procedure(ACL_formCB(form)
         ACL_toggleRecording(form))
       (field == "fulllog"
         ACL_showFullLog())
+      (field == "files"
+        ACL_openLogDir())
       (field == "loglines"
         let((n)
           n = atoi(val)
