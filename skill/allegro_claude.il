@@ -717,7 +717,13 @@ procedure(ACL_processStreamLine(line)
                           list("board" ACL_normPath(axlGetDrawingName()))
                           list("time" sprintf(nil "%d"
                             stringToTime(getCurrentTime())))))
-                        ACL_sessionSaved = t))))))
+                        ACL_sessionSaved = t
+                        ; Tell claude where its prior commands live so it
+                        ; can grep them instead of re-running discovery.
+                        ACL_sendMessage(sprintf(nil
+                          "[Your past SKILL commands and outputs from this session live in %s. Each cmd_<n>.il has a matching cmd_<n>.out. Grep these instead of re-running discovery.]"
+                          ACL_sessionLogDir)
+                          ?isSynthetic t ?noQuery t)))))))
             (evtype == "content_block_start"
               cblock = ACL_jGet(event "content_block")
               cond(
