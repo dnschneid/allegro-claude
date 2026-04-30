@@ -1392,9 +1392,16 @@ procedure(ACL_handleForkSession(sid)
 ; 15. Open Panel & Registration
 ; ============================================================
 
-procedure(ACL_openPanel()
-  prog((formFile)
+procedure(ACL_openPanel(@rest args)
+  prog((formFile prompt)
+    ; Any args become the initial prompt: typing `claude show me the netlist`
+    ; opens the dialog with that text pre-populated and sends it.
+    prompt = if(args buildString(args " ") "")
     when(and(ACL_form errset(axlFormDisplay(ACL_form)))
+      ; Form already exists -- just queue the prompt if any
+      when(strlen(prompt) > 0
+        axlFormSetField(ACL_form "userinput" prompt)
+        ACL_doSend(ACL_form))
       return(t))
     formFile = strcat(ACL_scriptDir "allegro_claude.form")
     ACL_form = axlFormCreate('ACL_form formFile nil 'ACL_formCB t t)
@@ -1425,7 +1432,11 @@ procedure(ACL_openPanel()
             mostRecent = car(ACL_sortSessionsByTime(sessions))
             ACL_handleRestoreSession(car(mostRecent))
           else
-            ACL_handleNewSession()))))))
+            ACL_handleNewSession())))
+      ; If a prompt was given on the command line, send it after setup.
+      when(strlen(prompt) > 0
+        axlFormSetField(ACL_form "userinput" prompt)
+        ACL_doSend(ACL_form)))))
 
 axlCmdRegister("claude" 'ACL_openPanel ?cmdType "general")
 regExitBefore('ACL_stopClaude)
