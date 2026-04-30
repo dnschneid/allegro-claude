@@ -247,6 +247,10 @@ defvar(ACL_mcpTimer nil)          ; repeating poll timer (nil = not running)
 
 defvar(ACL_approveRe pcreCompile("^\\s*approve\\s*$" pcreGenCompileOptBits(?caseLess t)))
 defvar(ACL_rejectRe  pcreCompile("^\\s*reject\\s*$"  pcreGenCompileOptBits(?caseLess t)))
+; "No conversation found with session ID: <uuid>" -- claude prints this
+; to stderr and exits when --resume is given a session it doesn't have.
+defvar(ACL_noSessionRe pcreCompile(
+  "No conversation found with session ID: ([0-9a-f-]+)"))
 defvar(ACL_bignumRe  pcreCompile("^-?\\d{10,}$"))
 
 defvar(ACL_homeDir  ; use ~/.local/share to help with sandboxing
@@ -447,6 +451,23 @@ procedure(ACL_addSession(sid info)
     sessions = cons(list(sid info) remove(assoc(sid sessions) sessions))
     ACL_saveSessions(sessions)))
 
+procedure(ACL_removeSession(sid)
+  let((sessions)
+    sessions = or(ACL_loadSessions() nil)
+    sessions = remove(assoc(sid sessions) sessions)
+    ACL_saveSessions(sessions)))
+
+procedure(ACL_handleStaleSession(stderrLine)
+  ; Called from the stderr handler when claude reports an unknown
+  ; --resume id. Strip the id from sessions.json so we don't try to
+  ; restore it next time.
+  when(pcreMatchp(ACL_noSessionRe stderrLine)
+    let((sid)
+      sid = pcreSubstitute(ACL_noSessionRe "\\1")
+      when(and(stringp(sid) strlen(sid) > 0)
+        printf("ACL: removing stale session id %s from sessions.json\n" sid)
+        ACL_removeSession(sid)))))
+
 procedure(ACL_getSession(sid)
   cadr(assoc(sid or(ACL_loadSessions() nil))))
 
@@ -539,7 +560,9 @@ procedure(ACL_startClaude(@optional resumeId fork)
     ACL_claude = ipcBeginProcess(cmd ""
       'ACL_claudeDataHandler
       lambda((id data)
-        foreach(d parseString(data "\n") printf("claude: %s\n" d))
+        foreach(d parseString(data "\n")
+          printf("claude: %s\n" d)
+          ACL_handleStaleSession(d))
         axlFlushDisplay()))
     ipcWaitForProcess(ACL_claude)
     unless(and(ACL_claude ipcIsAliveProcess(ACL_claude))
@@ -1629,6 +1652,29 @@ procedure(ACL_runTests()
     ; Cleanup
     deleteFile(tmpFile)
     ACL_mode = savedMode)
+
+  printf("\n--- Sessions ---\n")
+  let(((savedFile ACL_sessionsFile) sample stale)
+    ACL_sessionsFile = strcat(ACL_homeDir "/sessions_test.json")
+    sample = list(
+      list("aaaa-aaaa" list(list("board" "/tmp/foo.brd")))
+      list("bbbb-bbbb" list(list("board" "/tmp/bar.brd")))
+      list("cccc-cccc" list(list("board" "/tmp/baz.brd"))))
+    ACL_saveSessions(sample)
+    ACL_check("session preload" length(ACL_loadSessions()) 3)
+    ; Detect a stale-session line and ensure removeSession works
+    stale = "claude: No conversation found with session ID: bbbb-bbbb"
+    ACL_check("noSessionRe matches" pcreMatchp(ACL_noSessionRe stale) t)
+    ACL_handleStaleSession(stale)
+    ACL_check("stale removed" length(ACL_loadSessions()) 2)
+    ACL_check("right one removed" assoc("bbbb-bbbb" ACL_loadSessions()) nil)
+    ACL_check("others kept" and(assoc("aaaa-aaaa" ACL_loadSessions())
+                                assoc("cccc-cccc" ACL_loadSessions()) t) t)
+    ; Idempotent: removing a non-existent id is a no-op
+    ACL_handleStaleSession(stale)
+    ACL_check("idempotent" length(ACL_loadSessions()) 2)
+    deleteFile(ACL_sessionsFile)
+    ACL_sessionsFile = savedFile)
 
   printf("\n--- IPC ---\n")
   let((proc buf ready)
