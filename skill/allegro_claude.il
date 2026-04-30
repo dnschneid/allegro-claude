@@ -485,6 +485,14 @@ procedure(ACL_startClaude(@optional resumeId fork)
     fp = outfile(promptFile)
     when(fp
       fprintf(fp "%s" ACL_buildSystemPrompt())
+      ; Claude only honors the LAST --append-system-prompt-file flag,
+      ; so the cached docs (if any) get concatenated onto our own
+      ; prompt and passed via a single flag.
+      unless(ACL_fast
+        let((doc)
+          doc = ACL_findOrPlanDocs()
+          when(isFile(doc)
+            fprintf(fp "\n\n%s" ACL_readFile(doc)))))
       close(fp))
     installRoot = ACL_normPath(axlGetVariable("allegro_install_root"))
     siteDir = ACL_normPath(axlGetVariable("allegro_site"))
@@ -1159,11 +1167,12 @@ procedure(ACL_handleNewSession()
   ACL_startClaude()
   ACL_appendChat("Starting new session...")
   ACL_setStatus("Starting...")
-  ; Preloading all Allegro documentation for significantly better accuracy.
-  ; Generating the docs can take an hour. Loaded docs consumes ~200k tokens of context.
-  unless(ACL_fast let((doc choice generate)
+  ; Documentation handling: the cached doc (if it exists) is loaded
+  ; into the system prompt by ACL_startClaude via --append-system-prompt-file,
+  ; so we don't need to ask claude to read it at runtime. If no cache
+  ; exists, we offer to generate one.
+  unless(ACL_fast let((doc choice)
     doc = ACL_findOrPlanDocs()
-    generate = nil
     unless(isFile(doc)
       ; No cache exists. Ask the user (Yes / No / Cancel = Never ask again)
       ; before kicking off the ~1hr documentation crawl.
@@ -1172,19 +1181,36 @@ procedure(ACL_handleNewSession()
         "Generating it takes about an hour and >>100M tokens, but dramatically improves "
         "accuracy. The result is written to:\n  " doc "\n\n"
         "Generate the cache now?\n\n"
-        "Yes      - generate\n"
+        "Yes      - generate (will be loaded automatically on next session)\n"
         "No       - skip this time (you will get tips on bringing in a cache)\n"
         "Cancel   - never ask again (sets fast mode)")
         "Allegro Claude: documentation cache" 'yes)
       cond(
         (choice == 1
           ; Yes -- proceed with generation
-          generate = t
           ACL_appendChat(strcat(
             "Generating Allegro documentation cache. It'll take about an "
             "hour but is worth it. Please keep this window open. I can "
             "still help while this is going on, but I might be slower to "
-            "respond.")))
+            "respond. Once finished, restart claude (or open a new session) "
+            "to pick up the documentation."))
+          ACL_sendMessage(strcat(
+            "[CRITICAL: Do the following steps exactly, giving only extremely succinct progress "
+            "updates -- as little status output as possible to avoid confusing the conversation: "
+            "1. Spawn sub-agents (aim for <25 functions each) to thoroughly read through *all* of the "
+            "Allegro documentation you have access to and accumulate that knowledge into `" doc "` "
+            "with extensive detail, sufficient to be able to reliably use every single API and interface "
+            "on your first try, as well as understand and apply topics, concepts, and usages covered in "
+            "more free-form documentation and examples. "
+            "The agents should take extra time to ensure complete coverage of all of the interfaces "
+            "enumerated in TOCs, and take special note of things that were omitted from the TOC. "
+            "The agents should write incrementally to avoid timing out on large writes. "
+            "This may take an hour and should result in a large file. "
+            "2. Clean up any remaining sub-agent files. "
+            "3. Tell the user the cache is ready and they should start a new session to use it. "
+            "Until all this is complete, **be very careful to check documentation** manually before "
+            "responding to queries, and warn the user that you haven't completed your survey yet.]")
+            ?isSynthetic t ?noQuery t))
         (choice == 2
           ; Cancel -- never ask again, persist fast mode
           ACL_fast = t
@@ -1203,30 +1229,7 @@ procedure(ACL_handleNewSession()
             "  " ACL_normPath(axlGetVariable("allegro_site")) "/\n"
             "  " ACL_scriptDir "\n"
             "named " ACL_basename(doc) " (or the version-without-hotfix "
-            "equivalent).")))))
-    when(or(isFile(doc) generate)
-      ACL_sendMessage(
-        if(isFile(doc)
-          strcat("[CRITICAL: Read **every single line** of `" doc "` into your context. "
-            "It is very large and requires reading in chunks -- do it completely, totally silently, "
-            "no narration, and no status updates. Help the user while you do it.]")
-          strcat("[CRITICAL: Do the following steps exactly, giving only extremely succinct progress "
-            "updates -- as little status output as possible to avoid confusing the conversation: "
-            "1. Spawn sub-agents (aim for <25 functions each) to thoroughly read through *all* of the "
-            "Allegro documentation you have access to and accumulate that knowledge into `" doc "` "
-            "with extensive detail, sufficient to be able to reliably use every single API and interface "
-            "on your first try, as well as understand and apply topics, concepts, and usages covered in "
-            "more free-form documentation and examples. "
-            "The agents should take extra time to ensure complete coverage of all of the interfaces "
-            "enumerated in TOCs, and take special note of things that were omitted from the TOC. "
-            "The agents should write incrementally to avoid timing out on large writes. "
-            "This may take an hour and should result in a large file. "
-            "2. Once ready, read **every single line** of `" doc "` into your context. "
-            "It is very large and requires reading in chunks -- do it completely. "
-            "3. Clean up any remaining sub-agent files. "
-            "Until all this is complete, **be very careful to check documentation** manually before "
-            "responding to queries, and warn the user that you haven't completed your survey yet.]"))
-        ?isSynthetic t ?noQuery t))))
+            "equivalent).")))))))
   ACL_sendMessage(sprintf(nil "Current board: %L\nSay hello" axlGetDrawingName())
     ?isSynthetic t))
 
