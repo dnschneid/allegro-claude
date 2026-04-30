@@ -674,13 +674,20 @@ procedure(ACL_handleToolCall(block)
         ACL_mcpWriteFile(sprintf(nil "%s/cmd_%d.il" ACL_sessionLogDir seq) code))
       ACL_mcpPending = append(ACL_mcpPending list(list(toolId code seq)))
       ; In manual mode, hold the queue until the user types `approve`
-      ; (or `reject`). Otherwise arm the one-shot drain timer.
+      ; (or `reject`). Otherwise schedule a deferred drain.
       if(ACL_mode == "manual"
         ACL_setStatus(
           sprintf(nil "Manual: %d pending...send 'approve' or 'reject'" length(ACL_mcpPending))
         )
-        when(null(ACL_mcpExecTimer)
-          ACL_mcpExecTimer = axlUIWTimerAdd(nil 1 t 'ACL_mcpDrainPending))))))
+        ACL_mcpScheduleDrain()))))
+
+procedure(ACL_mcpScheduleDrain()
+  ; Always defer drain via a one-shot timer so ACL_execBlock's
+  ; evalstring runs from a clean stack -- never inside a form
+  ; callback's let/prog locals (which would dynamic-scope into the
+  ; eval'd code) and never inside the dataHandler (deadlocks).
+  unless(ACL_mcpExecTimer
+    ACL_mcpExecTimer = axlUIWTimerAdd(nil 1 t 'ACL_mcpDrainPending)))
 
 procedure(ACL_mcpDrainPending(@rest args)
   ACL_mcpExecTimer = nil
@@ -1093,7 +1100,7 @@ procedure(ACL_formCB(form)
         ; status update so "Mode: auto" lands before any execution
         ; output starts displacing it.
         when(val != "manual"
-          ACL_mcpDrainPending()))
+          ACL_mcpScheduleDrain()))
       (field == "record"
         ACL_toggleRecording(form))
       (field == "fulllog"
@@ -1209,7 +1216,7 @@ procedure(ACL_handleApprove()
   ; pending, fall back to nudging claude to proceed (covers the case
   ; where it stopped after only describing what it would do).
   if(ACL_mcpPending then
-    ACL_mcpDrainPending()
+    ACL_mcpScheduleDrain()
   else
     ACL_sendMessage(
       "Approved. Go ahead and execute the proposed commands."
@@ -1706,8 +1713,10 @@ procedure(ACL_runTests()
                               list("input" list(list("code" "(plus 5 5)")))))
       ACL_check("manual: queued" length(ACL_mcpPending) 1)
       ACL_check("manual: timer NOT armed" ACL_mcpExecTimer nil)
-      ; Approve drains the queue.
+      ; Approve schedules a deferred drain; in tests, run it inline.
       ACL_handleApprove()
+      ACL_check("manual: approve scheduled" and(ACL_mcpExecTimer t) t)
+      ACL_mcpDrainPending()
       ACL_check("manual: approve drained" ACL_mcpPending nil)
       ACL_check("manual: approve wrote .out"
         and(isFile(strcat(ACL_sessionLogDir "/tool_toolu_manual_1.out")) t) t)
