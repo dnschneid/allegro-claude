@@ -68,30 +68,31 @@ procedure(ACL_jParseStr(str pos)
         (t  pos++)))
     nil))
 
+; JSON unescape: a sentinel string that's vanishingly unlikely to
+; appear in real JSON content stands in for "decoded backslash"
+; while the simple escapes resolve, so input like "\\n" (literal
+; backslash + n) doesn't get re-decoded as a newline.
+defvar(ACL_unescSentinel "<__ACL_BS__>")
+defvar(ACL_unescBackslashSentinelRe pcreCompile("\\\\\\\\"))
+defvar(ACL_unescQuoteRe   pcreCompile("\\\\\""))
+defvar(ACL_unescNewlineRe pcreCompile("\\\\n"))
+defvar(ACL_unescTabRe     pcreCompile("\\\\t"))
+defvar(ACL_unescCRRe      pcreCompile("\\\\r"))
+defvar(ACL_unescSlashRe   pcreCompile("\\\\/"))
+defvar(ACL_unescSentinelRe pcreCompile("<__ACL_BS__>"))
+
 procedure(ACL_jUnescape(s)
-  ; Replace JSON escape sequences.  Called only when s contains "\\".
-  let((out pos bsPos next rest)
-    out = ""
-    pos = 1
-    rest = s
-    while(rest
-      bsPos = nindex(rest "\\")
-      if(bsPos then
-        ; Append everything before the backslash
-        when(bsPos > 1
-          out = strcat(out substring(rest 1 bsPos - 1)))
-        ; Decode the escape
-        next = substring(rest (bsPos + 1) 1)
-        out = strcat(out cond(
-          (next == "n" "\n")  (next == "t" "\t")  (next == "r" "\r")
-          (next == "\"" "\"") (next == "\\" "\\") (next == "/" "/")
-          (t next)))
-        rest = substring(rest (bsPos + 2))
-      else
-        ; No more escapes, append the remainder
-        out = strcat(out rest)
-        rest = nil))
-    out))
+  ; Replace JSON escape sequences. Two-phase to avoid double-decode:
+  ; first swap "\\\\" for a sentinel string, then resolve the simple
+  ; escapes, then swap the sentinel back to a single backslash.
+  let(((r pcreReplace(ACL_unescBackslashSentinelRe s ACL_unescSentinel 0)))
+    r = pcreReplace(ACL_unescQuoteRe   r "\"" 0)
+    r = pcreReplace(ACL_unescNewlineRe r "\n" 0)
+    r = pcreReplace(ACL_unescTabRe     r "\t" 0)
+    r = pcreReplace(ACL_unescCRRe      r "\r" 0)
+    r = pcreReplace(ACL_unescSlashRe   r "/" 0)
+    r = pcreReplace(ACL_unescSentinelRe r "\\\\" 0)
+    r))
 
 procedure(ACL_jParseNum(str pos)
   let((start c numStr)
@@ -152,28 +153,26 @@ procedure(ACL_jParseArr(str pos)
 procedure(ACL_jGet(obj key)
   cadr(assoc(key obj)))
 
-procedure(ACL_assocStr(key alist)
-  ; Like assoc but uses equal (string-safe) instead of eq
-  prog((rest)
-    rest = alist
-    while(rest
-      when(equal(key caar(rest)) return(car(rest)))
-      rest = cdr(rest))))
-
 ; ============================================================
 ; 2. JSON Writer
 ; ============================================================
 
+; JSON escape regexes -- single chars to escape. The order matters:
+; backslashes must be escaped BEFORE the other rules add new
+; backslashes, otherwise we'd double-encode them.
+defvar(ACL_escBackslashRe pcreCompile("\\\\"))
+defvar(ACL_escQuoteRe     pcreCompile("\""))
+defvar(ACL_escNewlineRe   pcreCompile("\n"))
+defvar(ACL_escCRRe        pcreCompile("\r"))
+defvar(ACL_escTabRe       pcreCompile("\t"))
+
 procedure(ACL_jsonEscStr(s)
-  let((out i c len)
-    out = "\""
-    for(i 1 strlen(s)
-      c = substring(s i 1)
-      out = strcat(out cond(
-        (c == "\""  "\\\"")  (c == "\\"  "\\\\")
-        (c == "\n"  "\\n")   (c == "\r"  "\\r")  (c == "\t" "\\t")
-        (t c))))
-    strcat(out "\"")))
+  let(((r pcreReplace(ACL_escBackslashRe s "\\\\\\\\" 0)))
+    r = pcreReplace(ACL_escQuoteRe     r "\\\\\""   0)
+    r = pcreReplace(ACL_escNewlineRe   r "\\\\n"    0)
+    r = pcreReplace(ACL_escCRRe        r "\\\\r"    0)
+    r = pcreReplace(ACL_escTabRe       r "\\\\t"    0)
+    strcat("\"" r "\"")))
 
 procedure(ACL_jsonIsAlist(v)
   ; A JSON-object alist looks like ((stringKey1 val1) ...). Require
@@ -220,8 +219,13 @@ defvar(ACL_isWindows (getShellEnvVar("OS") == "Windows_NT"))
 
 procedure(ACL_normPath(path)
   if(and(stringp(path) ACL_isWindows)
-    pcreReplace(pcreCompile("\\\\") path "/" 0)
+    pcreReplace(ACL_backslashRe path "/" 0)
     path))
+
+procedure(ACL_nonEmpty(s)
+  ; True iff s is a non-empty string. Required because strlen errors
+  ; on non-strings; bare `strlen(s) > 0` will crash on nil.
+  and(stringp(s) strlen(s) > 0))
 
 procedure(ACL_axlGetPath(name)
   ; Read an Allegro path variable, normalize slashes, ensure a
@@ -229,8 +233,8 @@ procedure(ACL_axlGetPath(name)
   ; happens with allegro_pcbenv) so callers can `or` against a
   ; default.
   let(((v axlGetVariable(name)))
-    when(and(stringp(v) strlen(v) > 0)
-      pcreReplace(pcreCompile("[^/]$") ACL_normPath(v) "$0/" 0))))
+    when(ACL_nonEmpty(v)
+      pcreReplace(ACL_noTrailingSlashRe ACL_normPath(v) "$0/" 0))))
 
 defvar(ACL_fast nil)                ; set to t to skip preloading Allegro docs
 defvar(ACL_claudeArgs "")            ; extra flags appended to claude CLI invocation
@@ -274,6 +278,37 @@ defvar(ACL_noSessionRe pcreCompile(
   "No conversation found with session ID: ([0-9a-f-]+)"))
 defvar(ACL_bignumRe  pcreCompile("^-?\\d{10,}$"))
 
+; Path manipulation. Compiled once because they fire on hot paths
+; (every IPC write, every stream-handler tool_use, etc).
+defvar(ACL_backslashRe       pcreCompile("\\\\"))
+defvar(ACL_noTrailingSlashRe pcreCompile("[^/]$"))
+defvar(ACL_trailingSlashesRe pcreCompile("/+$"))
+defvar(ACL_lastPathCompRe    pcreCompile("[^/\\\\]+$"))
+defvar(ACL_basenameStripRe   pcreCompile("^.*[/\\\\]"))
+defvar(ACL_lastPathSegRe     pcreCompile("/[^/]+$"))
+defvar(ACL_doubleQuoteRe     pcreCompile("\""))
+defvar(ACL_singleQuoteRe     pcreCompile("'"))
+
+; Stream / journal / status processing.
+defvar(ACL_cmdSeqFileRe      pcreCompile("^cmd_(\\d+)\\.il$"))
+defvar(ACL_mcpToolPrefixRe   pcreCompile("^.*__"))
+defvar(ACL_xmlTagRe          pcreCompile("<[^>]+>"))
+defvar(ACL_trimWSRe          pcreCompile("^\\s+|\\s+$"))
+defvar(ACL_collapseWSRe      pcreCompile("\\s+"))
+defvar(ACL_journalTSRe       pcreCompile("^\\\\[te] \\(\\d+:\\d+:\\d+\\) ?"))
+defvar(ACL_journalSkipRe     pcreCompile("^(allegro [0-9]|Host=|CmdLine=|Journal (start|end))"))
+defvar(ACL_manualStatusRe    pcreCompile("^Manual:"))
+defvar(ACL_nonIdentCharRe    pcreCompile("[^a-zA-Z0-9_]"))
+defvar(ACL_axlPrefixRe       pcreCompile("^axl\\w+$"))
+
+; Doc-cache filenames.
+defvar(ACL_versionSanitizeRe pcreCompile("[^\\w]"))
+defvar(ACL_hotfixStripRe     pcreCompile("_(S|HF)\\d+\\.md$"))
+
+; System-prompt template substitutions.
+defvar(ACL_promptNotesRe     pcreCompile("[$]ALLEGRO_CLAUDE_NOTES"))
+defvar(ACL_promptInstallRe   pcreCompile("[$]ALLEGRO_INSTALL_ROOT"))
+
 ; All path defvars below use the convention "directories end with /,
 ; files don't". Saves callers from needing to insert separators.
 defvar(ACL_homeDir  ; use ~/.local/share to help with sandboxing
@@ -293,12 +328,12 @@ defvar(ACL_sessionLogDir ACL_logDir)
 defvar(ACL_scriptDir nil)
 unless(ACL_scriptDir
   ACL_scriptDir = car(errset(
-    pcreReplace(pcreCompile("[^/\\\\]+$")
+    pcreReplace(ACL_lastPathCompRe
       simplifyFilename(get_filename(piport)) "" 0))))
 ; Normalize: forward slashes, guaranteed trailing slash. Then sanity-
 ; check by content -- PROMPT.md should sit alongside this file.
 when(stringp(ACL_scriptDir)
-  ACL_scriptDir = pcreReplace(pcreCompile("[^/]$")
+  ACL_scriptDir = pcreReplace(ACL_noTrailingSlashRe
     ACL_normPath(ACL_scriptDir) "$0/" 0))
 unless(and(stringp(ACL_scriptDir) isFile(strcat(ACL_scriptDir "PROMPT.md")))
   printf(strcat(
@@ -317,46 +352,63 @@ procedure(ACL_renameOver(src dst)
   when(and(ACL_isWindows isFile(dst)) errset(deleteFile(dst)))
   renameFile(src dst))
 
+procedure(ACL_listDirFiles(dir)
+  ; getDirFiles errors on missing/unreadable dirs, returns ("." "..")
+  ; on success even when empty. Return a clean list of regular file
+  ; names (no "." / ".."), or nil on error or empty dir.
+  let(((result errset(getDirFiles(dir))))
+    when(and(result car(result))
+      setof(f car(result) and(f f != "." f != "..")))))
+
 procedure(ACL_createDirP(path)
   ; mkdir -p: createDir doesn't recurse, so walk parents first.
   ; Strip any trailing slashes first so the regex can find the last
   ; component to lop off.
-  let(((p pcreReplace(pcreCompile("/+$") path "" 0)))
+  let(((p pcreReplace(ACL_trailingSlashesRe path "" 0)))
     when(and(strlen(p) > 0 null(isDir(p)))
-      ACL_createDirP(pcreReplace(pcreCompile("/[^/]+$") p "" 0))
+      ACL_createDirP(pcreReplace(ACL_lastPathSegRe p "" 0))
       createDir(p))))
 
 procedure(ACL_readFile(path)
-  prog((fp text line)
+  ; Returns "" if path is missing/unreadable.
+  let((fp lines line)
     fp = infile(path)
-    unless(fp return(""))
-    text = ""
-    while(gets(line fp) text = strcat(text line))
-    close(fp)
-    return(text)))
+    if(fp then
+      while(gets(line fp) lines = cons(line lines))
+      close(fp)
+      buildString(reverse(lines) "")
+    else
+      "")))
 
 procedure(ACL_appendChat(text)
   ACL_logWrite(strcat(text "\n")))
 
+procedure(ACL_logEndsWithNL()
+  ; True if the most recent log entry is a complete line. nil also
+  ; means "no entry yet", which counts as a complete-line state for
+  ; the purposes of deciding whether to start a new line.
+  or(null(ACL_logContent)
+     substring(car(ACL_logContent) strlen(car(ACL_logContent)) 1) == "\n"))
+
 procedure(ACL_logWrite(text)
   ; Stores one line per list entry. Partial lines appended via rplaca.
   ; Suppresses consecutive blank lines.
-  let((rest nlPos pre partial)
+  let((rest nlPos pre)
     rest = text
     while(and(rest strlen(rest) > 0)
-      partial = and(ACL_logContent
-                    substring(car(ACL_logContent) strlen(car(ACL_logContent)) 1) != "\n")
       nlPos = nindex(rest "\n")
       if(nlPos then
         pre = substring(rest 1 nlPos)
         cond(
-          (partial
+          (null(ACL_logEndsWithNL())
+            ; Continue an open partial line.
             rplaca(ACL_logContent strcat(car(ACL_logContent) pre)))
           (or(pre != "\n" car(ACL_logContent) != "\n")
+            ; New line; suppress consecutive blanks.
             ACL_logContent = cons(pre ACL_logContent)))
         rest = substring(rest (nlPos + 1))
       else
-        if(partial then
+        if(null(ACL_logEndsWithNL()) then
           rplaca(ACL_logContent strcat(car(ACL_logContent) rest))
         else
           ACL_logContent = cons(rest ACL_logContent))
@@ -388,13 +440,12 @@ procedure(ACL_logReset()
 
 procedure(ACL_showFullLog()
   ; Write full log to file and open in a viewer window
-  let((logfile fp)
-    logfile = strcat(ACL_sessionLogDir "log.txt")
-    fp = outfile(logfile)
+  letseq(((logfile strcat(ACL_sessionLogDir "log.txt"))
+          (fp outfile(logfile)))
     when(fp
       fprintf(fp "%s" ACL_logString())
       close(fp)
-    axlUIViewFileCreate(logfile "Claude - Full Log" nil '(50 120) nil ACL_form))))
+      axlUIViewFileCreate(logfile "Claude - Full Log" nil '(50 120) nil ACL_form))))
 
 procedure(ACL_openLogDir()
   ; Open the per-session log directory in the OS file explorer so the
@@ -411,29 +462,24 @@ procedure(ACL_setStatus(text)
   ; status update that would clobber it. Once the queue drains or
   ; the mode changes, status is open again.
   when(and(ACL_form
-           or(pcreMatchp("^Manual:" text)
+           or(pcreMatchp(ACL_manualStatusRe text)
               ACL_mode != "manual"
               null(ACL_mcpPending)))
     axlFormSetField(ACL_form "statuslabel"
-      if((strlen(text) > ACL_statusTruncLimit)
+      if(strlen(text) > ACL_statusTruncLimit
         strcat(substring(text 1 ACL_statusTruncLimit-3) "...")
         text))))
 
 procedure(ACL_buildSystemPrompt()
   ; Read the PROMPT.md template, substitute $ALLEGRO_INSTALL_ROOT and
   ; $ALLEGRO_CLAUDE_PATH with actual directories, and return the result.
-  let((template installRoot re)
-    template = ACL_readFile(strcat(ACL_scriptDir "PROMPT.md"))
+  let(((template ACL_readFile(strcat(ACL_scriptDir "PROMPT.md"))))
     template = strcat(template "\n\n" ACL_readFile(strcat(ACL_scriptDir "LESSONS.md")))
     when(isFile(strcat(ACL_notesDir "LESSONS.md"))
       template = strcat(template "\n\n" ACL_readFile(strcat(ACL_notesDir "LESSONS.md"))))
-    ; Inject paths
-    re = pcreCompile("[$]ALLEGRO_CLAUDE_NOTES")
-    template = pcreReplace(re template ACL_notesDir 0)
-    re = pcreCompile("[$]ALLEGRO_INSTALL_ROOT")
-    installRoot = ACL_normPath(axlGetVariable("allegro_install_root"))
-    template = pcreReplace(re template installRoot 0)
-    ; Platform-specific
+    template = pcreReplace(ACL_promptNotesRe template ACL_notesDir 0)
+    template = pcreReplace(ACL_promptInstallRe template
+      ACL_normPath(axlGetVariable("allegro_install_root")) 0)
     when(ACL_isWindows
       template = strcat(template "\n\n"
         "## Output Encoding\n\n"
@@ -444,28 +490,25 @@ procedure(ACL_buildSystemPrompt()
 
 procedure(ACL_shellQuote(s)
   if(ACL_isWindows
-    strcat("\"" pcreReplace(pcreCompile("\"") s "\\\"" 0) "\"")
-    strcat("'" pcreReplace(pcreCompile("'") s "'\\''" 0) "'")))
+    strcat("\"" pcreReplace(ACL_doubleQuoteRe s "\\\"" 0) "\"")
+    strcat("'" pcreReplace(ACL_singleQuoteRe s "'\\''" 0) "'")))
 
 ; ============================================================
 ; 4b. Settings Persistence
 ; ============================================================
 
-procedure(ACL_loadSettings(path)
-  let((text parsed)
-    text = ACL_readFile(path)
+procedure(ACL_readJsonFile(path)
+  ; Read a JSON file and return the parsed top-level value, or nil
+  ; if the file is missing/empty/unparseable.
+  let(((text ACL_readFile(path)))
     when(strlen(text) > 0
-      parsed = ACL_jParse(text)
-      when(parsed car(parsed)))))
+      let(((parsed ACL_jParse(text)))
+        when(parsed car(parsed))))))
+
+procedure(ACL_loadSettings(path) ACL_readJsonFile(path))
 
 procedure(ACL_saveSettings(path settings)
-  let((tmp fp)
-    tmp = sprintf(nil "%s.tmp.%d" path stringToTime(getCurrentTime()))
-    fp = outfile(tmp)
-    when(fp
-      fprintf(fp "%s\n" ACL_jsonVal(settings))
-      close(fp)
-      ACL_renameOver(tmp path))))
+  ACL_writeFileAtomic(path strcat(ACL_jsonVal(settings) "\n")))
 
 procedure(ACL_currentSettings()
   list(list("mode" ACL_mode)
@@ -473,48 +516,31 @@ procedure(ACL_currentSettings()
        list("claudeArgs" or(ACL_claudeArgs ""))))
 
 procedure(ACL_applySettings(settings)
-  let((val)
-    val = ACL_jGet(settings "mode")
+  let(((val ACL_jGet(settings "mode")))
     when(val
       ACL_mode = val
       when(ACL_form axlFormSetField(ACL_form "mode" val))))
   ACL_fast = ACL_jGet(settings "fast")
-  let((ca)
-    ca = ACL_jGet(settings "claudeArgs")
-    when(stringp(ca) ACL_claudeArgs = ca))
-)
+  let(((ca ACL_jGet(settings "claudeArgs")))
+    when(stringp(ca) ACL_claudeArgs = ca)))
 
 ; ============================================================
 ; 5. Session Management
 ; ============================================================
 
-procedure(ACL_loadSessions()
-  let((text parsed)
-    text = ACL_readFile(ACL_sessionsFile)
-    when(strlen(text) > 0
-      parsed = ACL_jParse(text)
-      when(parsed car(parsed)))))
+procedure(ACL_loadSessions() ACL_readJsonFile(ACL_sessionsFile))
 
 procedure(ACL_saveSessions(sessions)
-  let((tmp fp)
-    tmp = sprintf(nil "%s.tmp.%d" ACL_sessionsFile stringToTime(getCurrentTime()))
-    fp = outfile(tmp)
-    when(fp
-      fprintf(fp "%s\n" ACL_jsonVal(sessions))
-      close(fp)
-      ACL_renameOver(tmp ACL_sessionsFile))))
+  ACL_writeFileAtomic(ACL_sessionsFile strcat(ACL_jsonVal(sessions) "\n")))
 
 procedure(ACL_addSession(sid info)
-  let((sessions)
-    sessions = or(ACL_loadSessions() nil)
-    sessions = cons(list(sid info) remove(assoc(sid sessions) sessions))
-    ACL_saveSessions(sessions)))
+  let(((sessions ACL_loadSessions()))
+    ACL_saveSessions(cons(list(sid info)
+                          remove(assoc(sid sessions) sessions)))))
 
 procedure(ACL_removeSession(sid)
-  let((sessions)
-    sessions = or(ACL_loadSessions() nil)
-    sessions = remove(assoc(sid sessions) sessions)
-    ACL_saveSessions(sessions)))
+  let(((sessions ACL_loadSessions()))
+    ACL_saveSessions(remove(assoc(sid sessions) sessions))))
 
 procedure(ACL_handleStaleSession(stderrLine)
   ; Called from the stderr handler when claude reports an unknown
@@ -522,21 +548,19 @@ procedure(ACL_handleStaleSession(stderrLine)
   ; restore it next time, and clear ACL_sessionId so the next
   ; ACL_ensureClaude starts fresh instead of looping on the bad id.
   when(pcreMatchp(ACL_noSessionRe stderrLine)
-    let((sid)
-      sid = pcreSubstitute(ACL_noSessionRe "\\1")
-      when(and(stringp(sid) strlen(sid) > 0)
+    let(((sid pcreSubstitute(ACL_noSessionRe "\\1")))
+      when(ACL_nonEmpty(sid)
         printf("ACL: removing stale session id %s from sessions.json\n" sid)
         ACL_removeSession(sid)
         when(ACL_sessionId == sid
           ACL_sessionId = nil)))))
 
 procedure(ACL_getSession(sid)
-  cadr(assoc(sid or(ACL_loadSessions() nil))))
+  cadr(assoc(sid ACL_loadSessions())))
 
 procedure(ACL_getBoardSessions(boardPath)
-  let((normBoard)
-    normBoard = ACL_normPath(boardPath)
-    setof(pair or(ACL_loadSessions() nil)
+  let(((normBoard ACL_normPath(boardPath)))
+    setof(pair ACL_loadSessions()
       ACL_normPath(ACL_jGet(cadr(pair) "board")) == normBoard)))
 
 procedure(ACL_sortSessionsByTime(sessions)
@@ -544,9 +568,8 @@ procedure(ACL_sortSessionsByTime(sessions)
   ; Each entry is (sid info-alist); time is a string-encoded epoch second.
   sort(copy(sessions)
     lambda((a b)
-      let((ta tb)
-        ta = atoi(or(ACL_jGet(cadr(a) "time") "0"))
-        tb = atoi(or(ACL_jGet(cadr(b) "time") "0"))
+      let(((ta atoi(or(ACL_jGet(cadr(a) "time") "0")))
+           (tb atoi(or(ACL_jGet(cadr(b) "time") "0"))))
         ta > tb))))
 
 ; ============================================================
@@ -585,8 +608,7 @@ procedure(ACL_startClaude(@optional resumeId fork)
       ; so the cached docs (if any) get concatenated onto our own
       ; prompt and passed via a single flag.
       unless(ACL_fast
-        let((doc)
-          doc = ACL_findOrPlanDocs()
+        let(((doc ACL_findOrPlanDocs()))
           when(isFile(doc)
             fprintf(fp "\n\n%s" ACL_readFile(doc)))))
       close(fp))
@@ -595,7 +617,7 @@ procedure(ACL_startClaude(@optional resumeId fork)
     pcbenvDir = or(ACL_axlGetPath("allegro_pcbenv")
                    strcat(or(getShellEnvVar("HOME")
                              getShellEnvVar("USERPROFILE")) "/pcbenv"))
-    projectDir = ACL_normPath(pcreReplace(pcreCompile("[^/\\\\]+$")
+    projectDir = ACL_normPath(pcreReplace(ACL_lastPathCompRe
       simplifyFilename(axlGetDrawingName()) "" 0))
     args = list(
       if(ACL_isWindows "claude -p" "env -u LD_LIBRARY_PATH claude -p")
@@ -623,9 +645,9 @@ procedure(ACL_startClaude(@optional resumeId fork)
       args = append1(args resumeId)
       when(fork args = append1(args "--fork-session")))
     cmd = buildString(args " ")
-    when(and(stringp(ACL_claudeArgs) strlen(ACL_claudeArgs) > 0)
+    when(ACL_nonEmpty(ACL_claudeArgs)
       cmd = strcat(cmd " " ACL_claudeArgs))
-    let((fp) fp = outfile(strcat(ACL_homeDir "raw.log") "a")
+    let(((fp outfile(strcat(ACL_homeDir "raw.log") "a")))
       when(fp fprintf(fp "\n--- %s ---\n" getCurrentTime()) close(fp)))
     ACL_lineBuf = ""
     ACL_responseBuf = ""
@@ -648,21 +670,17 @@ procedure(ACL_startClaude(@optional resumeId fork)
       printf("*Error* ACL: claude process failed to start. Command: %s\n" cmd))))
 
 procedure(ACL_claudeExitHandler(id status)
-  ; Fired by the IPC layer when the claude child exits. Without this
-  ; hook the panel just silently stops responding -- there's no other
-  ; signal that the process is gone until the user tries to send the
-  ; next message and ACL_ensureClaude restarts it. Skip the chat
-  ; message when the exit was via ACL_stopClaude.
-  let(((deliberate ACL_claudeStopRequested))
-    ACL_claudeStopRequested = nil
-    ACL_claude = nil
-    ACL_pendingInput = nil
-    unless(deliberate
-      ACL_setStatus(sprintf(nil "Claude exited (status %L)" status))
-      ACL_appendChat(sprintf(nil
-        "[Claude process exited unexpectedly (status %L). Send any message to restart.]"
-        status)))
-    when(ACL_form axlFormSetField(ACL_form "send" "Send"))))
+  ; postFunc registered with ipcBeginProcess. Surfaces unexpected
+  ; exits in the chat log; quiet on deliberate stop (see ACL_stopClaude).
+  ACL_claude = nil
+  ACL_pendingInput = nil
+  unless(ACL_claudeStopRequested
+    ACL_setStatus(sprintf(nil "Claude exited (status %L)" status))
+    ACL_appendChat(sprintf(nil
+      "[Claude process exited unexpectedly (status %L). Send any message to restart.]"
+      status)))
+  ACL_claudeStopRequested = nil
+  when(ACL_form axlFormSetField(ACL_form "send" "Send")))
 
 procedure(ACL_stopClaude()
   ; Suppress the unexpected-exit chat message in the postFunc handler
@@ -685,12 +703,11 @@ procedure(ACL_ensureClaude()
 procedure(ACL_sendMessage(text @key (uuid nil) (isSynthetic nil) (noQuery nil))
   ACL_ensureClaude()
   when(ACL_claude
-    let((pairs)
-      pairs = list(
+    let(((pairs list(
         list("type" "user")
         list("message" list(
           list("role" "user")
-          list("content" text))))
+          list("content" text))))))
       when(and(isSynthetic null(uuid))
         ACL_synthId++
         uuid = sprintf(nil "synth%d" ACL_synthId))
@@ -723,10 +740,10 @@ procedure(ACL_handleToolCall(block)
   ; The cmd_<seq>.il file is written here in stream context (which is
   ; single-threaded with respect to other stream events), so the
   ; readable log can't get interleaved oddly even if execution hangs.
-  let((toolId input code seq)
-    toolId = ACL_jGet(block "id")
-    input = ACL_jGet(block "input")
-    code = when(input ACL_jGet(input "code"))
+  letseq(((toolId ACL_jGet(block "id"))
+          (input ACL_jGet(block "input"))
+          (code when(input ACL_jGet(input "code")))
+          (seq nil))
     when(and(stringp(toolId) stringp(code))
       ACL_mcpCmdSeq = ACL_mcpCmdSeq + 1
       seq = ACL_mcpCmdSeq
@@ -738,7 +755,7 @@ procedure(ACL_handleToolCall(block)
             strcat(substring(code 1 (ACL_logCodeLimit - 3)) "...")
             code))))
       when(ACL_sessionLogDir
-        ACL_mcpWriteFile(sprintf(nil "%s/cmd_%d.il" ACL_sessionLogDir seq) code))
+        ACL_writeFile(sprintf(nil "%s/cmd_%d.il" ACL_sessionLogDir seq) code))
       ACL_mcpPending = append(ACL_mcpPending list(list(toolId code seq)))
       ; In manual mode, hold the queue until the user types `approve`
       ; (or `reject`). Otherwise schedule a deferred drain.
@@ -758,31 +775,41 @@ procedure(ACL_mcpScheduleDrain()
 
 procedure(ACL_mcpDrainPending(@rest args)
   ACL_mcpExecTimer = nil
-  let((pending)
-    pending = ACL_mcpPending
+  let(((pending ACL_mcpPending))
     ACL_mcpPending = nil
     foreach(entry pending
-      let((toolId code seq result ipcOutPath)
-        toolId = car(entry)
-        code = cadr(entry)
-        seq = caddr(entry)
-        result = errset(ACL_execBlock(code))
-        result = if(result car(result)
-          "*error* SKILL execution failed unexpectedly")
+      letseq(((toolId car(entry))
+              (code cadr(entry))
+              (seq caddr(entry))
+              (raw errset(ACL_execBlock(code)))
+              (result if(raw car(raw)
+                         "*error* SKILL execution failed unexpectedly"))
+              (ipcOutPath when(ACL_sessionLogDir
+                                sprintf(nil "%s/tool_%s.out" ACL_sessionLogDir toolId))))
         when(ACL_sessionLogDir
-          ACL_mcpWriteFile(sprintf(nil "%s/cmd_%d.out" ACL_sessionLogDir seq) result)
+          ACL_writeFile(sprintf(nil "%s/cmd_%d.out" ACL_sessionLogDir seq) result)
           ; The IPC file the Python MCP server polls for: keyed by
           ; tool_use_id. Atomic publish via temp + rename.
-          ipcOutPath = sprintf(nil "%s/tool_%s.out" ACL_sessionLogDir toolId)
-          ACL_mcpWriteFile(strcat(ipcOutPath ".tmp") result)
-          ACL_renameOver(strcat(ipcOutPath ".tmp") ipcOutPath))))))
+          ACL_writeFileAtomic(ipcOutPath result))))))
 
-procedure(ACL_mcpWriteFile(path content)
-  let((fp)
-    fp = outfile(path)
+procedure(ACL_writeFile(path content)
+  ; Plain (non-atomic) write -- truncates path and writes content.
+  ; Used for files where torn writes are acceptable (cmd_<N>.il,
+  ; cmd_<N>.out: human-readable session log).
+  let(((fp outfile(path)))
     when(fp
       fprintf(fp "%s" content)
       close(fp))))
+
+procedure(ACL_writeFileAtomic(path content)
+  ; Atomic write: write to <path>.tmp then rename over <path>. The
+  ; rename is atomic on POSIX, near-atomic on Windows (delete + rename
+  ; via ACL_renameOver). Used for files that other processes / future
+  ; runs read (settings.json, sessions.json, tool_<id>.out polled by
+  ; the python MCP server).
+  let(((tmp strcat(path ".tmp")))
+    ACL_writeFile(tmp content)
+    ACL_renameOver(tmp path)))
 
 procedure(ACL_copyFile(src dst)
   ; Stream src to dst line by line. Returns t on success, nil if
@@ -791,39 +818,30 @@ procedure(ACL_copyFile(src dst)
           (out when(in outfile(dst)))
           line)
     when(and(in out)
-      while(gets(line in) fprintf(out "%s" line))
-      close(in) close(out)
-      t)))
+      while(gets(line in) fprintf(out "%s" line)))
+    ; Close whichever side was opened, even if the other failed.
+    when(in close(in))
+    when(out close(out))
+    and(in out t)))
 
 procedure(ACL_copyDirFiles(srcDir dstDir)
   ; Copy regular files (skip dotfiles like . and ..) from srcDir into
   ; dstDir, which must already exist. Used when forking a session so
   ; the fork inherits the parent's readable cmd_<n>.il / .out logs
   ; without stealing them.
-  let((files in out line)
-    files = errset(getDirFiles(srcDir))
-    when(and(files car(files))
-      foreach(f car(files)
-        when(and(f f != "." f != "..")
-          in = infile(strcat(srcDir "/" f))
-          out = outfile(strcat(dstDir "/" f))
-          when(and(in out)
-            while(gets(line in) fprintf(out "%s" line))
-            close(in) close(out)))))))
+  foreach(f ACL_listDirFiles(srcDir)
+    ACL_copyFile(strcat(srcDir "/" f) strcat(dstDir "/" f))))
 
 procedure(ACL_mcpScanMaxSeq(dir)
   ; Find the highest N from cmd_<N>.il files in dir, so a restored
   ; session continues numbering instead of overwriting prior logs.
-  let((files high re m n)
+  let((high m n)
     high = 0
-    re = pcreCompile("^cmd_(\\d+)\\.il$")
-    files = errset(getDirFiles(dir))
-    when(and(files car(files))
-      foreach(f car(files)
-        when(pcreMatchp(re f)
-          m = pcreSubstitute(re "\\1")
-          n = atoi(m)
-          when(and(n n > high) high = n))))
+    foreach(f ACL_listDirFiles(dir)
+      when(pcreMatchp(ACL_cmdSeqFileRe f)
+        m = pcreSubstitute(ACL_cmdSeqFileRe "\\1")
+        n = atoi(m)
+        when(and(n n > high) high = n)))
     high))
 
 ; ============================================================
@@ -833,8 +851,7 @@ procedure(ACL_mcpScanMaxSeq(dir)
 procedure(ACL_claudeDataHandler(id data)
   let((pos line)
     when(ACL_enableRawLog
-      let((fp)
-        fp = outfile(strcat(ACL_homeDir "raw.log") "a")
+      let(((fp outfile(strcat(ACL_homeDir "raw.log") "a")))
         when(fp fprintf(fp "%s" data) close(fp))))
     ACL_lineBuf = strcat(ACL_lineBuf data)
     pos = nindex(ACL_lineBuf "\n")
@@ -866,9 +883,8 @@ procedure(ACL_processStreamLine(line)
       ; parent files for forks. Same sid (resume) -- nothing to do
       ; here, the dir already exists.
       when(sid != ACL_sessionId
-        let((newDir oldDir)
-          newDir = strcat(ACL_logDir sid "/")
-          oldDir = when(ACL_sessionId strcat(ACL_logDir ACL_sessionId "/"))
+        let(((newDir strcat(ACL_logDir sid "/"))
+             (oldDir when(ACL_sessionId strcat(ACL_logDir ACL_sessionId "/"))))
           ACL_sessionId = sid
           createDir(ACL_logDir)
           createDir(newDir)
@@ -902,11 +918,10 @@ procedure(ACL_processStreamLine(line)
           evtype = ACL_jGet(event "type")
           cond(
             (evtype == "message_start"
-              let((msg msgId)
-                msg = ACL_jGet(event "message")
-                msgId = when(msg ACL_jGet(msg "id"))
+              letseq(((msg ACL_jGet(event "message"))
+                      (msgId when(msg ACL_jGet(msg "id"))))
                 ACL_streamingMsgId = msgId
-                when(and(msgId null(ACL_assocStr(msgId ACL_streamedMsgLen)))
+                when(and(msgId null(assoc(msgId ACL_streamedMsgLen)))
                   ACL_streamedMsgLen = cons(list(msgId 0) ACL_streamedMsgLen)))
               ACL_setStatus("Responding..."))
             (evtype == "content_block_delta"
@@ -918,8 +933,7 @@ procedure(ACL_processStreamLine(line)
                     when(text
                       ; Track streamed text length per message
                       when(ACL_streamingMsgId
-                        let((entry)
-                          entry = assoc(ACL_streamingMsgId ACL_streamedMsgLen)
+                        let(((entry assoc(ACL_streamingMsgId ACL_streamedMsgLen)))
                           when(entry
                             rplaca(cdr(entry) (cadr(entry) + strlen(text))))))
                       ACL_responseBuf = strcat(ACL_responseBuf text)
@@ -944,7 +958,7 @@ procedure(ACL_processStreamLine(line)
                 (and(cblock ACL_jGet(cblock "type") == "tool_use")
                   ACL_hadToolUse = t
                   ACL_setStatus(sprintf(nil "Using %s..."
-                    pcreReplace(pcreCompile("^.*__")
+                    pcreReplace(ACL_mcpToolPrefixRe
                       or(ACL_jGet(cblock "name") "tool") "" 0))))
                 (and(cblock ACL_jGet(cblock "type") == "text")
                   ; Add separator only if a tool_use occurred since last text
@@ -960,7 +974,7 @@ procedure(ACL_processStreamLine(line)
         let((msg content block msgId entry seenLen fullText newText)
           msg = ACL_jGet(parsed "message")
           msgId = when(msg ACL_jGet(msg "id"))
-          entry = when(msgId ACL_assocStr(msgId ACL_streamedMsgLen))
+          entry = when(msgId assoc(msgId ACL_streamedMsgLen))
           seenLen = if(entry cadr(entry) 0)
           content = when(msg ACL_jGet(msg "content"))
           when(content
@@ -1003,9 +1017,7 @@ procedure(ACL_processStreamLine(line)
                     axlFormSetActiveField(ACL_form "userinput"))
                   ACL_appendChat(sprintf(nil "\n\nYou: %s\n" content)))
                 (substring(uuid 1 4) != "user"
-                  let((stripped)
-                    stripped = pcreReplace(
-                      pcreCompile("<[^>]+>") content "" 0)
+                  let(((stripped pcreReplace(ACL_xmlTagRe content "" 0)))
                     ACL_setStatus(stripped)
                     ACL_appendChat(sprintf(nil "\n[%s]" stripped)))))))))
       ; Result (response complete)
@@ -1029,7 +1041,7 @@ procedure(ACL_flushDisplay()
 ; ============================================================
 
 procedure(ACL_stripWS(code)
-  pcreReplace(pcreCompile("^\\s+|\\s+$") code "" 0))
+  pcreReplace(ACL_trimWSRe code "" 0))
 
 procedure(ACL_execBlock(code)
   ; Execute one SKILL block with error handling.
@@ -1038,12 +1050,11 @@ procedure(ACL_execBlock(code)
     when(or(null(code) strlen(code) == 0)
       return("(empty block)"))
     ; Check if axl* functions used are defined
-    let((docError)
-      docError = ACL_checkFuncDocs(code)
+    let(((docError ACL_checkFuncDocs(code)))
       when(docError
         return(sprintf(nil "ERROR: %s" docError))))
     ACL_setStatus(strcat("Executing SKILL: "
-      pcreReplace(pcreCompile("\\s+") code " " 0)))
+      pcreReplace(ACL_collapseWSRe code " " 0)))
     ; Capture Allegro shell messages via a temporary journal. This is
     ; the only mechanism that catches errors from axlShell sub-commands
     ; AND axlMsgPut output (errport/poport/errset/muffleWarnings/
@@ -1098,45 +1109,31 @@ procedure(ACL_readJournalMsgs(path)
   ; Pull message lines from an Allegro journal. Lines start with "\\t "
   ; (info: axlMsgPut output) or "\\e " (errors). Skip the journal
   ; header/footer (start/end markers, host info, version banner).
-  let((fp line out msg trimmed)
-    out = ""
-    fp = infile(path)
+  letseq(((fp infile(path))
+          (lines nil)
+          line)
     when(fp
       while(gets(line fp)
         when(or(substring(line 1 3) == "\\t " substring(line 1 3) == "\\e ")
           ; Strip "\t (HH:MM:SS) " or "\e (HH:MM:SS) " prefix
-          msg = pcreReplace(pcreCompile("^\\\\[te] \\(\\d+:\\d+:\\d+\\) ?")
-            line "" 0)
-          trimmed = pcreReplace(pcreCompile("^\\s+|\\s+$") msg "" 0)
-          ; Skip journal boilerplate lines
-          unless(or(strlen(trimmed) == 0
-                    pcreMatchp(pcreCompile("^(allegro [0-9]|Host=|CmdLine=|Journal (start|end))") trimmed))
-            out = strcat(out trimmed "\n"))))
+          let(((trimmed pcreReplace(ACL_trimWSRe
+                          pcreReplace(ACL_journalTSRe line "" 0) "" 0)))
+            ; Skip journal boilerplate lines
+            unless(or(strlen(trimmed) == 0
+                      pcreMatchp(ACL_journalSkipRe trimmed))
+              lines = cons(strcat(trimmed "\n") lines)))))
       close(fp))
-    out))
+    buildString(reverse(lines) "")))
 
 procedure(ACL_checkFuncDocs(code)
   ; Check if axl* function names used in code are actually defined.
   ; Returns a warning string if any are undefined, nil if all ok.
-  let((missing found pos rest name)
-    rest = code
-    pos = nindex(rest "axl")
-    while(pos
-      let((start end)
-        start = pos
-        end = (pos + 3)
-        while(and(end <= strlen(rest)
-                  let(((c substring(rest end 1)))
-                    nindex("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_" c)))
-          end++)
-        name = substring(rest start (end - start))
-        when(and(name strlen(name) > 3)
-          unless(member(name found)
-            found = cons(name found)
-            unless(fboundp(stringToSymbol(name))
-              missing = cons(name missing))))
-        rest = substring(rest end))
-      pos = when(rest nindex(rest "axl")))
+  ; Splits the code on non-identifier chars, picks out the axl-words,
+  ; dedupes via unique, and reports the ones whose symbol isn't bound.
+  let((tokens axlNames missing)
+    tokens = parseString(pcreReplace(ACL_nonIdentCharRe code " " 0))
+    axlNames = unique(setof(tok tokens pcreMatchp(ACL_axlPrefixRe tok)))
+    missing = setof(name axlNames null(fboundp(stringToSymbol(name))))
     when(missing
       sprintf(nil "Undefined functions: %s. These do not exist. Check the Allegro documentation."
         buildString(missing ", ")))))
@@ -1186,8 +1183,7 @@ procedure(ACL_formCB(form)
       (field == "files"
         ACL_openLogDir())
       (field == "loglines"
-        let((n)
-          n = atoi(val)
+        let(((n atoi(val)))
           when(and(n n > 0)
             ACL_logLineLimit = n
             ; Redisplay with new limit
@@ -1196,9 +1192,8 @@ procedure(ACL_formCB(form)
         ACL_handleSessionPick()))))
 
 procedure(ACL_doSend(form)
-  let((text inManual)
-    text = axlFormGetField(form "userinput")
-    inManual = and(ACL_mode == "manual" ACL_mcpPending)
+  let(((text axlFormGetField(form "userinput"))
+       (inManual and(ACL_mode == "manual" ACL_mcpPending)))
     when(and(text strlen(text) > 0)
       cond(
         ; approve/reject are only special-cased while we're actively
@@ -1236,8 +1231,7 @@ procedure(ACL_toggleRecording(form)
     ACL_recording = nil
     axlFormSetField(form "record" "Record")
     ACL_setStatus("Processing recording...")
-    let((contents)
-      contents = ACL_readFile(ACL_journalFile)
+    let(((contents ACL_readFile(ACL_journalFile)))
       when(strlen(contents) > 0
         ACL_handleJournal(contents)))
   else
@@ -1261,9 +1255,8 @@ procedure(ACL_pollInput(@rest args)
   ; Timer callback: check if queued input text has changed.
   ; Self-terminates when ACL_pendingInput becomes nil.
   when(and(ACL_pendingInput ACL_form)
-    let((text)
-      text = axlFormGetField(ACL_form "userinput")
-      when((text != ACL_pendingInput)
+    let(((text axlFormGetField(ACL_form "userinput")))
+      when(text != ACL_pendingInput
         ACL_pendingInput = text
         ACL_sendMessage(text ?uuid sprintf(nil "user%d-%d" ACL_uuidEpoch ACL_promptId))))
     ; Re-schedule while still queued
@@ -1277,14 +1270,13 @@ procedure(ACL_handleUserMessage(text)
   ACL_setStatus("Thinking...")
   ACL_responseBuf = ""
   ACL_pendingInput = text
-  let((elapsed prefix userUuid)
-    elapsed = stringToTime(getCurrentTime()) - ACL_lastCmdTime
-    prefix = if(and(ACL_lastCmdTime elapsed > 60)
-      "[The board may have been edited. Re-query the design instead of relying on memory.] "
-      "")
-    userUuid = sprintf(nil "user%d-%d" ACL_uuidEpoch ACL_promptId)
+  letseq(((elapsed stringToTime(getCurrentTime()) - ACL_lastCmdTime)
+          (prefix if(and(ACL_lastCmdTime elapsed > 60)
+                     "[The board may have been edited. Re-query the design instead of relying on memory.] "
+                     ""))
+          (userUuid sprintf(nil "user%d-%d" ACL_uuidEpoch ACL_promptId)))
     ; Send system prefix as synthetic (not displayed, no response generated)
-    (when (strlen(prefix) > 0)
+    when(strlen(prefix) > 0
       ACL_sendMessage(prefix ?isSynthetic t ?noQuery t))
     ; Send user's actual message
     ACL_sendMessage(text ?uuid userUuid)
@@ -1295,7 +1287,7 @@ procedure(ACL_handleApprove(@optional (extra ""))
   ; Caller has already trimmed the leading "approve". Anything left
   ; was extra prompting that doesn't fit the approve/reject channel
   ; -- log it as discarded so the user knows it didn't reach claude.
-  if(and(stringp(extra) strlen(extra) > 0)
+  if(ACL_nonEmpty(extra)
     ACL_appendChat(sprintf(nil "[Approved. Additional prompting discarded: %s]" extra))
     ACL_appendChat("[Approved.]"))
   ACL_mcpScheduleDrain())
@@ -1305,27 +1297,24 @@ procedure(ACL_handleReject(@optional (extra ""))
   ; added context, surface it as the chat line and pass it through to
   ; claude as part of the tool's rejection result so claude knows
   ; what to do next; otherwise use the bare "Rejected." form.
-  let((haveExtra reason chatLine)
-    haveExtra = and(stringp(extra) strlen(extra) > 0)
-    chatLine = if(haveExtra sprintf(nil "[Rejected. %s]" extra) "[Rejected.]")
-    reason = if(haveExtra
-      sprintf(nil "*rejected by user in manual mode* -- do not retry. The user said:\n\"%s\"\n. Respond accordingly." extra)
-      "*rejected by user in manual mode* -- do not retry. Ask the user what they would like instead.")
+  letseq(((haveExtra ACL_nonEmpty(extra))
+          (chatLine if(haveExtra sprintf(nil "[Rejected. %s]" extra) "[Rejected.]"))
+          (reason if(haveExtra
+            sprintf(nil "*rejected by user in manual mode* -- do not retry. The user said:\n\"%s\"\n. Respond accordingly." extra)
+            "*rejected by user in manual mode* -- do not retry. Ask the user what they would like instead.")))
     ACL_appendChat(chatLine)
     ACL_setStatus("Thinking...")
     ; Respond to each pending tool_use with the rejection result.
     ; Claude receives this as the tool's output, so the rejection
     ; rides the tool-use channel -- no separate user message needed.
-    let((pending)
-      pending = ACL_mcpPending
+    let(((pending ACL_mcpPending))
       ACL_mcpPending = nil
       foreach(entry pending
-        let((toolId ipcOutPath)
-          toolId = car(entry)
-          when(ACL_sessionLogDir
-            ipcOutPath = sprintf(nil "%s/tool_%s.out" ACL_sessionLogDir toolId)
-            ACL_mcpWriteFile(strcat(ipcOutPath ".tmp") reason)
-            ACL_renameOver(strcat(ipcOutPath ".tmp") ipcOutPath)))))))
+        letseq(((toolId car(entry))
+                (ipcOutPath when(ACL_sessionLogDir
+                                  sprintf(nil "%s/tool_%s.out" ACL_sessionLogDir toolId))))
+          when(ipcOutPath
+            ACL_writeFileAtomic(ipcOutPath reason)))))))
 
 procedure(ACL_handleJournal(contents)
   ACL_setStatus("Analyzing...")
@@ -1347,7 +1336,7 @@ procedure(ACL_handleSessionPick()
     unless(axlGetDrawingName()
       ACL_appendChat("No board file loaded.")
       return(nil))
-    sessions = or(ACL_loadSessions() nil)
+    sessions = ACL_loadSessions()
     unless(sessions
       ACL_appendChat("No previous sessions. Starting new session.")
       ACL_handleNewSession()
@@ -1355,13 +1344,13 @@ procedure(ACL_handleSessionPick()
     ; Build parallel lists of labels and session IDs
     sids = mapcar('car sessions)
     labels = mapcar(lambda((entry)
-      let((info board time)
-        info = cadr(entry)
-        board = or(ACL_jGet(info "board") "?")
-        time = ACL_jGet(info "time")
-        when(and(time numberp(atoi(time)))
-          time = timeToString(atoi(time)))
-        sprintf(nil "%s  [%s]  (%s)" car(entry) board or(time "?"))))
+      letseq(((info cadr(entry))
+              (board or(ACL_jGet(info "board") "?"))
+              (rawTime ACL_jGet(info "time"))
+              (time if(and(rawTime numberp(atoi(rawTime)))
+                       timeToString(atoi(rawTime))
+                       "?")))
+        sprintf(nil "%s  [%s]  (%s)" car(entry) board time)))
       sessions)
     labels = cons("New session" labels)
     choice = axlUIMultipleChoice("Select a session" labels "Claude Sessions")
@@ -1377,7 +1366,7 @@ procedure(ACL_handleSessionPick()
 
 procedure(ACL_basename(path)
   ; Last path component of a "/"-or-"\"-separated path.
-  pcreReplace(pcreCompile("^.*[/\\\\]") path "" 0))
+  pcreReplace(ACL_basenameStripRe path "" 0))
 
 procedure(ACL_findOrPlanDocs()
   ; Look for the cached Allegro docs file across known locations.
@@ -1387,20 +1376,18 @@ procedure(ACL_findOrPlanDocs()
   ; Returns the first match found. If nothing matches, returns the
   ; notes-dir path with the exact-version filename so the agent can
   ; create it there.
-  let((exactName baseName dirs found)
-    exactName = strcat("SPB"
-      pcreReplace(pcreCompile("[^\\w]") axlVersion('fullVersion) "_" 0)
-      ".md")
-    ; Strip the hotfix suffix (trailing "_S<digits>" or "_HF<digits>")
-    baseName = pcreReplace(pcreCompile("_(S|HF)\\d+\\.md$")
-      exactName ".md" 0)
-    dirs = list(ACL_notesDir
-                ACL_axlGetPath("allegro_pcbenv")
-                ACL_axlGetPath("allegro_site")
-                ACL_scriptDir)
+  letseq(((exactName strcat("SPB"
+                              pcreReplace(ACL_versionSanitizeRe
+                                axlVersion('fullVersion) "_" 0)
+                              ".md"))
+          ; Strip the hotfix suffix (trailing "_S<digits>" or "_HF<digits>")
+          (baseName pcreReplace(ACL_hotfixStripRe exactName ".md" 0))
+          (dirs list(ACL_notesDir
+                     ACL_axlGetPath("allegro_pcbenv")
+                     ACL_axlGetPath("allegro_site")
+                     ACL_scriptDir))
+          found)
     ; Exact filename in any dir wins; then the less-specific (no hotfix).
-    ; All dirs end in "/" (path defvar convention), so a plain strcat
-    ; joins cleanly.
     foreach(name list(exactName baseName)
       foreach(d dirs
         when(and(stringp(d) null(found))
@@ -1482,8 +1469,7 @@ procedure(ACL_handleNewSession()
     ?isSynthetic t))
 
 procedure(ACL_handleRestoreSession(sid)
-  let((info)
-    info = ACL_getSession(sid)
+  let(((info ACL_getSession(sid)))
     if(null(info) then
       ; Session not in our sessions.json -- nothing to restore.
       ACL_handleNewSession()
@@ -1550,7 +1536,7 @@ procedure(ACL_openPanel(@rest args)
     ACL_form = axlFormCreate('ACL_form formFile nil 'ACL_formCB t t)
     when(ACL_form
       axlFormDefaultButton(ACL_form "send")
-      ACL_applySettings(or(ACL_loadSettings(ACL_settingsFile) nil))
+      ACL_applySettings(ACL_loadSettings(ACL_settingsFile))
       axlFormSetField(ACL_form "mode" ACL_mode)
       axlFormSetField(ACL_form "loglines" sprintf(nil "%d" ACL_logLineLimit))
       axlFormSetField(ACL_form "statuslabel" "Starting...")
@@ -1565,15 +1551,13 @@ procedure(ACL_openPanel(@rest args)
         ACL_setStatus(if(and(ACL_claude ipcIsAliveProcess(ACL_claude))
           "Ready" "Starting..."))
       else
-        let((sessions board mostRecent)
-          board = axlGetDrawingName()
-          sessions = when(board ACL_getBoardSessions(board))
+        letseq(((board axlGetDrawingName())
+                (sessions when(board ACL_getBoardSessions(board))))
           ; Auto-resume the most recent session for this board, if any.
           ; If the session id is stale, the stderr handler clears it and
           ; the next user action starts fresh via ACL_ensureClaude.
           if(sessions then
-            mostRecent = car(ACL_sortSessionsByTime(sessions))
-            ACL_handleRestoreSession(car(mostRecent))
+            ACL_handleRestoreSession(car(car(ACL_sortSessionsByTime(sessions))))
           else
             ACL_handleNewSession())))
       ; If a prompt was given on the command line, send it after setup.
@@ -1599,6 +1583,11 @@ procedure(ACL_check(name got expected)
     ACL_testFail++
     printf("  FAIL: %s\n    got:      %L\n    expected: %L\n" name got expected)))
 
+procedure(ACL_checkTrue(name got)
+  ; Like ACL_check but coerces got to a boolean -- avoids the noisy
+  ; `ACL_check("...", and(x t), t)` idiom.
+  ACL_check(name and(got t) t))
+
 procedure(ACL_runTests()
   ACL_testPass = 0
   ACL_testFail = 0
@@ -1611,6 +1600,12 @@ procedure(ACL_runTests()
   ACL_check("escaped str"  car(ACL_jParse("\"a\\nb\\tc\""))    "a\nb\tc")
   ACL_check("escaped quote" car(ACL_jParse("\"say \\\"hi\\\"\"")) "say \"hi\"")
   ACL_check("escaped backslash" car(ACL_jParse("\"a\\\\b\""))  "a\\b")
+  ; Pathological: literal "\\n" (backslash + n) must NOT decode to a
+  ; newline -- exercises the sentinel-swap in jUnescape.
+  ACL_check("escaped backslash-n"
+    car(ACL_jParse("\"a\\\\nb\""))  "a\\nb")
+  ACL_check("escaped slash"
+    car(ACL_jParse("\"a\\/b\""))    "a/b")
   ACL_check("integer"      car(ACL_jParse("42"))               42)
   ACL_check("negative"     car(ACL_jParse("-7"))               -7)
   ACL_check("float"        car(ACL_jParse("3.14"))             3.14)
@@ -1622,8 +1617,7 @@ procedure(ACL_runTests()
   ; Objects
   ACL_check("empty obj"    car(ACL_jParse("{}"))               nil)
   ACL_check("simple obj"   ACL_jGet(car(ACL_jParse("{\"a\":1}")) "a")  1)
-  let((o)
-    o = car(ACL_jParse("{\"x\":10,\"y\":20}"))
+  let(((o car(ACL_jParse("{\"x\":10,\"y\":20}"))))
     ACL_check("multi obj"  list(ACL_jGet(o "x") ACL_jGet(o "y"))  list(10 20)))
   ACL_check("nested obj"
     ACL_jGet(ACL_jGet(car(ACL_jParse("{\"a\":{\"b\":99}}")) "a") "b")
@@ -1657,10 +1651,9 @@ procedure(ACL_runTests()
     "{\"type\":\"msg\",\"n\":1}")
 
   printf("\n--- JSON Roundtrip ---\n")
-  let((orig parsed)
-    orig = ACL_jsonObj(list("type" "user_message")
-                       list("content" "hello\nworld"))
-    parsed = car(ACL_jParse(orig))
+  letseq(((orig ACL_jsonObj(list("type" "user_message")
+                            list("content" "hello\nworld")))
+          (parsed car(ACL_jParse(orig))))
     ACL_check("rt type"    ACL_jGet(parsed "type")     "user_message")
     ACL_check("rt content" ACL_jGet(parsed "content")  "hello\nworld"))
 
@@ -1670,35 +1663,31 @@ procedure(ACL_runTests()
     ACL_check("exec simple"
       ACL_execBlock("(plus 40 2)")
       "Result: 42")
+    ACL_check("checkFuncDocs all bound"
+      ACL_checkFuncDocs("axlMsgPut(\"hi\") axlGetVariable(\"foo\")")
+      nil)
+    ACL_checkTrue("checkFuncDocs flags missing"
+      ACL_checkFuncDocs("axlMsgPut(x) axlBogusNotARealFunction()"))
     ACL_check("exec empty"
       ACL_execBlock("")
       "(empty block)")
     ACL_check("exec with output"
       ACL_execBlock("printf(\"hello\\n\") 99")
       "Output:\nhello\n\nResult: 99")
-    let((errResult)
-      errResult = ACL_execBlock("(undefined_function_xyz)")
-      ACL_check("exec error"
-        and(nindex(errResult "*Error*") t)
-        t))
+    let(((errResult ACL_execBlock("(undefined_function_xyz)")))
+      ACL_checkTrue("exec error" nindex(errResult "*Error*")))
     ; Allegro shell errors should be captured via the journal
-    let((shellResult)
-      shellResult = ACL_execBlock("axlShell(\"zoom bogus\")")
-      ACL_check("exec captures shell error"
-        and(nindex(shellResult "Command not found") t)
-        t))
+    let(((shellResult ACL_execBlock("axlShell(\"zoom bogus\")")))
+      ACL_checkTrue("exec captures shell error"
+        nindex(shellResult "Command not found")))
     ; SKILL error() message text should survive
-    let((errResult)
-      errResult = ACL_execBlock("error(\"my custom error\")")
-      ACL_check("exec preserves error msg"
-        and(nindex(errResult "my custom error") t)
-        t))
+    let(((errResult ACL_execBlock("error(\"my custom error\")")))
+      ACL_checkTrue("exec preserves error msg"
+        nindex(errResult "my custom error")))
     ; axlMsgPut output should be captured (journal)
-    let((msgResult)
-      msgResult = ACL_execBlock("axlMsgPut(\"a logged note\")")
-      ACL_check("exec captures axlMsgPut"
-        and(nindex(msgResult "a logged note") t)
-        t))
+    let(((msgResult ACL_execBlock("axlMsgPut(\"a logged note\")")))
+      ACL_checkTrue("exec captures axlMsgPut"
+        nindex(msgResult "a logged note")))
     ; Multi-statement blocks should all evaluate; result is the last
     ; expression's value. (Without the progn wrapper, errsetstring
     ; would only run the first form.)
@@ -1754,12 +1743,12 @@ procedure(ACL_runTests()
     ACL_mcpDrainPending()
     ACL_check("pending cleared" ACL_mcpPending nil)
     ACL_check("seq advanced" ACL_mcpCmdSeq 1)
-    ACL_check("cmd il written"
-      and(isFile(strcat(ACL_sessionLogDir "cmd_1.il")) t) t)
-    ACL_check("cmd out written"
-      and(isFile(strcat(ACL_sessionLogDir "cmd_1.out")) t) t)
-    ACL_check("ipc out written"
-      and(isFile(strcat(ACL_sessionLogDir "tool_toolu_test_42.out")) t) t)
+    ACL_checkTrue("cmd il written"
+      isFile(strcat(ACL_sessionLogDir "cmd_1.il")))
+    ACL_checkTrue("cmd out written"
+      isFile(strcat(ACL_sessionLogDir "cmd_1.out")))
+    ACL_checkTrue("ipc out written"
+      isFile(strcat(ACL_sessionLogDir "tool_toolu_test_42.out")))
     ACL_check("cmd il content"
       ACL_readFile(strcat(ACL_sessionLogDir "cmd_1.il")) "(plus 40 2)")
     ACL_check("ipc out content"
@@ -1785,8 +1774,7 @@ procedure(ACL_runTests()
     ACL_check("scan max seq sees existing"
       ACL_mcpScanMaxSeq(ACL_sessionLogDir) 3)
     ; Empty dir -> 0
-    let((emptyDir)
-      emptyDir = strcat(ACL_homeDir "mcp_test_empty/")
+    let(((emptyDir strcat(ACL_homeDir "mcp_test_empty/")))
       createDir(emptyDir)
       ACL_check("scan max seq empty dir"
         ACL_mcpScanMaxSeq(emptyDir) 0)
@@ -1806,11 +1794,11 @@ procedure(ACL_runTests()
       ACL_check("manual: timer NOT armed" ACL_mcpExecTimer nil)
       ; Approve schedules a deferred drain; in tests, run it inline.
       ACL_handleApprove()
-      ACL_check("manual: approve scheduled" and(ACL_mcpExecTimer t) t)
+      ACL_checkTrue("manual: approve scheduled" ACL_mcpExecTimer)
       ACL_mcpDrainPending()
       ACL_check("manual: approve drained" ACL_mcpPending nil)
-      ACL_check("manual: approve wrote .out"
-        and(isFile(strcat(ACL_sessionLogDir "tool_toolu_manual_1.out")) t) t)
+      ACL_checkTrue("manual: approve wrote .out"
+        isFile(strcat(ACL_sessionLogDir "tool_toolu_manual_1.out")))
 
       ; Reject writes a rejection .out for each pending so the MCP
       ; server doesn't hang polling.
@@ -1820,8 +1808,8 @@ procedure(ACL_runTests()
       ACL_check("manual: queued again" length(ACL_mcpPending) 1)
       ACL_handleReject()
       ACL_check("manual: reject cleared" ACL_mcpPending nil)
-      ACL_check("manual: reject wrote .out"
-        and(isFile(strcat(ACL_sessionLogDir "tool_toolu_manual_2.out")) t) t)
+      ACL_checkTrue("manual: reject wrote .out"
+        isFile(strcat(ACL_sessionLogDir "tool_toolu_manual_2.out")))
       ACL_check("manual: reject .out content"
         ACL_readFile(strcat(ACL_sessionLogDir "tool_toolu_manual_2.out"))
         "*rejected by user in manual mode* -- do not retry. Ask the user what they would like instead.")
@@ -1850,12 +1838,8 @@ procedure(ACL_runTests()
       ACL_mode = savedMode)
 
     ; Clean up
-    let((files)
-      files = errset(getDirFiles(ACL_sessionLogDir))
-      when(and(files car(files))
-        foreach(f car(files)
-          when(and(f f != "." f != "..")
-            errset(deleteFile(strcat(ACL_sessionLogDir f)))))))
+    foreach(f ACL_listDirFiles(ACL_sessionLogDir)
+      errset(deleteFile(strcat(ACL_sessionLogDir f))))
     errset(deleteDir(ACL_sessionLogDir))
     ACL_sessionLogDir = savedSessionDir
     ACL_mcpCmdSeq = savedSeq
@@ -1863,10 +1847,9 @@ procedure(ACL_runTests()
     ACL_form = savedForm)
 
   printf("\n--- Form File ---\n")
-  let((formPath formHandle)
-    formPath = strcat(ACL_scriptDir "allegro_claude.form")
-    formHandle = axlFormCreate('ACL_testForm formPath nil nil nil)
-    ACL_check("form parse" and(formHandle t) t)
+  letseq(((formPath strcat(ACL_scriptDir "allegro_claude.form"))
+          (formHandle axlFormCreate('ACL_testForm formPath nil nil nil)))
+    ACL_checkTrue("form parse" formHandle)
     when(formHandle axlFormClose(formHandle)))
 
   printf("\n--- Doc Lookup ---\n")
@@ -1884,11 +1867,9 @@ procedure(ACL_runTests()
     axlSetVariable("allegro_pcbenv" pcbDir)
     axlSetVariable("allegro_site" siteDir)
     exactName = strcat("SPB"
-      pcreReplace(pcreCompile("[^\\w]") axlVersion('fullVersion) "_" 0) ".md")
-    baseName = pcreReplace(pcreCompile("_(S|HF)\\d+\\.md$")
+      pcreReplace(ACL_versionSanitizeRe axlVersion('fullVersion) "_" 0) ".md")
+    baseName = pcreReplace(ACL_hotfixStripRe
       exactName ".md" 0)
-    ; Helper closures via let-bound functions aren't great in SKILL,
-    ; so just inline a writer + cleaner.
     let((fp p)
       ; ---- 1. No files anywhere -> default to notesDir/exactName
       doc = ACL_findOrPlanDocs()
@@ -1920,36 +1901,32 @@ procedure(ACL_runTests()
       deleteFile(p)
 
       ; ---- 6. Dir priority: notesDir > pcbenv when both have exact
-      let((pNotes pPcb)
-        pNotes = strcat(notesDir exactName)
-        pPcb = strcat(pcbDir exactName)
+      letseq(((pNotes strcat(notesDir exactName))
+              (pPcb   strcat(pcbDir exactName)))
         fp = outfile(pNotes) when(fp fprintf(fp "n") close(fp))
         fp = outfile(pPcb) when(fp fprintf(fp "p") close(fp))
         ACL_check("doc notesDir beats pcbenv" ACL_findOrPlanDocs() pNotes)
         deleteFile(pNotes) deleteFile(pPcb))
 
       ; ---- 7. Dir priority: pcbenv > site
-      let((pPcb pSite)
-        pPcb = strcat(pcbDir exactName)
-        pSite = strcat(siteDir exactName)
+      letseq(((pPcb  strcat(pcbDir exactName))
+              (pSite strcat(siteDir exactName)))
         fp = outfile(pPcb) when(fp fprintf(fp "p") close(fp))
         fp = outfile(pSite) when(fp fprintf(fp "s") close(fp))
         ACL_check("doc pcbenv beats site" ACL_findOrPlanDocs() pPcb)
         deleteFile(pPcb) deleteFile(pSite))
 
       ; ---- 8. Dir priority: site > scriptDir
-      let((pSite pScript)
-        pSite = strcat(siteDir exactName)
-        pScript = strcat(scriptDir exactName)
+      letseq(((pSite   strcat(siteDir exactName))
+              (pScript strcat(scriptDir exactName)))
         fp = outfile(pSite) when(fp fprintf(fp "s") close(fp))
         fp = outfile(pScript) when(fp fprintf(fp "x") close(fp))
         ACL_check("doc site beats scriptDir" ACL_findOrPlanDocs() pSite)
         deleteFile(pSite) deleteFile(pScript))
 
       ; ---- 9. Exact in scriptDir beats base in notesDir
-      let((pExact pBase)
-        pExact = strcat(scriptDir exactName)
-        pBase = strcat(notesDir baseName)
+      letseq(((pExact strcat(scriptDir exactName))
+              (pBase  strcat(notesDir baseName)))
         fp = outfile(pExact) when(fp fprintf(fp "e") close(fp))
         fp = outfile(pBase) when(fp fprintf(fp "b") close(fp))
         ACL_check("doc exact anywhere beats base in notes"
@@ -1969,9 +1946,8 @@ procedure(ACL_runTests()
       deleteFile(p)
 
       ; ---- 12. Base in notesDir beats base in pcbenv (priority within base)
-      let((pNotes pPcb)
-        pNotes = strcat(notesDir baseName)
-        pPcb = strcat(pcbDir baseName)
+      letseq(((pNotes strcat(notesDir baseName))
+              (pPcb   strcat(pcbDir baseName)))
         fp = outfile(pNotes) when(fp fprintf(fp "n") close(fp))
         fp = outfile(pPcb) when(fp fprintf(fp "p") close(fp))
         ACL_check("doc base priority" ACL_findOrPlanDocs() pNotes)
@@ -2059,8 +2035,7 @@ procedure(ACL_runTests()
     ACL_sessionId = "rekey-old-2"
     parentDir = strcat(ACL_logDir "rekey-old-2/")
     ACL_createDirP(parentDir)
-    let((fp)
-      fp = outfile(strcat(parentDir "/cmd_3.il"))
+    let(((fp outfile(strcat(parentDir "/cmd_3.il"))))
       when(fp fprintf(fp "(plus 2 2)") close(fp))
       fp = outfile(strcat(parentDir "/cmd_3.out"))
       when(fp fprintf(fp "Result: 4") close(fp)))
@@ -2070,29 +2045,25 @@ procedure(ACL_runTests()
     newDir = strcat(ACL_logDir "rekey-new-2/")
     ACL_check("fork: id updated" ACL_sessionId "rekey-new-2")
     ACL_check("fork: parent dir preserved" isDir(parentDir) t)
-    ACL_check("fork: parent cmd preserved"
-      and(isFile(strcat(parentDir "/cmd_3.il")) t) t)
+    ACL_checkTrue("fork: parent cmd preserved"
+      isFile(strcat(parentDir "/cmd_3.il")))
     ACL_check("fork: new dir present" isDir(newDir) t)
-    ACL_check("fork: cmd file copied to new"
-      and(isFile(strcat(newDir "/cmd_3.il")) t) t)
+    ACL_checkTrue("fork: cmd file copied to new"
+      isFile(strcat(newDir "/cmd_3.il")))
     ACL_check("fork: copied content matches"
       ACL_readFile(strcat(newDir "/cmd_3.il")) "(plus 2 2)")
     ACL_check("fork: seq seeded from copied files" ACL_mcpCmdSeq 3)
-    ACL_check("fork: parent kept in sessions"
-      and(assoc("rekey-old-2" ACL_loadSessions()) t) t)
+    ACL_checkTrue("fork: parent kept in sessions"
+      assoc("rekey-old-2" ACL_loadSessions()))
     ; Fork should NOT pre-add the new sid: the first-text save path
     ; registers it with the current board (not the parent's).
     ACL_check("fork: new id NOT pre-added to sessions"
       assoc("rekey-new-2" ACL_loadSessions()) nil)
     ; cleanup
     foreach(d list(parentDir newDir)
-      let((files)
-        files = errset(getDirFiles(d))
-        when(and(files car(files))
-          foreach(f car(files)
-            when(and(f f != "." f != "..")
-              errset(deleteFile(strcat(d "/" f))))))
-        errset(deleteDir(d))))
+      foreach(f ACL_listDirFiles(d)
+        errset(deleteFile(strcat(d "/" f))))
+      errset(deleteDir(d)))
 
     ACL_resumeIsFork = savedFork
     ACL_mcpCmdSeq = savedSeq
@@ -2102,10 +2073,10 @@ procedure(ACL_runTests()
     ACL_sessionsFile = savedFile)
 
   printf("\n--- Resume seq seeding ---\n")
-  ; On resume claude returns the SAME sid, so the new-session branch
-  ; in ACL_processStreamLine doesn't fire. The seq must still be
-  ; reseeded from existing cmd_<N>.il files, otherwise tool_use
-  ; numbering restarts at 1 and overwrites prior turns.
+  ; On resume claude returns the SAME sid, so processStreamLine's
+  ; new-sid branch never fires. The seq must still be seeded from
+  ; existing cmd_<N>.il files on every system/init event, otherwise
+  ; tool_use numbering restarts at 1 and overwrites prior turns.
   let(((savedSid ACL_sessionId) (savedLogDir ACL_sessionLogDir)
        (savedSeq ACL_mcpCmdSeq) sid logDir fp)
     sid = "resume-seed-test"
@@ -2113,9 +2084,6 @@ procedure(ACL_runTests()
     ACL_createDirP(logDir)
     fp = outfile(strcat(logDir "/cmd_7.il"))
     when(fp fprintf(fp "(plus 1 1)") close(fp))
-    ; Simulate resume: ACL_startClaude reset seq to 0 and the sid
-    ; matches the one already set, so processStreamLine's rekey
-    ; block must NOT be the only place that seeds.
     ACL_sessionId = sid
     ACL_sessionLogDir = logDir
     ACL_mcpCmdSeq = 0
@@ -2129,8 +2097,9 @@ procedure(ACL_runTests()
     ACL_sessionId = savedSid)
 
   printf("\n--- Hook session_id ignored ---\n")
-  ; SessionStart:resume hook events carry transient session_ids that must NOT
-  ; trigger our rekey logic. Only system/init should be authoritative.
+  ; SessionStart:resume hook events carry transient session_ids that
+  ; must not be mistaken for a real sid change. Only system/init is
+  ; authoritative.
   let(((savedSid ACL_sessionId) (savedLogDir ACL_sessionLogDir))
     ACL_sessionId = "real-sid"
     ACL_sessionLogDir = strcat(ACL_logDir "real-sid/")
@@ -2161,7 +2130,7 @@ procedure(ACL_runTests()
       lambda((id data) buf = strcat(buf data)  ready = t)
       lambda((id data) printf("ipc err: %s\n" data)))
     ipcWaitForProcess(proc)
-    ACL_check("ipc spawn" and(proc ipcIsAliveProcess(proc) t) t)
+    ACL_checkTrue("ipc spawn" and(proc ipcIsAliveProcess(proc)))
     ; Write and read back
     ipcWriteProcess(proc "hello\n")
     ; Give dataHandler time to fire (may need a brief pause)
@@ -2170,14 +2139,13 @@ procedure(ACL_runTests()
     ipcKillProcess(proc))
 
   printf("\n--- Claude Process ---\n")
-  let((claudeExists)
-    claudeExists = errset(system(
-      if(ACL_isWindows "where claude >NUL 2>&1"
-        "env -u LD_LIBRARY_PATH which claude > /dev/null 2>&1")))
+  let(((claudeExists errset(system(
+          if(ACL_isWindows "where claude >NUL 2>&1"
+            "env -u LD_LIBRARY_PATH which claude > /dev/null 2>&1")))))
     if(and(claudeExists car(claudeExists) == 0) then
       ACL_streamErrorCount = 0
       ACL_startClaude()
-      ACL_check("claude start" and(ACL_claude ipcIsAliveProcess(ACL_claude) t) t)
+      ACL_checkTrue("claude start" and(ACL_claude ipcIsAliveProcess(ACL_claude)))
       ; End-to-end: send message and wait for response via ipcSleep
       ; ipcSleep processes handlers while waiting
       printf("  Sending hello to Claude...\n")
@@ -2188,9 +2156,8 @@ procedure(ACL_runTests()
       for(i 1 120
         unless(ACL_gotText ipcSleep(1)))
       ACL_check("claude response" ACL_gotText t)
-      ; SKILL execution round-trip test:
-      ; Tool calls are now executed directly from the stream handler
-      ; via a one-shot timer (no more SKILL queue-poll).
+      ; SKILL execution round-trip test: stream tool_use -> handler
+      ; -> deferred drain -> .out file -> MCP server -> claude.
       printf("  Testing SKILL execution round-trip...\n")
       ACL_responseBuf = ""
       ACL_gotText = nil
@@ -2202,20 +2169,17 @@ procedure(ACL_runTests()
       ACL_check("skill exec response" ACL_gotText t)
       ; Inspect actual artifacts: at least one cmd_*.out should exist
       ; and contain "42" somewhere in the result.
-      let((files outContent foundExec)
-        files = errset(getDirFiles(ACL_sessionLogDir))
-        foundExec = nil
-        outContent = ""
-        when(and(files car(files))
-          foreach(f car(files)
-            when(and(strlen(f) > 4
-                     substring(f (strlen(f) - 3)) == ".out")
-              foundExec = t
-              outContent = strcat(outContent
-                ACL_readFile(strcat(ACL_sessionLogDir f))))))
+      let(((outContent "")
+           (foundExec nil))
+        foreach(f ACL_listDirFiles(ACL_sessionLogDir)
+          when(and(strlen(f) > 4
+                   substring(f (strlen(f) - 3)) == ".out")
+            foundExec = t
+            outContent = strcat(outContent
+              ACL_readFile(strcat(ACL_sessionLogDir f)))))
         ACL_check("mcp tool was called" foundExec t)
-        ACL_check("mcp result contains 42"
-          and(nindex(outContent "42") t) t))
+        ACL_checkTrue("mcp result contains 42"
+          nindex(outContent "42")))
       ACL_stopClaude()
       ACL_check("claude stop" ACL_claude nil)
       ACL_check("no stream errors" ACL_streamErrorCount 0)
