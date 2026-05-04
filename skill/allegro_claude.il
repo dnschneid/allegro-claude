@@ -215,6 +215,15 @@ procedure(ACL_normPath(path)
     pcreReplace(pcreCompile("\\\\") path "/" 0)
     path))
 
+procedure(ACL_axlGetPath(name)
+  ; Read an Allegro path variable, normalize slashes, ensure a
+  ; trailing slash, and treat defined-but-blank as nil (sometimes
+  ; happens with allegro_pcbenv) so callers can `or` against a
+  ; default.
+  let(((v axlGetVariable(name)))
+    when(and(stringp(v) strlen(v) > 0)
+      pcreReplace(pcreCompile("[^/]$") ACL_normPath(v) "$0/" 0))))
+
 defvar(ACL_fast nil)                ; set to t to skip preloading Allegro docs
 defvar(ACL_claudeArgs "")            ; extra flags appended to claude CLI invocation
 defvar(ACL_enableRawLog nil)       ; helps with debugging streams
@@ -257,20 +266,39 @@ defvar(ACL_noSessionRe pcreCompile(
   "No conversation found with session ID: ([0-9a-f-]+)"))
 defvar(ACL_bignumRe  pcreCompile("^-?\\d{10,}$"))
 
+; All path defvars below use the convention "directories end with /,
+; files don't". Saves callers from needing to insert separators.
 defvar(ACL_homeDir  ; use ~/.local/share to help with sandboxing
-  strcat(or(getShellEnvVar("XDG_DATA_HOME")
+  ACL_normPath(strcat(or(getShellEnvVar("XDG_DATA_HOME")
             strcat(or(getShellEnvVar("USERPROFILE") getShellEnvVar("HOME"))
                    "/.local/share"))
-         "/allegro_claude"))
-defvar(ACL_notesDir       strcat(ACL_homeDir "/notes"))
-defvar(ACL_sessionsFile strcat(ACL_homeDir "/sessions.json"))
-defvar(ACL_settingsFile strcat(ACL_homeDir "/settings.json"))
-defvar(ACL_logDir       strcat(ACL_homeDir "/logs"))
+         "/allegro_claude/")))
+defvar(ACL_notesDir     strcat(ACL_homeDir "notes/"))
+defvar(ACL_sessionsFile strcat(ACL_homeDir "sessions.json"))
+defvar(ACL_settingsFile strcat(ACL_homeDir "settings.json"))
+defvar(ACL_logDir       strcat(ACL_homeDir "logs/"))
 defvar(ACL_sessionLogDir ACL_logDir)
 
-defvar(ACL_scriptDir
-  ACL_normPath(pcreReplace(pcreCompile("[^/\\\\]+$")
-    simplifyFilename(get_filename(piport)) "" 0)))
+; ACL_scriptDir is the directory containing this file (and PROMPT.md,
+; LESSONS.md, the .form, and allegro_mcp.py). Auto-detect via piport.
+; The user can pre-set ACL_scriptDir before loading to skip detection.
+defvar(ACL_scriptDir nil)
+unless(ACL_scriptDir
+  ACL_scriptDir = car(errset(
+    pcreReplace(pcreCompile("[^/\\\\]+$")
+      simplifyFilename(get_filename(piport)) "" 0))))
+; Normalize: forward slashes, guaranteed trailing slash. Then sanity-
+; check by content -- PROMPT.md should sit alongside this file.
+when(stringp(ACL_scriptDir)
+  ACL_scriptDir = pcreReplace(pcreCompile("[^/]$")
+    ACL_normPath(ACL_scriptDir) "$0/" 0))
+unless(and(stringp(ACL_scriptDir) isFile(strcat(ACL_scriptDir "PROMPT.md")))
+  printf(strcat(
+    "*Warning* ACL: script directory looks wrong "
+    "(ACL_scriptDir = %L; expected to contain PROMPT.md). "
+    "Set ACL_scriptDir explicitly before loading allegro_claude.il -- e.g.:\n"
+    "  ACL_scriptDir = \"/path/to/allegro-claude/skill/\"\n"
+    "  load(strcat(ACL_scriptDir \"allegro_claude.il\"))\n") ACL_scriptDir))
 
 ; ============================================================
 ; 4. Utilities
@@ -283,9 +311,12 @@ procedure(ACL_renameOver(src dst)
 
 procedure(ACL_createDirP(path)
   ; mkdir -p: createDir doesn't recurse, so walk parents first.
-  when(and(strlen(path) > 0 null(isDir(path)))
-    ACL_createDirP(pcreReplace(pcreCompile("/[^/]+$") path "" 0))
-    createDir(path)))
+  ; Strip any trailing slashes first so the regex can find the last
+  ; component to lop off.
+  let(((p pcreReplace(pcreCompile("/+$") path "" 0)))
+    when(and(strlen(p) > 0 null(isDir(p)))
+      ACL_createDirP(pcreReplace(pcreCompile("/[^/]+$") p "" 0))
+      createDir(p))))
 
 procedure(ACL_readFile(path)
   prog((fp text line)
@@ -350,7 +381,7 @@ procedure(ACL_logReset()
 procedure(ACL_showFullLog()
   ; Write full log to file and open in a viewer window
   let((logfile fp)
-    logfile = strcat(ACL_sessionLogDir "/log.txt")
+    logfile = strcat(ACL_sessionLogDir "log.txt")
     fp = outfile(logfile)
     when(fp
       fprintf(fp "%s" ACL_logString())
@@ -386,8 +417,8 @@ procedure(ACL_buildSystemPrompt()
   let((template installRoot re)
     template = ACL_readFile(strcat(ACL_scriptDir "PROMPT.md"))
     template = strcat(template "\n\n" ACL_readFile(strcat(ACL_scriptDir "LESSONS.md")))
-    when(isFile(strcat(ACL_notesDir "/LESSONS.md"))
-      template = strcat(template "\n\n" ACL_readFile(strcat(ACL_notesDir "/LESSONS.md"))))
+    when(isFile(strcat(ACL_notesDir "LESSONS.md"))
+      template = strcat(template "\n\n" ACL_readFile(strcat(ACL_notesDir "LESSONS.md"))))
     ; Inject paths
     re = pcreCompile("[$]ALLEGRO_CLAUDE_NOTES")
     template = pcreReplace(re template ACL_notesDir 0)
@@ -525,7 +556,7 @@ procedure(ACL_startClaude(@optional resumeId fork)
     ; Write MCP config for Claude CLI. Pass the base log dir; the MCP
     ; server discovers its session UUID from CLAUDE_LAUNCHER_SESSION_FILE
     ; and constructs the same per-session subdirectory.
-    mcpConfigFile = ACL_normPath(strcat(ACL_homeDir "/mcp_config.json"))
+    mcpConfigFile = ACL_normPath(strcat(ACL_homeDir "mcp_config.json"))
     fp = outfile(mcpConfigFile)
     when(fp
       fprintf(fp "%s" ACL_jsonObj(list("mcpServers"
@@ -534,7 +565,7 @@ procedure(ACL_startClaude(@optional resumeId fork)
           list("args" list(ACL_normPath(strcat(ACL_scriptDir "allegro_mcp.py"))))
           list("env" list(list("ALLEGRO_MCP_DIR" ACL_normPath(ACL_logDir))))))))))
       close(fp))
-    promptFile = ACL_normPath(strcat(ACL_homeDir "/PROMPT.md"))
+    promptFile = ACL_normPath(strcat(ACL_homeDir "PROMPT.md"))
     fp = outfile(promptFile)
     when(fp
       fprintf(fp "%s" ACL_buildSystemPrompt())
@@ -547,9 +578,9 @@ procedure(ACL_startClaude(@optional resumeId fork)
           when(isFile(doc)
             fprintf(fp "\n\n%s" ACL_readFile(doc)))))
       close(fp))
-    installRoot = ACL_normPath(axlGetVariable("allegro_install_root"))
-    siteDir = ACL_normPath(axlGetVariable("allegro_site"))
-    pcbenvDir = or(ACL_normPath(axlGetVariable("allegro_pcbenv"))
+    installRoot = ACL_axlGetPath("allegro_install_root")
+    siteDir = ACL_axlGetPath("allegro_site")
+    pcbenvDir = or(ACL_axlGetPath("allegro_pcbenv")
                    strcat(or(getShellEnvVar("HOME")
                              getShellEnvVar("USERPROFILE")) "/pcbenv"))
     projectDir = ACL_normPath(pcreReplace(pcreCompile("[^/\\\\]+$")
@@ -570,7 +601,7 @@ procedure(ACL_startClaude(@optional resumeId fork)
       "--add-dir" ACL_shellQuote(pcbenvDir)
       "--add-dir" ACL_shellQuote(projectDir)
       "--allowedTools" ACL_shellQuote(strcat(
-        "Edit(" ACL_notesDir "/*),mcp__allegro__allegro_execute"))
+        "Edit(" ACL_notesDir "*),mcp__allegro__allegro_execute"))
       "--disallowedTools" "AskUserQuestion"
       "--model" "opus[1m]"
       "--effort" "max")
@@ -582,7 +613,7 @@ procedure(ACL_startClaude(@optional resumeId fork)
     cmd = buildString(args " ")
     when(and(stringp(ACL_claudeArgs) strlen(ACL_claudeArgs) > 0)
       cmd = strcat(cmd " " ACL_claudeArgs))
-    let((fp) fp = outfile(strcat(ACL_homeDir "/raw.log") "a")
+    let((fp) fp = outfile(strcat(ACL_homeDir "raw.log") "a")
       when(fp fprintf(fp "\n--- %s ---\n" getCurrentTime()) close(fp)))
     ACL_lineBuf = ""
     ACL_responseBuf = ""
@@ -759,7 +790,7 @@ procedure(ACL_claudeDataHandler(id data)
   let((pos line)
     when(ACL_enableRawLog
       let((fp)
-        fp = outfile(strcat(ACL_homeDir "/raw.log") "a")
+        fp = outfile(strcat(ACL_homeDir "raw.log") "a")
         when(fp fprintf(fp "%s" data) close(fp))))
     ACL_lineBuf = strcat(ACL_lineBuf data)
     pos = nindex(ACL_lineBuf "\n")
@@ -792,8 +823,8 @@ procedure(ACL_processStreamLine(line)
       ; here, the dir already exists.
       when(sid != ACL_sessionId
         let((newDir oldDir)
-          newDir = strcat(ACL_logDir "/" sid)
-          oldDir = when(ACL_sessionId strcat(ACL_logDir "/" ACL_sessionId))
+          newDir = strcat(ACL_logDir sid "/")
+          oldDir = when(ACL_sessionId strcat(ACL_logDir ACL_sessionId "/"))
           ACL_sessionId = sid
           createDir(ACL_logDir)
           createDir(newDir)
@@ -975,7 +1006,7 @@ procedure(ACL_execBlock(code)
     ; axlMsgContext all miss them). Skip if the user has a recording
     ; active -- we can't have two journals.
     unless(ACL_recording
-      jfile = strcat(ACL_sessionLogDir "/exec_journal.scr")
+      jfile = strcat(ACL_sessionLogDir "exec_journal.scr")
       errset(axlJournal(jfile)))
     ; Execute with:
     ;   poport redirect to capture printf output
@@ -1096,7 +1127,7 @@ procedure(ACL_formCB(form)
         ACL_mode = val
         ACL_saveSettings(ACL_settingsFile ACL_currentSettings())
         when(ACL_sessionLogDir
-          ACL_saveSettings(strcat(ACL_sessionLogDir "/settings.json") ACL_currentSettings()))
+          ACL_saveSettings(strcat(ACL_sessionLogDir "settings.json") ACL_currentSettings()))
         ACL_setStatus(sprintf(nil "Mode: %s" val))
         ; Switching out of manual mode releases any held tool calls.
         ; Drain handles an empty queue gracefully. Done after the
@@ -1166,7 +1197,7 @@ procedure(ACL_toggleRecording(form)
       when(strlen(contents) > 0
         ACL_handleJournal(contents)))
   else
-    ACL_journalFile = strcat(ACL_sessionLogDir "/journal.scr")
+    ACL_journalFile = strcat(ACL_sessionLogDir "journal.scr")
     axlJournal(ACL_journalFile)
     ACL_recording = t
     axlFormSetField(form "record" "Done")
@@ -1320,18 +1351,18 @@ procedure(ACL_findOrPlanDocs()
     baseName = pcreReplace(pcreCompile("_(S|HF)\\d+\\.md$")
       exactName ".md" 0)
     dirs = list(ACL_notesDir
-                ACL_normPath(axlGetVariable("allegro_pcbenv"))
-                ACL_normPath(axlGetVariable("allegro_site"))
+                ACL_axlGetPath("allegro_pcbenv")
+                ACL_axlGetPath("allegro_site")
                 ACL_scriptDir)
     ; Exact filename in any dir wins; then the less-specific (no hotfix).
-    ; pcreReplace strips a trailing slash so the join is consistent.
+    ; All dirs end in "/" (path defvar convention), so a plain strcat
+    ; joins cleanly.
     foreach(name list(exactName baseName)
       foreach(d dirs
         when(and(stringp(d) null(found))
-          let((path)
-            path = strcat(pcreReplace(pcreCompile("/$") d "" 0) "/" name)
+          let(((path strcat(d name)))
             when(isFile(path) found = path)))))
-    or(found strcat(ACL_notesDir "/" exactName))))
+    or(found strcat(ACL_notesDir exactName))))
 
 procedure(ACL_handleNewSession()
   ACL_sessionId = nil
@@ -1397,9 +1428,9 @@ procedure(ACL_handleNewSession()
           ACL_appendChat(strcat(
             "Skipping documentation cache for this session. If you "
             "already have a cache file, place it at any of:\n"
-            "  " ACL_notesDir "/\n"
-            "  " ACL_normPath(axlGetVariable("allegro_pcbenv")) "/\n"
-            "  " ACL_normPath(axlGetVariable("allegro_site")) "/\n"
+            "  " ACL_notesDir "\n"
+            "  " ACL_axlGetPath("allegro_pcbenv") "\n"
+            "  " ACL_axlGetPath("allegro_site") "\n"
             "  " ACL_scriptDir "\n"
             "named " ACL_basename(doc) " (or the version-without-hotfix "
             "equivalent).")))))))
@@ -1414,11 +1445,11 @@ procedure(ACL_handleRestoreSession(sid)
       ACL_handleNewSession()
     else
       ACL_sessionId = sid
-      ACL_sessionLogDir = strcat(ACL_logDir "/" ACL_sessionId)
+      ACL_sessionLogDir = strcat(ACL_logDir ACL_sessionId "/")
       ACL_sessionSaved = t
       ACL_logReset()
       ACL_applySettings(or(
-        ACL_loadSettings(strcat(ACL_sessionLogDir "/settings.json"))
+        ACL_loadSettings(strcat(ACL_sessionLogDir "settings.json"))
         ACL_loadSettings(ACL_settingsFile)
         nil))
       ACL_startClaude(sid)
@@ -1661,7 +1692,7 @@ procedure(ACL_runTests()
   let(((savedForm ACL_form) (savedSessionDir ACL_sessionLogDir)
        (savedSeq ACL_mcpCmdSeq) (savedPending ACL_mcpPending))
     ACL_form = nil
-    ACL_sessionLogDir = strcat(ACL_homeDir "/mcp_test")
+    ACL_sessionLogDir = strcat(ACL_homeDir "mcp_test/")
     ACL_mcpCmdSeq = 0
     ACL_mcpPending = nil
     createDir(ACL_sessionLogDir)
@@ -1676,15 +1707,15 @@ procedure(ACL_runTests()
     ACL_check("pending cleared" ACL_mcpPending nil)
     ACL_check("seq advanced" ACL_mcpCmdSeq 1)
     ACL_check("cmd il written"
-      and(isFile(strcat(ACL_sessionLogDir "/cmd_1.il")) t) t)
+      and(isFile(strcat(ACL_sessionLogDir "cmd_1.il")) t) t)
     ACL_check("cmd out written"
-      and(isFile(strcat(ACL_sessionLogDir "/cmd_1.out")) t) t)
+      and(isFile(strcat(ACL_sessionLogDir "cmd_1.out")) t) t)
     ACL_check("ipc out written"
-      and(isFile(strcat(ACL_sessionLogDir "/tool_toolu_test_42.out")) t) t)
+      and(isFile(strcat(ACL_sessionLogDir "tool_toolu_test_42.out")) t) t)
     ACL_check("cmd il content"
-      ACL_readFile(strcat(ACL_sessionLogDir "/cmd_1.il")) "(plus 40 2)")
+      ACL_readFile(strcat(ACL_sessionLogDir "cmd_1.il")) "(plus 40 2)")
     ACL_check("ipc out content"
-      ACL_readFile(strcat(ACL_sessionLogDir "/tool_toolu_test_42.out"))
+      ACL_readFile(strcat(ACL_sessionLogDir "tool_toolu_test_42.out"))
       "Result: 42")
     ; Multiple queued at once should all execute on one drain
     ACL_handleToolCall(list(list("id" "toolu_a") list("name" "mcp__allegro__allegro_execute")
@@ -1694,9 +1725,9 @@ procedure(ACL_runTests()
     ACL_check("queued two" length(ACL_mcpPending) 2)
     ACL_mcpDrainPending()
     ACL_check("seq advanced again" ACL_mcpCmdSeq 3)
-    ACL_check("ipc a" ACL_readFile(strcat(ACL_sessionLogDir "/tool_toolu_a.out"))
+    ACL_check("ipc a" ACL_readFile(strcat(ACL_sessionLogDir "tool_toolu_a.out"))
       "Result: 2")
-    ACL_check("ipc b" ACL_readFile(strcat(ACL_sessionLogDir "/tool_toolu_b.out"))
+    ACL_check("ipc b" ACL_readFile(strcat(ACL_sessionLogDir "tool_toolu_b.out"))
       "Result: 4")
     ; Block missing required fields is ignored
     ACL_handleToolCall(list(list("name" "mcp__allegro__allegro_execute")
@@ -1707,14 +1738,14 @@ procedure(ACL_runTests()
       ACL_mcpScanMaxSeq(ACL_sessionLogDir) 3)
     ; Empty dir -> 0
     let((emptyDir)
-      emptyDir = strcat(ACL_homeDir "/mcp_test_empty")
+      emptyDir = strcat(ACL_homeDir "mcp_test_empty/")
       createDir(emptyDir)
       ACL_check("scan max seq empty dir"
         ACL_mcpScanMaxSeq(emptyDir) 0)
       errset(deleteDir(emptyDir)))
     ; Nonexistent dir -> 0 (errset swallows)
     ACL_check("scan max seq nonexistent dir"
-      ACL_mcpScanMaxSeq(strcat(ACL_homeDir "/no_such_dir_42")) 0)
+      ACL_mcpScanMaxSeq(strcat(ACL_homeDir "no_such_dir_42")) 0)
 
     ; --- Manual mode: tool calls are HELD until approve/reject ---
     let(((savedMode ACL_mode))
@@ -1731,7 +1762,7 @@ procedure(ACL_runTests()
       ACL_mcpDrainPending()
       ACL_check("manual: approve drained" ACL_mcpPending nil)
       ACL_check("manual: approve wrote .out"
-        and(isFile(strcat(ACL_sessionLogDir "/tool_toolu_manual_1.out")) t) t)
+        and(isFile(strcat(ACL_sessionLogDir "tool_toolu_manual_1.out")) t) t)
 
       ; Reject writes a rejection .out for each pending so the MCP
       ; server doesn't hang polling.
@@ -1742,10 +1773,10 @@ procedure(ACL_runTests()
       ACL_handleReject()
       ACL_check("manual: reject cleared" ACL_mcpPending nil)
       ACL_check("manual: reject wrote .out"
-        and(isFile(strcat(ACL_sessionLogDir "/tool_toolu_manual_2.out")) t) t)
+        and(isFile(strcat(ACL_sessionLogDir "tool_toolu_manual_2.out")) t) t)
       ACL_check("manual: reject .out content"
-        ACL_readFile(strcat(ACL_sessionLogDir "/tool_toolu_manual_2.out"))
-        "*rejected by user* -- do not retry. Ask the user what they would like instead.")
+        ACL_readFile(strcat(ACL_sessionLogDir "tool_toolu_manual_2.out"))
+        "*rejected by user in manual mode* -- do not retry. Ask the user what they would like instead.")
 
       ; Reject WITH extra prompting -- chat shows the user's text and
       ; the .out passes their words through to claude.
@@ -1754,8 +1785,8 @@ procedure(ACL_runTests()
                               list("input" list(list("code" "(plus 9 9)")))))
       ACL_handleReject("but use snap_grid first")
       ACL_check("manual: reject extra .out content"
-        ACL_readFile(strcat(ACL_sessionLogDir "/tool_toolu_manual_3.out"))
-        "*rejected by user* -- do not retry. The user said: \"but use snap_grid first\". Respond accordingly.")
+        ACL_readFile(strcat(ACL_sessionLogDir "tool_toolu_manual_3.out"))
+        "*rejected by user in manual mode* -- do not retry. The user said:\n\"but use snap_grid first\"\n. Respond accordingly.")
 
       ; approve/reject regexes accept variants and pass extras
       ACL_check("approveRe bare" pcreMatchp(ACL_approveRe "approve") t)
@@ -1776,7 +1807,7 @@ procedure(ACL_runTests()
       when(and(files car(files))
         foreach(f car(files)
           when(and(f f != "." f != "..")
-            errset(deleteFile(strcat(ACL_sessionLogDir "/" f)))))))
+            errset(deleteFile(strcat(ACL_sessionLogDir f)))))))
     errset(deleteDir(ACL_sessionLogDir))
     ACL_sessionLogDir = savedSessionDir
     ACL_mcpCmdSeq = savedSeq
@@ -1795,10 +1826,10 @@ procedure(ACL_runTests()
        (savedSite axlGetVariable("allegro_site"))
        (savedPcb axlGetVariable("allegro_pcbenv"))
        doc exactName baseName notesDir pcbDir siteDir scriptDir)
-    notesDir = strcat(ACL_homeDir "/doc_test_notes")
-    pcbDir = strcat(ACL_homeDir "/doc_test_pcbenv")
-    siteDir = strcat(ACL_homeDir "/doc_test_site")
-    scriptDir = strcat(ACL_homeDir "/doc_test_script/")
+    notesDir = strcat(ACL_homeDir "doc_test_notes/")
+    pcbDir = strcat(ACL_homeDir "doc_test_pcbenv/")
+    siteDir = strcat(ACL_homeDir "doc_test_site/")
+    scriptDir = strcat(ACL_homeDir "doc_test_script/")
     foreach(d list(notesDir pcbDir siteDir scriptDir) createDir(d))
     ACL_notesDir = notesDir
     ACL_scriptDir = scriptDir
@@ -1814,7 +1845,7 @@ procedure(ACL_runTests()
       ; ---- 1. No files anywhere -> default to notesDir/exactName
       doc = ACL_findOrPlanDocs()
       ACL_check("doc default to notesDir"
-        doc strcat(notesDir "/" exactName))
+        doc strcat(notesDir exactName))
 
       ; ---- 2. Exact in scriptDir wins (alone)
       p = strcat(scriptDir exactName)
@@ -1823,27 +1854,27 @@ procedure(ACL_runTests()
       deleteFile(p)
 
       ; ---- 3. Exact in siteDir wins (alone)
-      p = strcat(siteDir "/" exactName)
+      p = strcat(siteDir exactName)
       fp = outfile(p) when(fp fprintf(fp "x") close(fp))
       ACL_check("doc exact in siteDir" ACL_findOrPlanDocs() p)
       deleteFile(p)
 
       ; ---- 4. Exact in pcbDir wins (alone)
-      p = strcat(pcbDir "/" exactName)
+      p = strcat(pcbDir exactName)
       fp = outfile(p) when(fp fprintf(fp "x") close(fp))
       ACL_check("doc exact in pcbDir" ACL_findOrPlanDocs() p)
       deleteFile(p)
 
       ; ---- 5. Exact in notesDir wins (alone)
-      p = strcat(notesDir "/" exactName)
+      p = strcat(notesDir exactName)
       fp = outfile(p) when(fp fprintf(fp "x") close(fp))
       ACL_check("doc exact in notesDir" ACL_findOrPlanDocs() p)
       deleteFile(p)
 
       ; ---- 6. Dir priority: notesDir > pcbenv when both have exact
       let((pNotes pPcb)
-        pNotes = strcat(notesDir "/" exactName)
-        pPcb = strcat(pcbDir "/" exactName)
+        pNotes = strcat(notesDir exactName)
+        pPcb = strcat(pcbDir exactName)
         fp = outfile(pNotes) when(fp fprintf(fp "n") close(fp))
         fp = outfile(pPcb) when(fp fprintf(fp "p") close(fp))
         ACL_check("doc notesDir beats pcbenv" ACL_findOrPlanDocs() pNotes)
@@ -1851,8 +1882,8 @@ procedure(ACL_runTests()
 
       ; ---- 7. Dir priority: pcbenv > site
       let((pPcb pSite)
-        pPcb = strcat(pcbDir "/" exactName)
-        pSite = strcat(siteDir "/" exactName)
+        pPcb = strcat(pcbDir exactName)
+        pSite = strcat(siteDir exactName)
         fp = outfile(pPcb) when(fp fprintf(fp "p") close(fp))
         fp = outfile(pSite) when(fp fprintf(fp "s") close(fp))
         ACL_check("doc pcbenv beats site" ACL_findOrPlanDocs() pPcb)
@@ -1860,7 +1891,7 @@ procedure(ACL_runTests()
 
       ; ---- 8. Dir priority: site > scriptDir
       let((pSite pScript)
-        pSite = strcat(siteDir "/" exactName)
+        pSite = strcat(siteDir exactName)
         pScript = strcat(scriptDir exactName)
         fp = outfile(pSite) when(fp fprintf(fp "s") close(fp))
         fp = outfile(pScript) when(fp fprintf(fp "x") close(fp))
@@ -1870,7 +1901,7 @@ procedure(ACL_runTests()
       ; ---- 9. Exact in scriptDir beats base in notesDir
       let((pExact pBase)
         pExact = strcat(scriptDir exactName)
-        pBase = strcat(notesDir "/" baseName)
+        pBase = strcat(notesDir baseName)
         fp = outfile(pExact) when(fp fprintf(fp "e") close(fp))
         fp = outfile(pBase) when(fp fprintf(fp "b") close(fp))
         ACL_check("doc exact anywhere beats base in notes"
@@ -1878,7 +1909,7 @@ procedure(ACL_runTests()
         deleteFile(pExact) deleteFile(pBase))
 
       ; ---- 10. Base name found in notesDir when no exact exists
-      p = strcat(notesDir "/" baseName)
+      p = strcat(notesDir baseName)
       fp = outfile(p) when(fp fprintf(fp "x") close(fp))
       ACL_check("doc base in notesDir" ACL_findOrPlanDocs() p)
       deleteFile(p)
@@ -1891,8 +1922,8 @@ procedure(ACL_runTests()
 
       ; ---- 12. Base in notesDir beats base in pcbenv (priority within base)
       let((pNotes pPcb)
-        pNotes = strcat(notesDir "/" baseName)
-        pPcb = strcat(pcbDir "/" baseName)
+        pNotes = strcat(notesDir baseName)
+        pPcb = strcat(pcbDir baseName)
         fp = outfile(pNotes) when(fp fprintf(fp "n") close(fp))
         fp = outfile(pPcb) when(fp fprintf(fp "p") close(fp))
         ACL_check("doc base priority" ACL_findOrPlanDocs() pNotes)
@@ -1907,7 +1938,7 @@ procedure(ACL_runTests()
 
   printf("\n--- Settings ---\n")
   let((tmpFile settings loaded (savedMode ACL_mode))
-    tmpFile = strcat(ACL_sessionLogDir "/test_settings.json")
+    tmpFile = strcat(ACL_sessionLogDir "test_settings.json")
     ; Round-trip save/load
     settings = list(list("mode" "verbose"))
     ACL_saveSettings(tmpFile settings)
@@ -1934,7 +1965,7 @@ procedure(ACL_runTests()
 
   printf("\n--- Sessions ---\n")
   let(((savedFile ACL_sessionsFile) (savedSid ACL_sessionId) sample stale sorted)
-    ACL_sessionsFile = strcat(ACL_homeDir "/sessions_test.json")
+    ACL_sessionsFile = strcat(ACL_homeDir "sessions_test.json")
     sample = list(
       list("aaaa-aaaa" list(list("board" "/tmp/foo.brd") list("time" "100")))
       list("bbbb-bbbb" list(list("board" "/tmp/bar.brd") list("time" "300")))
@@ -1976,9 +2007,9 @@ procedure(ACL_runTests()
   let(((savedFile ACL_sessionsFile) (savedSid ACL_sessionId)
        (savedLogDir ACL_sessionLogDir) (savedFork ACL_resumeIsFork)
        (savedSeq ACL_mcpCmdSeq) parentDir newDir)
-    ACL_sessionsFile = strcat(ACL_homeDir "/sessions_rekey_test.json")
+    ACL_sessionsFile = strcat(ACL_homeDir "sessions_rekey_test.json")
     ACL_sessionId = "rekey-old-2"
-    parentDir = strcat(ACL_logDir "/rekey-old-2")
+    parentDir = strcat(ACL_logDir "rekey-old-2/")
     ACL_createDirP(parentDir)
     let((fp)
       fp = outfile(strcat(parentDir "/cmd_3.il"))
@@ -1988,7 +2019,7 @@ procedure(ACL_runTests()
     ACL_addSession("rekey-old-2" list(list("board" "/tmp/y.brd") list("time" "200")))
     ACL_resumeIsFork = t
     ACL_processStreamLine("{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"rekey-new-2\"}")
-    newDir = strcat(ACL_logDir "/rekey-new-2")
+    newDir = strcat(ACL_logDir "rekey-new-2/")
     ACL_check("fork: id updated" ACL_sessionId "rekey-new-2")
     ACL_check("fork: parent dir preserved" isDir(parentDir) t)
     ACL_check("fork: parent cmd preserved"
@@ -2030,7 +2061,7 @@ procedure(ACL_runTests()
   let(((savedSid ACL_sessionId) (savedLogDir ACL_sessionLogDir)
        (savedSeq ACL_mcpCmdSeq) sid logDir fp)
     sid = "resume-seed-test"
-    logDir = strcat(ACL_logDir "/" sid)
+    logDir = strcat(ACL_logDir sid "/")
     ACL_createDirP(logDir)
     fp = outfile(strcat(logDir "/cmd_7.il"))
     when(fp fprintf(fp "(plus 1 1)") close(fp))
@@ -2054,7 +2085,7 @@ procedure(ACL_runTests()
   ; trigger our rekey logic. Only system/init should be authoritative.
   let(((savedSid ACL_sessionId) (savedLogDir ACL_sessionLogDir))
     ACL_sessionId = "real-sid"
-    ACL_sessionLogDir = strcat(ACL_logDir "/real-sid")
+    ACL_sessionLogDir = strcat(ACL_logDir "real-sid/")
     ACL_processStreamLine(strcat(
       "{\"type\":\"system\",\"subtype\":\"hook_started\","
       "\"hook_name\":\"SessionStart:resume\","
@@ -2072,8 +2103,13 @@ procedure(ACL_runTests()
   let((proc buf ready)
     buf = ""
     ready = nil
-    ; Spawn a simple echo process to verify IPC round-trip
-    proc = ipcBeginProcess("cat" ""
+    ; Spawn a simple echo process to verify IPC round-trip.
+    ; `cat` doesn't exist on Windows; `findstr "^"` matches every
+    ; line (including empty), which gives the same stdin->stdout
+    ; behavior using a built-in cmd.exe utility.
+    proc = ipcBeginProcess(
+      if(ACL_isWindows "cmd /c findstr \"^\"" "cat")
+      ""
       lambda((id data) buf = strcat(buf data)  ready = t)
       lambda((id data) printf("ipc err: %s\n" data)))
     ipcWaitForProcess(proc)
@@ -2128,7 +2164,7 @@ procedure(ACL_runTests()
                      substring(f (strlen(f) - 3)) == ".out")
               foundExec = t
               outContent = strcat(outContent
-                ACL_readFile(strcat(ACL_sessionLogDir "/" f))))))
+                ACL_readFile(strcat(ACL_sessionLogDir f))))))
         ACL_check("mcp tool was called" foundExec t)
         ACL_check("mcp result contains 42"
           and(nindex(outContent "42") t) t))
