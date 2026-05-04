@@ -215,6 +215,7 @@ when(and(boundp('ACL_claude) ACL_claude)
   ACL_claude = nil)
 
 defvar(ACL_claude nil)
+defvar(ACL_claudeStopRequested nil)
 defvar(ACL_isWindows (getShellEnvVar("OS") == "Windows_NT"))
 
 procedure(ACL_normPath(path)
@@ -635,13 +636,34 @@ procedure(ACL_startClaude(@optional resumeId fork)
         foreach(d parseString(data "\n")
           printf("claude: %s\n" d)
           ACL_handleStaleSession(d))
-        axlFlushDisplay()))
+        axlFlushDisplay())
+      'ACL_claudeExitHandler)
     ipcWaitForProcess(ACL_claude)
     unless(and(ACL_claude ipcIsAliveProcess(ACL_claude))
       ACL_setStatus("Failed to initialize!")
       printf("*Error* ACL: claude process failed to start. Command: %s\n" cmd))))
 
+procedure(ACL_claudeExitHandler(id status)
+  ; Fired by the IPC layer when the claude child exits. Without this
+  ; hook the panel just silently stops responding -- there's no other
+  ; signal that the process is gone until the user tries to send the
+  ; next message and ACL_ensureClaude restarts it. Skip the chat
+  ; message when the exit was via ACL_stopClaude.
+  let(((deliberate ACL_claudeStopRequested))
+    ACL_claudeStopRequested = nil
+    ACL_claude = nil
+    ACL_pendingInput = nil
+    unless(deliberate
+      ACL_setStatus(sprintf(nil "Claude exited (status %L)" status))
+      ACL_appendChat(sprintf(nil
+        "[Claude process exited unexpectedly (status %L). Send any message to restart.]"
+        status)))
+    when(ACL_form axlFormSetField(ACL_form "send" "Send"))))
+
 procedure(ACL_stopClaude()
+  ; Suppress the unexpected-exit chat message in the postFunc handler
+  ; -- this exit was deliberate.
+  ACL_claudeStopRequested = t
   when(and(ACL_claude ipcIsAliveProcess(ACL_claude))
     ipcSignalProcess(ACL_claude 'TERM))
   ACL_claude = nil
