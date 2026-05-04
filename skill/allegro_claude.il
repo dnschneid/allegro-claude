@@ -175,6 +175,13 @@ procedure(ACL_jsonEscStr(s)
         (t c))))
     strcat(out "\"")))
 
+procedure(ACL_jsonIsAlist(v)
+  ; A JSON-object alist looks like ((stringKey1 val1) ...). Require
+  ; the first entry to be a 2-list with a string key so a plain
+  ; list-of-lists (e.g. ((1 2) 3)) doesn't get misidentified.
+  and(listp(v) car(v) listp(car(v)) cdr(car(v))
+      stringp(caar(v))))
+
 procedure(ACL_jsonVal(v)
   cond(
     (stringp(v) ACL_jsonEscStr(v))
@@ -182,13 +189,13 @@ procedure(ACL_jsonVal(v)
     (v == t      "true")
     (v == 'false "false")
     (null(v)     "null")
+    (ACL_jsonIsAlist(v)
+      strcat("{" buildString(
+        mapcar(lambda((pair)
+          strcat(ACL_jsonEscStr(car(pair)) ":" ACL_jsonVal(cadr(pair))))
+          v) ",") "}"))
     (listp(v)
-      if(and(car(v) listp(car(v)))
-        strcat("{" buildString(
-          mapcar(lambda((pair)
-            strcat(ACL_jsonEscStr(car(pair)) ":" ACL_jsonVal(cadr(pair))))
-            v) ",") "}")
-        strcat("[" buildString(mapcar('ACL_jsonVal v) ",") "]")))))
+      strcat("[" buildString(mapcar('ACL_jsonVal v) ",") "]"))))
 
 procedure(ACL_jsonObj(@rest pairs)
   strcat("{" buildString(
@@ -1604,6 +1611,10 @@ procedure(ACL_runTests()
   ACL_check("val true"     ACL_jsonVal(t)                      "true")
   ACL_check("val nil"      ACL_jsonVal(nil)                    "null")
   ACL_check("val array"    ACL_jsonVal('(1 2 3))               "[1,2,3]")
+  ; List-of-lists with non-string keys must serialize as a nested
+  ; array, not as an object with weird non-string keys.
+  ACL_check("val nested arr"  ACL_jsonVal('((1 2) 3))           "[[1,2],3]")
+  ACL_check("val list of arr" ACL_jsonVal(list(list(1) list(2))) "[[1],[2]]")
   ACL_check("jsonObj"
     ACL_jsonObj(list("type" "msg") list("n" 1))
     "{\"type\":\"msg\",\"n\":1}")
