@@ -561,18 +561,22 @@ procedure(ACL_startClaude(@optional resumeId fork)
     createDir(ACL_logDir)
     ACL_mcpPending = nil
     ACL_mcpCmdSeq = 0
-    ; Write MCP config for Claude CLI. Pass the base log dir; the MCP
-    ; server discovers its session UUID from CLAUDE_LAUNCHER_SESSION_FILE
-    ; and constructs the same per-session subdirectory.
+    ; Write MCP config for Claude CLI. The MCP server discovers its
+    ; session UUID from CLAUDE_LAUNCHER_SESSION_FILE (set by claude on
+    ; launch) and constructs its log dir relative to its own location.
+    ;
+    ; Copy allegro_mcp.py into ACL_homeDir before pointing the config
+    ; at it to avoid potential sandboxing issues.
     mcpConfigFile = ACL_normPath(strcat(ACL_homeDir "mcp_config.json"))
-    fp = outfile(mcpConfigFile)
-    when(fp
-      fprintf(fp "%s" ACL_jsonObj(list("mcpServers"
-        list(list("allegro" list(
-          list("command" if(ACL_isWindows "python" "python3"))
-          list("args" list(ACL_normPath(strcat(ACL_scriptDir "allegro_mcp.py"))))
-          list("env" list(list("ALLEGRO_MCP_DIR" ACL_normPath(ACL_logDir))))))))))
-      close(fp))
+    let(((mcpScript ACL_normPath(strcat(ACL_homeDir "allegro_mcp.py"))))
+      ACL_copyFile(strcat(ACL_scriptDir "allegro_mcp.py") mcpScript)
+      fp = outfile(mcpConfigFile)
+      when(fp
+        fprintf(fp "%s" ACL_jsonObj(list("mcpServers"
+          list(list("allegro" list(
+            list("command" if(ACL_isWindows "python" "python3"))
+            list("args" list(mcpScript))))))))
+        close(fp)))
     promptFile = ACL_normPath(strcat(ACL_homeDir "PROMPT.md"))
     fp = outfile(promptFile)
     when(fp
@@ -779,6 +783,17 @@ procedure(ACL_mcpWriteFile(path content)
     when(fp
       fprintf(fp "%s" content)
       close(fp))))
+
+procedure(ACL_copyFile(src dst)
+  ; Stream src to dst line by line. Returns t on success, nil if
+  ; either side couldn't be opened. Overwrites dst if it exists.
+  letseq(((in infile(src))
+          (out when(in outfile(dst)))
+          line)
+    when(and(in out)
+      while(gets(line in) fprintf(out "%s" line))
+      close(in) close(out)
+      t)))
 
 procedure(ACL_copyDirFiles(srcDir dstDir)
   ; Copy regular files (skip dotfiles like . and ..) from srcDir into

@@ -6,11 +6,15 @@
 Communicates with SKILL via file-based IPC under a session directory.
 Layout:
 
-  $ALLEGRO_MCP_DIR / <claude-session-uuid> / tool_<tool_use_id>.out
+  <this_script_dir> / logs / <claude-session-uuid> / tool_<tool_use_id>.out
 
-The session UUID is discovered from CLAUDE_LAUNCHER_SESSION_FILE (Claude
-CLI sets this when launching MCP servers). SKILL learns the same UUID
-from the stream-json output and constructs the same path independently.
+SKILL copies this script into ACL_homeDir before launching claude, so
+the script's own directory is the project home; the per-session log
+dir lives under logs/<sid>/. SKILL writes the .out file there from
+the same path independently.
+
+The session UUID is discovered from CLAUDE_LAUNCHER_SESSION_FILE
+(Claude CLI sets this when launching MCP servers).
 
 Protocol (Phase 1+: SKILL-driven):
   1. Claude streams a tool_use block to SKILL with the full code.
@@ -54,7 +58,7 @@ TOOL = {
     },
 }
 
-BASE_DIR = os.environ["ALLEGRO_MCP_DIR"]
+BASE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 UUID_RE = re.compile(r"\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b")
 
 
