@@ -975,7 +975,6 @@ procedure(ACL_processStreamLine(line)
           msg = ACL_jGet(parsed "message")
           msgId = when(msg ACL_jGet(msg "id"))
           entry = when(msgId assoc(msgId ACL_streamedMsgLen))
-          seenLen = if(entry cadr(entry) 0)
           content = when(msg ACL_jGet(msg "content"))
           when(content
             fullText = ""
@@ -983,15 +982,18 @@ procedure(ACL_processStreamLine(line)
               when(and(block ACL_jGet(block "type") == "text")
                 text = ACL_jGet(block "text")
                 when(text fullText = strcat(fullText text)))
-              ; Tool calls for our allegro_execute MCP tool can be
-              ; satisfied locally -- we extract the code from the
-              ; stream and execute it ourselves, writing the result
-              ; where the Python MCP server polls for it. This
-              ; eliminates the SKILL queue-poll loop and the round
-              ; trip through Python's queue/cmd file write.
+              ; Tool calls for our allegro_execute MCP tool: extract
+              ; the code from the stream and execute locally.
               when(and(block ACL_jGet(block "type") == "tool_use"
                        ACL_jGet(block "name") == "mcp__allegro__allegro_execute")
                 ACL_handleToolCall(block)))
+            ; If we have a tracked entry for this msg, use it as the
+            ; high-water mark. Otherwise (no message_start was seen --
+            ; e.g. resume mid-turn, or partial stream capture), assume
+            ; the entire fullText was already delivered via deltas:
+            ; printing it again would duplicate; missing the unstreamed
+            ; prefix is the lesser evil.
+            seenLen = if(entry cadr(entry) strlen(fullText))
             when(strlen(fullText) > seenLen
               newText = substring(fullText (seenLen + 1))
               when(and(newText strlen(newText) > 0)
@@ -2115,6 +2117,47 @@ procedure(ACL_runTests()
     ACL_check("hook response ignored" ACL_sessionId "real-sid")
     ACL_sessionLogDir = savedLogDir
     ACL_sessionId = savedSid)
+
+  printf("\n--- Assistant dedup fallback ---\n")
+  ; If the stream skipped message_start (resume mid-turn or partial
+  ; capture), the assistant event must NOT print the full text on top
+  ; of whatever was already streamed via deltas. Verify by feeding a
+  ; mid-stream delta + assistant pair with no message_start.
+  let(((savedBuf ACL_responseBuf) (savedLog ACL_logContent)
+       (savedId ACL_streamingMsgId) (savedLen ACL_streamedMsgLen)
+       (savedForm ACL_form))
+    ACL_form = nil ACL_logContent = nil ACL_responseBuf = ""
+    ACL_streamingMsgId = nil ACL_streamedMsgLen = nil
+    ACL_processStreamLine(strcat(
+      "{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\","
+      "\"index\":0,\"delta\":{\"type\":\"text_delta\","
+      "\"text\":\" world!\"}}}"))
+    ACL_processStreamLine(strcat(
+      "{\"type\":\"assistant\",\"message\":{\"id\":\"msg_no_start\","
+      "\"content\":[{\"type\":\"text\",\"text\":\"Hello world!\"}]}}"))
+    ACL_check("dedup fallback: only streamed text shown"
+      ACL_logString() " world!")
+    ; Now the normal path: message_start + deltas + assistant. The
+    ; assistant copy must not duplicate anything.
+    ACL_logContent = nil ACL_responseBuf = ""
+    ACL_streamingMsgId = nil ACL_streamedMsgLen = nil
+    ACL_processStreamLine(strcat(
+      "{\"type\":\"stream_event\",\"event\":{\"type\":\"message_start\","
+      "\"message\":{\"id\":\"msg_full\"}}}"))
+    ACL_processStreamLine(strcat(
+      "{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\","
+      "\"index\":0,\"delta\":{\"type\":\"text_delta\","
+      "\"text\":\"Hello world!\"}}}"))
+    ACL_processStreamLine(strcat(
+      "{\"type\":\"assistant\",\"message\":{\"id\":\"msg_full\","
+      "\"content\":[{\"type\":\"text\",\"text\":\"Hello world!\"}]}}"))
+    ACL_check("dedup full stream: text shown once"
+      ACL_logString() "Hello world!")
+    ACL_form = savedForm
+    ACL_streamedMsgLen = savedLen
+    ACL_streamingMsgId = savedId
+    ACL_logContent = savedLog
+    ACL_responseBuf = savedBuf)
 
   printf("\n--- IPC ---\n")
   let((proc buf ready)
