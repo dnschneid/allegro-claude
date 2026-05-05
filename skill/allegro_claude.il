@@ -309,6 +309,115 @@ defvar(ACL_hotfixStripRe     pcreCompile("_(S|HF)\\d+\\.md$"))
 defvar(ACL_promptNotesRe     pcreCompile("[$]ALLEGRO_CLAUDE_NOTES"))
 defvar(ACL_promptInstallRe   pcreCompile("[$]ALLEGRO_INSTALL_ROOT"))
 
+; ============================================================
+; UTF-8 -> CP-1252 recoding for the form widget on Windows.
+; SKILL string literals don't honor \xNN escapes, so all byte
+; sequences are built via intToChar at load time.
+; ============================================================
+
+procedure(ACL_byte(n)
+  ; Single-byte string for byte value n. (intToChar returns a symbol;
+  ; pcreReplace and friends want a string.)
+  strcat("" intToChar(n)))
+
+procedure(ACL_bytes(@rest ns)
+  ; Multi-byte string from a list of byte values.
+  buildString(mapcar('ACL_byte ns) ""))
+
+; Translation table: each entry is (compiled-regex replacement-string).
+; Source data is a flat list of (utf8-byte-list replacement) pairs;
+; replacement is either a CP-1252 byte (integer) for lossless mappings
+; or an ASCII string for lossy ones. mapcar inflates each pair into
+; the (regex, string) form pcreReplace expects.
+defvar(ACL_recodeTable
+  mapcar(lambda((row)
+           list(pcreCompile(apply('ACL_bytes car(row)))
+                if(integerp(cadr(row)) ACL_byte(cadr(row)) cadr(row))))
+    '(
+      ; --- Smart punctuation: lossless CP-1252 ---
+      ((0xe2 0x80 0x98) 0x91)    ; ' left  single
+      ((0xe2 0x80 0x99) 0x92)    ; ' right single
+      ((0xe2 0x80 0x9c) 0x93)    ; " left  double
+      ((0xe2 0x80 0x9d) 0x94)    ; " right double
+      ((0xe2 0x80 0x93) 0x96)    ; en dash
+      ((0xe2 0x80 0x94) 0x97)    ; em dash
+      ((0xe2 0x80 0xa6) 0x85)    ; ellipsis
+      ((0xe2 0x80 0xa2) 0x95)    ; bullet
+      ((0xe2 0x82 0xac) 0x80)    ; euro
+      ((0xc2 0xa0)      0xa0)    ; nbsp
+      ((0xc2 0xb7)      0xb7)    ; middle dot
+      ; --- Math, units, symbols: lossless CP-1252 ---
+      ((0xc2 0xb5)      0xb5)    ; micro
+      ((0xc2 0xb0)      0xb0)    ; degree
+      ((0xc2 0xb1)      0xb1)    ; plus-minus
+      ((0xc3 0x97)      0xd7)    ; multiply
+      ((0xc3 0xb7)      0xf7)    ; divide
+      ((0xc2 0xb2)      0xb2)    ; superscript 2
+      ((0xc2 0xb3)      0xb3)    ; superscript 3
+      ((0xc2 0xa9)      0xa9)    ; copyright
+      ((0xc2 0xae)      0xae)    ; registered
+      ((0xe2 0x84 0xa2) 0x99)    ; trademark
+      ((0xc2 0xbc)      0xbc)    ; 1/4
+      ((0xc2 0xbd)      0xbd)    ; 1/2
+      ((0xc2 0xbe)      0xbe)    ; 3/4
+      ; --- Currency, punctuation, ordinals: lossless CP-1252 ---
+      ((0xc2 0xa1)      0xa1)    ; inverted !
+      ((0xc2 0xa2)      0xa2)    ; cent
+      ((0xc2 0xa3)      0xa3)    ; pound
+      ((0xc2 0xa5)      0xa5)    ; yen
+      ((0xc2 0xa6)      0xa6)    ; broken bar
+      ((0xc2 0xa7)      0xa7)    ; section
+      ((0xc2 0xab)      0xab)    ; left guillemet
+      ((0xc2 0xac)      0xac)    ; not
+      ((0xc2 0xb6)      0xb6)    ; pilcrow
+      ((0xc2 0xbb)      0xbb)    ; right guillemet
+      ((0xc2 0xbf)      0xbf)    ; inverted ?
+      ; --- Daggers / per mille: lossless CP-1252 ---
+      ((0xe2 0x80 0xa0) 0x86)    ; dagger
+      ((0xe2 0x80 0xa1) 0x87)    ; double dagger
+      ((0xe2 0x80 0xb0) 0x89)    ; per mille
+      ; --- Ohm: not in CP-1252, lossy ASCII ---
+      ((0xce 0xa9)      "ohm")   ; greek capital omega
+      ((0xe2 0x84 0xa6) "ohm")   ; ohm sign U+2126
+      ; --- Box drawing: lossy ASCII ---
+      ((0xe2 0x94 0x80) "-")     ; horizontal
+      ((0xe2 0x94 0x82) "|")     ; vertical
+      ; corners + tees + cross share the 0xe2 0x94 prefix.
+      ; 0x5b/0x5d are ASCII '[' / ']' so the regex character class
+      ; embeds cleanly in the byte sequence.
+      ((0xe2 0x94 0x5b 0x8c 0x90 0x94 0x98 0x9c 0xa4 0xac 0xb4 0xbc 0x5d) "+")
+      ; --- Arrows: lossy ASCII ---
+      ((0xe2 0x86 0x92) "->")
+      ((0xe2 0x86 0x90) "<-")
+      ((0xe2 0x86 0x91) "^")
+      ((0xe2 0x86 0x93) "v")
+      ; --- Math comparators: lossy ASCII (not in CP-1252) ---
+      ((0xe2 0x89 0xa4) "<=")
+      ((0xe2 0x89 0xa5) ">=")
+      ((0xe2 0x89 0xa0) "!="))))
+
+; Catch-all: any remaining valid UTF-8 multi-byte sequence collapses
+; to a single "?". The lead byte range [0xc0-0xf7] excludes the high
+; bytes the table just emitted (which are isolated, not preceded by a
+; lead byte), so we don't eat our own output. Adjacent unmapped
+; sequences merge so an unknown 3-byte char doesn't show as "???".
+defvar(ACL_recodeCatchallRe
+  pcreCompile(strcat("(?:[" ACL_byte(0xc0) "-" ACL_byte(0xf7) "]["
+                     ACL_byte(0x80) "-" ACL_byte(0xbf) "]+)+")))
+
+procedure(ACL_recode(s)
+  ; Convert a UTF-8 string to CP-1252 for display in Allegro form
+  ; widgets on Windows. Lossless for smart punctuation, math/units,
+  ; and Latin-1; lossy ASCII for box-drawing/arrows/comparators;
+  ; "?" for everything else. No-op on Linux (Allegro renders UTF-8
+  ; fine there), on non-strings, and on pure-ASCII input
+  if(or(null(ACL_isWindows) null(stringp(s))
+        null(pcreMatchp(ACL_recodeCatchallRe s))) s
+    let(((r s))
+      foreach(entry ACL_recodeTable
+        r = pcreReplace(car(entry) r cadr(entry) 0))
+      pcreReplace(ACL_recodeCatchallRe r "?" 0))))
+
 ; All path defvars below use the convention "directories end with /,
 ; files don't". Saves callers from needing to insert separators.
 defvar(ACL_homeDir  ; use ~/.local/share to help with sandboxing
@@ -394,7 +503,7 @@ procedure(ACL_logWrite(text)
   ; Stores one line per list entry. Partial lines appended via rplaca.
   ; Suppresses consecutive blank lines.
   let((rest nlPos pre)
-    rest = text
+    rest = ACL_recode(text)
     while(and(rest strlen(rest) > 0)
       nlPos = nindex(rest "\n")
       if(nlPos then
@@ -461,6 +570,7 @@ procedure(ACL_setStatus(text)
   ; to see "Manual: N pending" persistently -- suppress any other
   ; status update that would clobber it. Once the queue drains or
   ; the mode changes, status is open again.
+  text = ACL_recode(text)
   when(and(ACL_form
            or(pcreMatchp(ACL_manualStatusRe text)
               ACL_mode != "manual"
@@ -2117,6 +2227,58 @@ procedure(ACL_runTests()
     ACL_check("hook response ignored" ACL_sessionId "real-sid")
     ACL_sessionLogDir = savedLogDir
     ACL_sessionId = savedSid)
+
+  printf("\n--- CP-1252 recode ---\n")
+  let(((savedWin ACL_isWindows))
+    ACL_isWindows = t
+    ; Lossless table mapping: high CP-1252 byte stays in place.
+    ACL_check("lossless single byte"
+      ACL_recode(strcat("don" ACL_bytes(0xe2 0x80 0x99) "t"))
+      strcat("don" ACL_byte(0x92) "t"))
+    ; Lossy table mapping: ASCII fallback string.
+    ACL_check("lossy ascii"
+      ACL_recode(strcat("a" ACL_bytes(0xe2 0x94 0x82) "b")) "a|b")
+    ; Catch-all collapses unmapped UTF-8 to a single ?, even when
+    ; multiple unmapped sequences are adjacent.
+    ACL_check("catchall mixed"
+      ACL_recode(strcat("a" ACL_bytes(0xf0 0x9f 0x98 0x80 0xf0 0x9f 0x98 0x81) "b"))
+      "a?b")
+    ; Catch-all must NOT eat the high CP-1252 bytes the table emitted.
+    ACL_check("catchall preserves recoded"
+      ACL_recode(ACL_bytes(0xe2 0x80 0x99 0xe2 0x80 0x99))
+      strcat(ACL_byte(0x92) ACL_byte(0x92)))
+    ACL_check("ascii passthrough"
+      ACL_recode("hello world") "hello world")
+    ACL_isWindows = nil
+    ACL_check("linux passthrough"
+      ACL_recode(strcat("don" ACL_bytes(0xe2 0x80 0x99) "t"))
+      strcat("don" ACL_bytes(0xe2 0x80 0x99) "t"))
+    ACL_isWindows = t
+    ACL_check("nil passthrough" ACL_recode(nil) nil)
+    ACL_isWindows = savedWin)
+
+  printf("\n--- recode integration via stream ---\n")
+  let(((savedBuf ACL_responseBuf) (savedLog ACL_logContent)
+       (savedId ACL_streamingMsgId) (savedLen ACL_streamedMsgLen)
+       (savedForm ACL_form) (savedWin ACL_isWindows))
+    ACL_form = nil ACL_logContent = nil ACL_responseBuf = ""
+    ACL_streamingMsgId = nil ACL_streamedMsgLen = nil
+    ACL_isWindows = t
+    ACL_processStreamLine(strcat(
+      "{\"type\":\"stream_event\",\"event\":{\"type\":\"message_start\","
+      "\"message\":{\"id\":\"msg_recode\"}}}"))
+    ACL_processStreamLine(strcat(
+      "{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\","
+      "\"index\":0,\"delta\":{\"type\":\"text_delta\","
+      "\"text\":\"X" ACL_bytes(0xe2 0x94 0x82) "Y\"}}}"))
+    ACL_check("stream-time recode"
+      ACL_logString() "X|Y")
+    ACL_isWindows = savedWin
+    ACL_form = savedForm
+    ACL_streamedMsgLen = savedLen
+    ACL_streamingMsgId = savedId
+    ACL_logContent = savedLog
+    ACL_responseBuf = savedBuf)
 
   printf("\n--- Assistant dedup fallback ---\n")
   ; If the stream skipped message_start (resume mid-turn or partial
