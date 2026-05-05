@@ -118,17 +118,29 @@ Your own notes are in `$ALLEGRO_CLAUDE_NOTES/LESSONS.md` and are copied below. U
 ## `substring` returns nil past end of string
 `substring(str pos)` returns nil if `pos > strlen(str)`. Guard with `and(rest strlen(rest) > 0)` or check for nil before calling `strlen`.
 
+## `strlen` errors on non-strings (including nil)
+`strlen(nil)`, `strlen(42)`, `strlen('foo)` all raise `*Error* strlen: argument #1 should be a string`. It does NOT silently return nil. If a value might not be a string, guard with `stringp` first: `and(stringp(s) strlen(s) > 0)`.
+
 ## `nindex` rejects nil arguments
 `nindex(str nil)` errors. If `substring` might return nil, guard before passing to `nindex`: `and(c nindex("chars" c))`.
 
 ## `prog` vs `let` return values
 `let` returns the value of its last expression. `prog` always returns nil unless `return(value)` is called. If you need early exit (via `return`), you must use `prog` -- but then you must also `return(value)` for the normal exit path.
 
+## `letseq` is SKILL's `let*` -- inter-binding deps need it
+`let(((a 1) (b a + 1)) ...)` errors with `unbound variable - a`: `let` binds in parallel, so `b`'s init expression evaluates in the surrounding scope and can't see `a`. Use `letseq(((a 1) (b a + 1)) ...)` for sequential bindings. Same shape as `let`, just allows each init to reference earlier bindings.
+
 ## `return` only works inside `prog`
 `return(value)` can only be used lexically inside a `prog` block. It does NOT work inside `let`, `when`, or standalone `cond`. A `return` inside a nested `let` within a `prog` WILL work -- it exits the nearest enclosing `prog`.
 
 ## `pcreCompile` options are integers, not strings
 `pcreCompile("pattern" "i")` is wrong. Use `pcreCompile("pattern" pcreGenCompileOptBits(?caseLess t))` or the integer constant `0x00000001`.
+
+## `pcreReplace` interprets backslashes in the replacement string
+The replacement string passed to `pcreReplace` goes through PCRE's own escape processing -- `"\\"` (one literal backslash in the SKILL string) becomes empty in the output, and `"\\1"` is a backreference to capture group 1. To put a literal backslash in the replacement, write `"\\\\"` in SKILL source (two backslashes in the string, which PCRE then collapses to one). To preserve the entire match without replacement, use `"$0"`. Same gotcha applies to `pcreSubstitute`.
+
+## Quadratic strcat accumulators -- use cons + reverse + buildString
+Building a string by `out = strcat(out chunk)` in a loop is O(n^2) on output size (PROMPT.md / journal contents / API responses can hit this). The idiomatic linear pattern: `cons` each chunk onto a list, `reverse` it, then `buildString(list "")`.
 
 ## `cons` requires a list as the second argument
 `cons(value 5)` errors -- the second argument must be a list. Use `list(value 5)` for a two-element list, or `cons(value nil)` for a one-element list.
