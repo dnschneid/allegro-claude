@@ -2073,7 +2073,9 @@ procedure(ACL_runTests()
       errset(deleteDir(d))))
 
   printf("\n--- Settings ---\n")
-  let((tmpFile settings loaded (savedMode ACL_mode))
+  let((tmpFile settings loaded
+       (savedMode ACL_mode) (savedFast ACL_fast)
+       (savedClaudeArgs ACL_claudeArgs))
     tmpFile = strcat(ACL_sessionLogDir "test_settings.json")
     ; Round-trip save/load
     settings = list(list("mode" "verbose"))
@@ -2081,22 +2083,26 @@ procedure(ACL_runTests()
     loaded = ACL_loadSettings(tmpFile)
     ACL_check("settings roundtrip" loaded settings)
     ACL_check("settings get mode" ACL_jGet(loaded "mode") "verbose")
-    ; currentSettings reflects ACL_mode
+    ; currentSettings reflects the live globals -- pin them to known
+    ; values, otherwise the test depends on whatever settings.json
+    ; was applied at load time.
     ACL_mode = "quiet"
+    ACL_fast = nil
+    ACL_claudeArgs = ""
     ACL_check("currentSettings" ACL_currentSettings()
       list(list("mode" "quiet") list("fast" 'false) list("claudeArgs" "")))
     ; applySettings updates ACL_mode
     ACL_applySettings(list(list("mode" "manual")))
     ACL_check("applySettings" ACL_mode "manual")
     ; claudeArgs round-trips
-    let(((savedClaudeArgs ACL_claudeArgs))
-      ACL_applySettings(list(list("claudeArgs" "--debug api,hooks")))
-      ACL_check("applySettings claudeArgs" ACL_claudeArgs "--debug api,hooks")
-      ACL_claudeArgs = savedClaudeArgs)
+    ACL_applySettings(list(list("claudeArgs" "--debug api,hooks")))
+    ACL_check("applySettings claudeArgs" ACL_claudeArgs "--debug api,hooks")
     ; Load nonexistent file returns nil
     ACL_check("load missing" ACL_loadSettings("/tmp/nonexistent_acl_test.json") nil)
     ; Cleanup
     deleteFile(tmpFile)
+    ACL_claudeArgs = savedClaudeArgs
+    ACL_fast = savedFast
     ACL_mode = savedMode)
 
   printf("\n--- Sessions ---\n")
@@ -2325,12 +2331,11 @@ procedure(ACL_runTests()
   let((proc buf ready)
     buf = ""
     ready = nil
-    ; Spawn a simple echo process to verify IPC round-trip.
-    ; `cat` doesn't exist on Windows; `findstr "^"` matches every
-    ; line (including empty), which gives the same stdin->stdout
-    ; behavior using a built-in cmd.exe utility.
+    ; Spawn a simple echo process to verify IPC round-trip. `cat`
+    ; doesn't exist on Windows; `more` reads stdin and writes
+    ; everything to stdout when stdin isn't a terminal.
     proc = ipcBeginProcess(
-      if(ACL_isWindows "cmd /c findstr \"^\"" "cat")
+      if(ACL_isWindows "cmd /c more" "cat")
       ""
       lambda((id data) buf = strcat(buf data)  ready = t)
       lambda((id data) printf("ipc err: %s\n" data)))
@@ -2340,7 +2345,9 @@ procedure(ACL_runTests()
     ipcWriteProcess(proc "hello\n")
     ; Give dataHandler time to fire (may need a brief pause)
     for(i 1 10 unless(ready ipcSleep(1)))
-    ACL_check("ipc echo" buf "hello\n")
+    ACL_checkTrue("ipc echo"
+      ; cmd /c more on Windows tacks a CR on; cat doesn't.
+      or(buf == "hello\n" buf == "hello\r\n"))
     ipcKillProcess(proc))
 
   printf("\n--- Claude Process ---\n")
@@ -2372,16 +2379,25 @@ procedure(ACL_runTests()
           ACL_mcpDrainPending()
           ipcSleep(1)))
       ACL_check("skill exec response" ACL_gotText t)
-      ; Inspect actual artifacts: at least one cmd_*.out should exist
-      ; and contain "42" somewhere in the result.
+      ; Inspect actual artifacts: each cmd_<N>.il should have a
+      ; matching cmd_<N>.out containing "42".
       let(((outContent "")
            (foundExec nil))
-        foreach(f ACL_listDirFiles(ACL_sessionLogDir)
-          when(and(strlen(f) > 4
-                   substring(f (strlen(f) - 3)) == ".out")
-            foundExec = t
-            outContent = strcat(outContent
-              ACL_readFile(strcat(ACL_sessionLogDir f)))))
+        for(i 1 30
+          unless(foundExec
+            foreach(f ACL_listDirFiles(ACL_sessionLogDir)
+              when(pcreMatchp(ACL_cmdSeqFileRe f)
+                let(((outPath strcat(ACL_sessionLogDir
+                                     substring(f 1 (strlen(f) - 2)) "out")))
+                  when(isFile(outPath)
+                    foundExec = t
+                    outContent = strcat(outContent ACL_readFile(outPath))))))
+            unless(foundExec ipcSleep(1))))
+        unless(foundExec
+          printf("    sessionLogDir=%L isDir=%L files=%L\n"
+            ACL_sessionLogDir
+            isDir(ACL_sessionLogDir)
+            ACL_listDirFiles(ACL_sessionLogDir)))
         ACL_check("mcp tool was called" foundExec t)
         ACL_checkTrue("mcp result contains 42"
           nindex(outContent "42")))
