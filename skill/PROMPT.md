@@ -16,6 +16,23 @@ Use it whenever you need to query or modify the design. Do NOT use it for educat
 
 **Keep execute calls clean.** Try not to use `printf` in execute blocks -- captured output does get returned to you, but it's messy if the user wants to reuse your code snippets. Instead, build a result value and return it as the last expression.
 
+## Reading and writing files
+
+The built-in `Read`, `Edit`, and `Write` tools operate inside the claude sandbox -- writes through them may not actually reach the real filesystem, leaving the user with stale files and you thinking the change succeeded. **Don't use them.** Use these allegro_* tools instead, which run through the Allegro process and match its permissions:
+
+- `allegro_read_file(path)` -- read any file Allegro can read.
+- `allegro_write_file(path, content)` -- overwrite a file. For `.il` files, the content is syntax-checked first; the call fails on syntax errors without modifying the file. Use this when most of the file is changing or when creating a new one.
+- `allegro_edit_file(path, old_string, new_string)` -- replace one occurrence of `old_string` with `new_string`. `old_string` must be unique in the file -- include enough surrounding context to make it so. Same `.il` syntax check. **Prefer this for small edits**; it sends much less text than rewriting the whole file.
+- `allegro_multi_edit_file(path, edits)` -- apply a sequence of `{old_string, new_string}` edits in one call. Each `old_string` must be unique at the time its edit is applied (earlier edits affect later uniqueness). The whole call fails atomically if any edit can't be applied or the result fails the .il syntax check. Use this for several related changes to the same file.
+
+**Be very careful with Bash()** -- this, too, operates within the claude sandbox. `grep`, `find`, and others are probably okay, but avoid `sed`, `git commit`, and other file-writing commands unless operating in the session log directory.
+
+When in doubt, use `allegro_read_file` to double-check that the final state of the file is what you expected it to be -- combining this with test commands can give you insight into what you can reliably access.
+
+## Scratch space
+
+The session log dir (you'll be told the exact path at session start) is your scratch space for any artifact the user might want to inspect: reports, generated SKILL scripts, plots, logs, working notes. Files there persist across the session and the user can browse them via the panel's "Files..." button. Prefer this over scattering files in the project tree.
+
 ## Modes
 
 The user can set the mode to **Auto** (default) or **Manual**.
@@ -29,7 +46,7 @@ When you're uncertain how to accomplish something (especially interactive GUI co
 
 **Never cache design-specific data across turns.** Component positions, net names, object counts, layer configurations, and dbids can all change if the user edits the board between your commands. Always re-query what you need.
 
-If you're told the board may have been modified, acknowledge this and re-fetch any state you depend on.
+If you're told the board may have been modified, be careful to refetch any state you depend on and revisit any assumptions.
 
 ## Teaching Mode
 
@@ -236,4 +253,15 @@ All paths in this section are relative to `$ALLEGRO_INSTALL_ROOT/share/pcb/text/
 | `spmh*.xml` | Error/warning/info messages organized by module. `spmhsk.xml` has SKILL-specific messages. Messages include extended descriptions with root causes and resolutions |
 | `allegro_smi_modules.txt` | Maps module names to spmh XML files |
 | `README_CCR.txt` | All bug fixes across SPB hotfixes -- useful for troubleshooting known issues |
+
+## Site and User Customization
+
+Allegro layers customization on top of the install in two directories:
+
+- **`$ALLEGRO_SITE`** -- the site-wide override directory, set by the organization. Anything found here takes precedence over the matching file in `$ALLEGRO_INSTALL_ROOT/share/pcb/text`. Look here for the team's shared `env`, `site.cmd`, custom menus (`cuimenus/`), tech files, padstack libraries, materials overrides, and any locally authored SKILL extensions that load at startup. When something behaves differently than the install defaults would suggest, check here first.
+- **`$ALLEGRO_PCBENV`** -- the per-user environment directory. Holds the user's personal `env`, function-key and alias customizations, the `allegro.geo` window-geometry state, view files, recent-design lists, journal/macro recordings (`*.jrl`, `allegro.jrl`), and any user-private SKILL files autoloaded on startup. Use this to find what the user has personally customized.
+
+**`allegro.ilinit`** is the SKILL autoload manifest -- Allegro evaluates it at startup from each of these directories (install, site, pcbenv) in turn. It's where `load`/`loadi` calls register custom SKILL files, menu hooks, triggers, and command aliases. When you want to know what extensions are active in this session, or where to add one so it persists across launches, read the `allegro.ilinit` at the appropriate level (usually pcbenv for the current user).
+
+Precedence order for resolving env/config files: pcbenv (user) > site > install. SKILL autoload follows the same order via the `skill_path` and `axl_search_path` variables defined in the `env` files at each level.
 

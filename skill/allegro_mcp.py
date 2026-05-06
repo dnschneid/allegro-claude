@@ -39,24 +39,130 @@ import re
 import sys
 import time
 
-TOOL = {
-    "name": "allegro_execute",
-    "description": (
-        "Execute SKILL code in the running Allegro PCB Editor session. "
-        "Returns the evaluation result (or error) and any printed output. "
-        "Use this whenever you need to query or modify the design."
-    ),
-    "inputSchema": {
-        "type": "object",
-        "properties": {
-            "code": {
-                "type": "string",
-                "description": "SKILL code to evaluate in Allegro",
-            }
+TOOLS = [
+    {
+        "name": "allegro_execute",
+        "description": (
+            "Execute SKILL code in the running Allegro PCB Editor session. "
+            "Returns the evaluation result (or error) and any printed output. "
+            "Use this whenever you need to query or modify the design."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "string",
+                    "description": "SKILL code to evaluate in Allegro",
+                }
+            },
+            "required": ["code"],
         },
-        "required": ["code"],
     },
-}
+    {
+        "name": "allegro_read_file",
+        "description": (
+            "Read a file from disk, using Allegro's ACLs. Use this instead of "
+            "the built-in Read tool for any file outside the session log dir, "
+            "especially files the user expects you to inspect or modify "
+            "(SKILL scripts, board macros, generated reports)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string",
+                         "description": "Absolute path to the file"}
+            },
+            "required": ["path"],
+        },
+    },
+    {
+        "name": "allegro_write_file",
+        "description": (
+            "Write a file to disk, using Allegro's ACLs. Overwrites the file "
+            "if it exists. Use this instead of the built-in Write tool. For "
+            ".il (SKILL) files, the content is syntax-checked before writing "
+            "-- the call fails on syntax errors without writing the file."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path":    {"type": "string",
+                            "description": "Absolute path to the file"},
+                "content": {"type": "string",
+                            "description": "Full new contents of the file"},
+            },
+            "required": ["path", "content"],
+        },
+    },
+    {
+        "name": "allegro_edit_file",
+        "description": (
+            "Replace one occurrence of old_string with new_string in a file on "
+            "disk, using Allegro's ACLs. Use this instead of the built-in Edit "
+            "or Bash tools when outside fo the session log dir, since writes "
+            "within the claude sandbox may be silently redirected. old_string "
+            "must be unique in the file (the call fails if it appears more "
+            "than once or zero times). For .il files, the resulting content is "
+            "syntax-checked before writing -- the call fails without writing "
+            "if there would be syntax errors. Prefer this over "
+            "allegro_write_file for small changes -- it sends much less text."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path":       {"type": "string",
+                               "description": "Absolute path to the file"},
+                "old_string": {"type": "string",
+                               "description":
+                                   "Text to find. Must appear exactly once. "
+                                   "Include enough surrounding context to "
+                                   "be unambiguous."},
+                "new_string": {"type": "string",
+                               "description":
+                                   "Replacement text. May be empty to delete."},
+            },
+            "required": ["path", "old_string", "new_string"],
+        },
+    },
+    {
+        "name": "allegro_multi_edit_file",
+        "description": (
+            "Apply a sequence of find/replace edits to a file in one "
+            "round-trip, using Allegro's ACLs. Each edit's old_string "
+            "must be unique in the file content as it stands at that "
+            "point in the sequence (earlier edits affect later "
+            "uniqueness). The whole call fails atomically -- if any one "
+            "edit can't be applied, or if the final content fails the "
+            ".il syntax check, the file is not modified. Use this "
+            "instead of multiple allegro_edit_file calls when making "
+            "several related changes to the same file."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path":  {"type": "string",
+                          "description": "Absolute path to the file"},
+                "edits": {
+                    "type": "array",
+                    "description":
+                        "Ordered list of edits. Each entry has "
+                        "old_string and new_string with the same "
+                        "semantics as allegro_edit_file.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "old_string": {"type": "string"},
+                            "new_string": {"type": "string"},
+                        },
+                        "required": ["old_string", "new_string"],
+                    },
+                    "minItems": 1,
+                },
+            },
+            "required": ["path", "edits"],
+        },
+    },
+]
 
 BASE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 UUID_RE = re.compile(r"\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b")
@@ -171,7 +277,7 @@ def main():
         elif method == "notifications/initialized":
             pass
         elif method == "tools/list":
-            send_result(msg["id"], {"tools": [TOOL]})
+            send_result(msg["id"], {"tools": TOOLS})
         elif method == "tools/call":
             handle_call(msg)
         elif method == "ping":

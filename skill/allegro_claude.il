@@ -236,6 +236,13 @@ procedure(ACL_axlGetPath(name)
     when(ACL_nonEmpty(v)
       pcreReplace(ACL_noTrailingSlashRe ACL_normPath(v) "$0/" 0))))
 
+procedure(ACL_pcbenvDir()
+  ; The user's pcbenv: allegro_pcbenv if set, otherwise $HOME/pcbenv
+  ; (or $USERPROFILE/pcbenv on Windows).
+  or(ACL_axlGetPath("allegro_pcbenv")
+     strcat(or(getShellEnvVar("HOME")
+               getShellEnvVar("USERPROFILE")) "/pcbenv")))
+
 defvar(ACL_fast nil)                ; set to t to skip preloading Allegro docs
 defvar(ACL_claudeArgs "")            ; extra flags appended to claude CLI invocation
 defvar(ACL_enableRawLog nil)       ; helps with debugging streams
@@ -292,6 +299,7 @@ defvar(ACL_singleQuoteRe     pcreCompile("'"))
 ; Stream / journal / status processing.
 defvar(ACL_cmdSeqFileRe      pcreCompile("^cmd_(\\d+)\\.il$"))
 defvar(ACL_mcpToolPrefixRe   pcreCompile("^.*__"))
+defvar(ACL_mcpAllegroToolRe  pcreCompile("^mcp__allegro__allegro_"))
 defvar(ACL_xmlTagRe          pcreCompile("<[^>]+>"))
 defvar(ACL_trimWSRe          pcreCompile("^\\s+|\\s+$"))
 defvar(ACL_collapseWSRe      pcreCompile("\\s+"))
@@ -308,6 +316,8 @@ defvar(ACL_hotfixStripRe     pcreCompile("_(S|HF)\\d+\\.md$"))
 ; System-prompt template substitutions.
 defvar(ACL_promptNotesRe     pcreCompile("[$]ALLEGRO_CLAUDE_NOTES"))
 defvar(ACL_promptInstallRe   pcreCompile("[$]ALLEGRO_INSTALL_ROOT"))
+defvar(ACL_promptSiteRe      pcreCompile("[$]ALLEGRO_SITE"))
+defvar(ACL_promptPcbenvRe    pcreCompile("[$]ALLEGRO_PCBENV"))
 
 ; ============================================================
 ; UTF-8 -> CP-1252 recoding for the form widget on Windows.
@@ -590,6 +600,10 @@ procedure(ACL_buildSystemPrompt()
     template = pcreReplace(ACL_promptNotesRe template ACL_notesDir 0)
     template = pcreReplace(ACL_promptInstallRe template
       ACL_normPath(axlGetVariable("allegro_install_root")) 0)
+    template = pcreReplace(ACL_promptSiteRe template
+      ACL_normPath(or(ACL_axlGetPath("allegro_site") "")) 0)
+    template = pcreReplace(ACL_promptPcbenvRe template
+      ACL_normPath(ACL_pcbenvDir()) 0)
     when(ACL_isWindows
       template = strcat(template "\n\n"
         "## Output Encoding\n\n"
@@ -724,9 +738,7 @@ procedure(ACL_startClaude(@optional resumeId fork)
       close(fp))
     installRoot = ACL_axlGetPath("allegro_install_root")
     siteDir = ACL_axlGetPath("allegro_site")
-    pcbenvDir = or(ACL_axlGetPath("allegro_pcbenv")
-                   strcat(or(getShellEnvVar("HOME")
-                             getShellEnvVar("USERPROFILE")) "/pcbenv"))
+    pcbenvDir = ACL_pcbenvDir()
     projectDir = ACL_normPath(pcreReplace(ACL_lastPathCompRe
       simplifyFilename(axlGetDrawingName()) "" 0))
     args = list(
@@ -745,8 +757,12 @@ procedure(ACL_startClaude(@optional resumeId fork)
       "--add-dir" ACL_shellQuote(pcbenvDir)
       "--add-dir" ACL_shellQuote(projectDir)
       "--allowedTools" ACL_shellQuote(strcat(
-        "Edit(" ACL_notesDir "*),mcp__allegro__allegro_execute"))
-      "--disallowedTools" "AskUserQuestion"
+        "mcp__allegro__allegro_execute,"
+        "mcp__allegro__allegro_read_file,"
+        "mcp__allegro__allegro_write_file,"
+        "mcp__allegro__allegro_edit_file,"
+        "mcp__allegro__allegro_multi_edit_file"))
+      "--disallowedTools" "AskUserQuestion,Edit,Write,NotebookEdit"
       "--model" "opus[1m]"
       "--effort" "max")
     ACL_resumeIsFork = and(resumeId fork t)
@@ -843,7 +859,7 @@ defvar(ACL_mcpCmdSeq 0)
 
 procedure(ACL_handleToolCall(block)
   ; Called from the stream handler when a complete tool_use block for
-  ; our allegro_execute tool arrives. Logs the command and queues it
+  ; one of our allegro_* tools arrives. Logs the call and queues it
   ; for top-level execution -- we can't run ACL_execBlock here because
   ; evalstring inside a dataHandler deadlocks.
   ;
@@ -851,22 +867,23 @@ procedure(ACL_handleToolCall(block)
   ; single-threaded with respect to other stream events), so the
   ; readable log can't get interleaved oddly even if execution hangs.
   letseq(((toolId ACL_jGet(block "id"))
+          (toolName or(ACL_jGet(block "name") ""))
           (input ACL_jGet(block "input"))
-          (code when(input ACL_jGet(input "code")))
+          (preview ACL_toolPreview(toolName input))
           (seq nil))
-    when(and(stringp(toolId) stringp(code))
+    when(and(stringp(toolId) input preview)
       ACL_mcpCmdSeq = ACL_mcpCmdSeq + 1
       seq = ACL_mcpCmdSeq
       when(ACL_mode != "quiet"
         ACL_logWrite(sprintf(nil "\n\n[cmd_%d.il:\n%s]\n\n"
           seq
           if(and(ACL_mode == "snippets"
-                 strlen(code) > ACL_logCodeLimit)
-            strcat(substring(code 1 (ACL_logCodeLimit - 3)) "...")
-            code))))
+                 strlen(preview) > ACL_logCodeLimit)
+            strcat(substring(preview 1 (ACL_logCodeLimit - 3)) "...")
+            preview))))
       when(ACL_sessionLogDir
-        ACL_writeFile(sprintf(nil "%s/cmd_%d.il" ACL_sessionLogDir seq) code))
-      ACL_mcpPending = append(ACL_mcpPending list(list(toolId code seq)))
+        ACL_writeFile(sprintf(nil "%s/cmd_%d.il" ACL_sessionLogDir seq) preview))
+      ACL_mcpPending = append(ACL_mcpPending list(list(toolId toolName input seq)))
       ; In manual mode, hold the queue until the user types `approve`
       ; (or `reject`). Otherwise schedule a deferred drain.
       if(ACL_mode == "manual"
@@ -874,6 +891,39 @@ procedure(ACL_handleToolCall(block)
           sprintf(nil "Manual: %d pending...waiting for you to \"approve\" or \"reject\"" length(ACL_mcpPending))
         )
         ACL_mcpScheduleDrain()))))
+
+procedure(ACL_toolPreview(toolName input)
+  ; Human-readable representation of a tool call for the cmd_<N>.il
+  ; log. allegro_execute logs the SKILL code; the file tools log a
+  ; comment-prefixed summary plus any content/edit payloads. Returns
+  ; nil for unknown tools.
+  cond(
+    (toolName == "mcp__allegro__allegro_execute"
+      ACL_jGet(input "code"))
+    (toolName == "mcp__allegro__allegro_read_file"
+      sprintf(nil "; read_file %L" ACL_jGet(input "path")))
+    (toolName == "mcp__allegro__allegro_write_file"
+      sprintf(nil "; write_file %L\n%s"
+        ACL_jGet(input "path") ACL_jGetStr(input "content")))
+    (toolName == "mcp__allegro__allegro_edit_file"
+      sprintf(nil "; edit_file %L\n;-- old --\n%s\n;-- new --\n%s"
+        ACL_jGet(input "path")
+        ACL_jGetStr(input "old_string")
+        ACL_jGetStr(input "new_string")))
+    (toolName == "mcp__allegro__allegro_multi_edit_file"
+      let(((edits or(ACL_jGet(input "edits") nil))
+           (idx 0)
+           parts)
+        parts = list(sprintf(nil "; multi_edit_file %L (%d edits)"
+          ACL_jGet(input "path") length(edits)))
+        foreach(edit edits
+          idx = idx + 1
+          parts = append(parts list(
+            sprintf(nil ";-- edit %d old --" idx)
+            ACL_jGetStr(edit "old_string")
+            sprintf(nil ";-- edit %d new --" idx)
+            ACL_jGetStr(edit "new_string"))))
+        buildString(parts "\n")))))
 
 procedure(ACL_mcpScheduleDrain()
   ; Always defer drain via a one-shot timer so ACL_execBlock's
@@ -889,11 +939,10 @@ procedure(ACL_mcpDrainPending(@rest args)
     ACL_mcpPending = nil
     foreach(entry pending
       letseq(((toolId car(entry))
-              (code cadr(entry))
-              (seq caddr(entry))
-              (raw errset(ACL_execBlock(code)))
-              (result if(raw car(raw)
-                         "*error* SKILL execution failed unexpectedly"))
+              (toolName cadr(entry))
+              (input caddr(entry))
+              (seq cadddr(entry))
+              (result ACL_runTool(toolName input))
               (ipcOutPath when(ACL_sessionLogDir
                                 sprintf(nil "%s/tool_%s.out" ACL_sessionLogDir toolId))))
         when(ACL_sessionLogDir
@@ -901,6 +950,143 @@ procedure(ACL_mcpDrainPending(@rest args)
           ; The IPC file the Python MCP server polls for: keyed by
           ; tool_use_id. Atomic publish via temp + rename.
           ACL_writeFileAtomic(ipcOutPath result))))))
+
+procedure(ACL_runTool(toolName input)
+  ; Dispatch one tool call by name. Each branch handles its own arg
+  ; extraction so adding a tool only touches this proc + ACL_toolPreview.
+  cond(
+    (toolName == "mcp__allegro__allegro_execute"
+      let(((raw errset(ACL_execBlock(ACL_jGet(input "code")))))
+        if(raw car(raw) "*error* SKILL execution failed unexpectedly")))
+    (toolName == "mcp__allegro__allegro_read_file"
+      ACL_toolReadFile(ACL_jGet(input "path")))
+    (toolName == "mcp__allegro__allegro_write_file"
+      ACL_toolWriteFile(ACL_jGet(input "path")
+                        ACL_jGetStr(input "content")))
+    (toolName == "mcp__allegro__allegro_edit_file"
+      ACL_toolEditFile(ACL_jGet(input "path")
+                       ACL_jGetStr(input "old_string")
+                       ACL_jGetStr(input "new_string")))
+    (toolName == "mcp__allegro__allegro_multi_edit_file"
+      ACL_toolMultiEditFile(ACL_jGet(input "path")
+                            ACL_jGet(input "edits")))
+    (t sprintf(nil "*error* unknown tool: %s" toolName))))
+
+procedure(ACL_jGetStr(obj key)
+  ; Like ACL_jGet but returns "" for missing/non-string values, so
+  ; callers can treat the result as a string unconditionally.
+  let(((v ACL_jGet(obj key)))
+    if(stringp(v) v "")))
+
+defvar(ACL_skillFileRe pcreCompile("\\.il$" pcreGenCompileOptBits(?caseLess t)))
+
+procedure(ACL_writeChecked(path content okMsg)
+  ; Run the .il syntax check, write the file if it passes, and
+  ; return either the syntax-check error or okMsg.
+  or(ACL_skillSyntaxCheck(path content)
+     progn(ACL_writeFile(path content) okMsg)))
+
+procedure(ACL_validateFilePath(opName path needExisting)
+  ; Returns nil if path is a non-empty string and (when needExisting)
+  ; refers to an existing file; otherwise an "*error* OPNAME: ..." line.
+  cond(
+    (null(ACL_nonEmpty(path))
+      sprintf(nil "*error* %s: missing path" opName))
+    (and(needExisting null(isFile(path)))
+      sprintf(nil "*error* %s: not a file: %s" opName path))))
+
+procedure(ACL_toolReadFile(path)
+  or(ACL_validateFilePath("read_file" path t)
+     ACL_readFile(path)))
+
+procedure(ACL_toolWriteFile(path content)
+  or(ACL_validateFilePath("write_file" path nil)
+     ACL_writeChecked(path content
+       sprintf(nil "Wrote %d bytes to %s" strlen(content) path))))
+
+procedure(ACL_applyEdit(text oldStr newStr)
+  ; Apply a single find/replace to text. Returns
+  ;   (text newText)    on success
+  ;   (error message)   on not-found / non-unique
+  letseq(((first nindex(text oldStr))
+          (after when(first (first + strlen(oldStr))))
+          (second when(after nindex(substring(text after) oldStr))))
+    cond(
+      (null(first)
+        list('error sprintf(nil "old_string not found: %L" oldStr)))
+      (second
+        list('error sprintf(nil "old_string is not unique: %L" oldStr)))
+      (t list('text strcat(substring(text 1 (first - 1))
+                           newStr
+                           substring(text after)))))))
+
+procedure(ACL_toolEditFile(path oldStr newStr)
+  or(ACL_validateFilePath("edit_file" path t)
+     when(null(ACL_nonEmpty(oldStr))
+       "*error* edit_file: missing old_string")
+     let(((res ACL_applyEdit(ACL_readFile(path) oldStr newStr)))
+       if(car(res) == 'error
+         sprintf(nil "*error* edit_file: %s in %s" cadr(res) path)
+         ACL_writeChecked(path cadr(res)
+           sprintf(nil "Edited %s (%d bytes)" path strlen(cadr(res))))))))
+
+procedure(ACL_toolMultiEditFile(path edits)
+  ; Apply a list of {old_string, new_string} edits in sequence,
+  ; failing the whole call (without writing) if any single edit
+  ; can't be applied or the final content fails the .il syntax
+  ; check. Each edit's old_string must be unique at the time of
+  ; that edit -- earlier edits can affect uniqueness for later
+  ; ones, which is the same semantics claude's MultiEdit uses.
+  or(ACL_validateFilePath("multi_edit_file" path t)
+     when(null(and(listp(edits) edits))
+       "*error* multi_edit_file: edits must be a non-empty list")
+     let(((text ACL_readFile(path))
+          (idx 0)
+          err)
+       foreach(edit edits
+         idx = idx + 1
+         unless(err
+           letseq(((oldStr ACL_jGetStr(edit "old_string"))
+                   (newStr ACL_jGetStr(edit "new_string")))
+             cond(
+               (null(ACL_nonEmpty(oldStr))
+                 err = sprintf(nil "edit %d: missing old_string" idx))
+               (t letseq(((res ACL_applyEdit(text oldStr newStr)))
+                    if(car(res) == 'error
+                      err = sprintf(nil "edit %d: %s" idx cadr(res))
+                      text = cadr(res))))))))
+       if(err
+         sprintf(nil "*error* multi_edit_file: %s in %s" err path)
+         ACL_writeChecked(path text
+           sprintf(nil "Edited %s (%d edits, %d bytes)"
+             path length(edits) strlen(text)))))))
+
+procedure(ACL_skillSyntaxCheck(path content)
+  ; Syntax-check .il content using only the reader -- no eval, so
+  ; nothing in `content` runs even if it tries to escape a wrapper.
+  ; We wrap as `progn(<content>) ACL_synEOF__` and read top-level
+  ; forms from a string port. Well-formed content gives exactly two
+  ; forms: a list whose head is `progn`, then the EOF sentinel. Any
+  ; other shape -- extra forms (escape attempt or stray `)`),
+  ; missing sentinel (unterminated string / missing close eating
+  ; the rest), or wrong head -- is a syntax error.
+  when(pcreMatchp(ACL_skillFileRe path)
+    let((p forms err)
+      p = instring(strcat("progn(\n" content "\n) ACL_synEOF__"))
+      forms = car(errset(lineread(p) t))
+      close(p)
+      cond(
+        (or(null(forms) listp(forms) == nil)
+          err = "form list missing")
+        (length(forms) != 2
+          err = sprintf(nil "expected 2 top-level forms, got %d"
+                          length(forms)))
+        (cadr(forms) != 'ACL_synEOF__
+          err = "EOF sentinel missing (unterminated string or paren?)")
+        (or(null(listp(car(forms))) car(car(forms)) != 'progn)
+          err = "wrapper not preserved (stray `)` in content?)"))
+      when(err
+        sprintf(nil "*error* syntax check failed for %s: %s" path err)))))
 
 procedure(ACL_writeFile(path content)
   ; Plain (non-atomic) write -- truncates path and writes content.
@@ -1059,7 +1245,7 @@ procedure(ACL_processStreamLine(line)
                         ; Tell claude where its prior commands live so it
                         ; can grep them instead of re-running discovery.
                         ACL_sendMessage(sprintf(nil
-                          "[Your past SKILL commands and outputs from this session live in %s. Each cmd_<n>.il has a matching cmd_<n>.out. Grep these instead of re-running discovery.]"
+                          "[Session log dir: %s -- holds your prior cmd_<n>.il/.out (allegro_execute code/output) from this session (reference them as appropriate), and is your scratch space for any reports, generated scripts, or working files the user might want to inspect via the Files... button.]"
                           ACL_sessionLogDir)
                           ?isSynthetic t ?noQuery t)))))))
             (evtype == "content_block_start"
@@ -1092,10 +1278,11 @@ procedure(ACL_processStreamLine(line)
               when(and(block ACL_jGet(block "type") == "text")
                 text = ACL_jGet(block "text")
                 when(text fullText = strcat(fullText text)))
-              ; Tool calls for our allegro_execute MCP tool: extract
-              ; the code from the stream and execute locally.
+              ; Tool calls for our allegro_* MCP tools: extract the
+              ; arguments from the stream and execute locally.
               when(and(block ACL_jGet(block "type") == "tool_use"
-                       ACL_jGet(block "name") == "mcp__allegro__allegro_execute")
+                       pcreMatchp(ACL_mcpAllegroToolRe
+                         or(ACL_jGet(block "name") "")))
                 ACL_handleToolCall(block)))
             ; If we have a tracked entry for this msg, use it as the
             ; high-water mark. Otherwise (no message_start was seen --
@@ -1957,6 +2144,157 @@ procedure(ACL_runTests()
     ACL_mcpCmdSeq = savedSeq
     ACL_mcpPending = savedPending
     ACL_form = savedForm)
+
+  printf("\n--- SKILL syntax check ---\n")
+  ; Reader-only check: must accept well-formed content, reject
+  ; structural problems, and crucially MUST NOT execute content
+  ; (no eval -- code injection attempts read as extra forms and
+  ; are rejected).
+  let((dummy)
+    ; Non-.il paths: skipped, returns nil
+    ACL_check("syn skip non-.il"
+      ACL_skillSyntaxCheck("foo.txt" "anything goes ;;) ((") nil)
+    ; Well-formed
+    ACL_check("syn accept simple"
+      ACL_skillSyntaxCheck("a.il" "(plus 1 2)") nil)
+    ACL_check("syn accept multi-form"
+      ACL_skillSyntaxCheck("a.il" "(plus 1 2)\n(times 3 4)") nil)
+    ACL_check("syn accept empty"
+      ACL_skillSyntaxCheck("a.il" "") nil)
+    ACL_check("syn accept whitespace only"
+      ACL_skillSyntaxCheck("a.il" "\n\n  \n") nil)
+    ACL_check("syn accept procedure def"
+      ACL_skillSyntaxCheck("a.il"
+        "procedure(foo(x) plus(x 1))\n") nil)
+    ACL_check("syn accept comments"
+      ACL_skillSyntaxCheck("a.il" "; just a comment\n(plus 1 2)") nil)
+    ACL_check("syn accept literal nil form"
+      ACL_skillSyntaxCheck("a.il" "nil") nil)
+    ; Malformed
+    ACL_checkTrue("syn reject extra close"
+      ACL_skillSyntaxCheck("a.il" "(plus 1 2)))"))
+    ACL_checkTrue("syn reject missing close"
+      ACL_skillSyntaxCheck("a.il" "(plus 1 2"))
+    ACL_checkTrue("syn reject unterm string"
+      ACL_skillSyntaxCheck("a.il" "(setq x \"open"))
+    ; Safety: payloads designed to escape the wrapper. The probe
+    ; that matters is that the global ACL_synProbeFlag stays nil --
+    ; reader-only check must NOT execute the payload.
+    ACL_synProbeFlag = nil
+    ACL_checkTrue("syn reject escape-progn payload"
+      ACL_skillSyntaxCheck("a.il"
+        ") (setq ACL_synProbeFlag 'PWNED) progn("))
+    ACL_check("syn payload did not run"
+      ACL_synProbeFlag nil)
+    ; Trailing junk after a balanced form: extra top-level form,
+    ; reader sees 3 forms (progn body, junk, EOF), rejected.
+    ACL_synProbeFlag = nil
+    ACL_checkTrue("syn reject trailing junk after balance"
+      ACL_skillSyntaxCheck("a.il"
+        "(setq x 1)\n) (setq ACL_synProbeFlag 'PWNED) progn("))
+    ACL_check("syn trailing-junk payload did not run"
+      ACL_synProbeFlag nil))
+
+  let(((tmpDir strcat(ACL_homeDir "filetool_test/")))
+    ACL_createDirP(tmpDir)
+    ; read_file: missing file
+    ACL_check("read_file missing"
+      ACL_runTool("mcp__allegro__allegro_read_file"
+        list(list("path" strcat(tmpDir "nope.txt"))))
+      sprintf(nil "*error* read_file: not a file: %snope.txt" tmpDir))
+    ; write_file plain text
+    let(((p strcat(tmpDir "hello.txt")))
+      ACL_runTool("mcp__allegro__allegro_write_file"
+        list(list("path" p) list("content" "hi there\n")))
+      ACL_check("write_file content"
+        ACL_runTool("mcp__allegro__allegro_read_file" list(list("path" p)))
+        "hi there\n"))
+    ; write_file SKILL with valid syntax
+    let(((p strcat(tmpDir "good.il")))
+      ACL_runTool("mcp__allegro__allegro_write_file"
+        list(list("path" p)
+             list("content" "(plus 1 2)\n(times 3 4)\n")))
+      ACL_check("write_file .il valid round-trip"
+        ACL_runTool("mcp__allegro__allegro_read_file" list(list("path" p)))
+        "(plus 1 2)\n(times 3 4)\n"))
+    ; write_file SKILL with bad syntax: rejected, file untouched
+    let(((p strcat(tmpDir "bad.il")))
+      ACL_runTool("mcp__allegro__allegro_write_file"
+        list(list("path" p) list("content" "(plus 1 2)))\n")))
+      ACL_check("write_file .il bad: file not created"
+        isFile(p) nil)
+      ACL_checkTrue("write_file .il bad: returns error"
+        pcreMatchp(pcreCompile("syntax check failed")
+          ACL_runTool("mcp__allegro__allegro_write_file"
+            list(list("path" p) list("content" "unbalanced \"string"))))))
+    ; edit_file: unique replace
+    let(((p strcat(tmpDir "edit.txt")))
+      ACL_runTool("mcp__allegro__allegro_write_file"
+        list(list("path" p) list("content" "alpha\nbeta\ngamma\n")))
+      ACL_runTool("mcp__allegro__allegro_edit_file"
+        list(list("path" p) list("old_string" "beta")
+             list("new_string" "BETA")))
+      ACL_check("edit_file unique replace"
+        ACL_runTool("mcp__allegro__allegro_read_file" list(list("path" p)))
+        "alpha\nBETA\ngamma\n"))
+    ; edit_file: not found
+    let(((p strcat(tmpDir "edit.txt")))
+      ACL_checkTrue("edit_file not found"
+        pcreMatchp(pcreCompile("not found")
+          ACL_runTool("mcp__allegro__allegro_edit_file"
+            list(list("path" p) list("old_string" "no_such_text")
+                 list("new_string" "x"))))))
+    ; edit_file: ambiguous
+    let(((p strcat(tmpDir "ambig.txt")))
+      ACL_runTool("mcp__allegro__allegro_write_file"
+        list(list("path" p) list("content" "x\nx\n")))
+      ACL_checkTrue("edit_file not unique"
+        pcreMatchp(pcreCompile("not unique")
+          ACL_runTool("mcp__allegro__allegro_edit_file"
+            list(list("path" p) list("old_string" "x")
+                 list("new_string" "y"))))))
+    ; edit_file: .il syntax check on result.
+    let(((p strcat(tmpDir "edit.il")))
+      ACL_runTool("mcp__allegro__allegro_write_file"
+        list(list("path" p) list("content" "(plus 1 2)\n")))
+      ACL_checkTrue("edit_file .il bad result rejected"
+        pcreMatchp(pcreCompile("syntax check failed")
+          ACL_runTool("mcp__allegro__allegro_edit_file"
+            list(list("path" p) list("old_string" "(plus 1 2)")
+                 list("new_string" "1 2)))")))))
+      ACL_check("edit_file .il bad: file unchanged"
+        ACL_runTool("mcp__allegro__allegro_read_file" list(list("path" p)))
+        "(plus 1 2)\n"))
+    ; multi_edit_file: sequential edits, each unique at its turn.
+    let(((p strcat(tmpDir "multi.txt")))
+      ACL_runTool("mcp__allegro__allegro_write_file"
+        list(list("path" p) list("content" "alpha\nbeta\ngamma\n")))
+      ACL_runTool("mcp__allegro__allegro_multi_edit_file"
+        list(list("path" p)
+             list("edits" list(
+               list(list("old_string" "alpha") list("new_string" "ALPHA"))
+               list(list("old_string" "gamma") list("new_string" "GAMMA"))))))
+      ACL_check("multi_edit_file applies all"
+        ACL_runTool("mcp__allegro__allegro_read_file" list(list("path" p)))
+        "ALPHA\nbeta\nGAMMA\n"))
+    ; multi_edit_file: any failure aborts atomically (file unchanged).
+    let(((p strcat(tmpDir "multi_atomic.txt")))
+      ACL_runTool("mcp__allegro__allegro_write_file"
+        list(list("path" p) list("content" "one\ntwo\n")))
+      ACL_checkTrue("multi_edit_file atomic on failure"
+        pcreMatchp(pcreCompile("not found")
+          ACL_runTool("mcp__allegro__allegro_multi_edit_file"
+            list(list("path" p)
+                 list("edits" list(
+                   list(list("old_string" "one") list("new_string" "ONE"))
+                   list(list("old_string" "missing") list("new_string" "X"))))))))
+      ACL_check("multi_edit_file unchanged after failure"
+        ACL_runTool("mcp__allegro__allegro_read_file" list(list("path" p)))
+        "one\ntwo\n"))
+    ; Cleanup
+    foreach(f ACL_listDirFiles(tmpDir)
+      errset(deleteFile(strcat(tmpDir f))))
+    errset(deleteDir(tmpDir)))
 
   printf("\n--- Form File ---\n")
   letseq(((formPath strcat(ACL_scriptDir "allegro_claude.form"))
