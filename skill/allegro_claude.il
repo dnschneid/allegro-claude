@@ -445,26 +445,29 @@ defvar(ACL_settingsFile strcat(ACL_homeDir "settings.json"))
 defvar(ACL_logDir       strcat(ACL_homeDir "logs/"))
 defvar(ACL_sessionLogDir ACL_logDir)
 
-; ACL_scriptDir is the directory containing this file (and PROMPT.md,
-; LESSONS.md, the .form, and allegro_mcp.py). Auto-detect via piport.
-; The user can pre-set ACL_scriptDir before loading to skip detection.
+; ACL_scriptDir is the directory containing this and related sources.
+; The user can pre-set ACL_scriptDir before loading to set precedence.
+; Regardless, The first directory that has the required files is selected.
+procedure(ACL_validScriptDir(d)
+  when(stringp(d)
+    let(((nd pcreReplace(ACL_noTrailingSlashRe ACL_normPath(d) "$0/" 0)))
+      when(isFile(strcat(nd "allegro_mcp.py")) nd))))
 defvar(ACL_scriptDir nil)
+ACL_scriptDir = ACL_validScriptDir(car(exists(d
+  append(list(ACL_scriptDir
+              getShellEnvVar("ACL_SCRIPT_DIR")
+              car(errset(pcreReplace(ACL_lastPathCompRe
+                simplifyFilename(get_filename(piport)) "" 0))))
+         getSkillPath())
+  ACL_validScriptDir(d))))
 unless(ACL_scriptDir
-  ACL_scriptDir = car(errset(
-    pcreReplace(ACL_lastPathCompRe
-      simplifyFilename(get_filename(piport)) "" 0))))
-; Normalize: forward slashes, guaranteed trailing slash. Then sanity-
-; check by content -- PROMPT.md should sit alongside this file.
-when(stringp(ACL_scriptDir)
-  ACL_scriptDir = pcreReplace(ACL_noTrailingSlashRe
-    ACL_normPath(ACL_scriptDir) "$0/" 0))
-unless(and(stringp(ACL_scriptDir) isFile(strcat(ACL_scriptDir "PROMPT.md")))
   printf(strcat(
-    "*Warning* ACL: script directory looks wrong "
-    "(ACL_scriptDir = %L; expected to contain PROMPT.md). "
+    "*Warning* ACL: could not locate script directory "
+    "(no allegro_mcp.py found via ACL_scriptDir, ACL_SCRIPT_DIR env var, "
+    "piport parent directory, or getSkillPath). "
     "Set ACL_scriptDir explicitly before loading allegro_claude.il -- e.g.:\n"
     "  ACL_scriptDir = \"/path/to/allegro-claude/skill/\"\n"
-    "  load(strcat(ACL_scriptDir \"allegro_claude.il\"))\n") ACL_scriptDir))
+    "  load(strcat(ACL_scriptDir \"allegro_claude.il\"))\n")))
 
 ; ============================================================
 ; 4. Utilities
