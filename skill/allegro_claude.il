@@ -210,7 +210,10 @@ procedure(ACL_jsonObj(@rest pairs)
 when(and(boundp('ACL_claude) ACL_claude)
   when(ipcIsAliveProcess(ACL_claude)
     printf("ACL: stopping previous claude process\n")
-    ipcSignalProcess(ACL_claude 'TERM))
+    ; Windows has no POSIX signals, so we have to ipcKillProcess
+    if(ACL_isWindows
+      ipcKillProcess(ACL_claude)
+      ipcSignalProcess(ACL_claude 'TERM)))
   ACL_claude = nil)
 
 defvar(ACL_claude nil)
@@ -817,7 +820,10 @@ procedure(ACL_stopClaude()
   ; -- this exit was deliberate.
   ACL_claudeStopRequested = t
   when(and(ACL_claude ipcIsAliveProcess(ACL_claude))
-    ipcSignalProcess(ACL_claude 'TERM))
+    ; Windows has no POSIX signals, so we have to ipcKillProcess
+    if(ACL_isWindows
+      ipcKillProcess(ACL_claude)
+      ipcSignalProcess(ACL_claude 'TERM)))
   ACL_claude = nil
   ACL_pendingInput = nil
   when(ACL_form axlFormSetField(ACL_form "send" "Send")))
