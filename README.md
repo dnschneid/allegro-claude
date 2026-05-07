@@ -19,6 +19,23 @@ load(strcat(ACL_scriptDir "allegro_claude.il"))
 
 Claude does its best work when it pre-loads the Allegro documentation, but this requires a massive (1MB pure markdown) cache. The cache differs by release and cannot be shared in this repo since the docs are only available to Cadence subscribers. Generating the cache is an extremely expensive operation -- taking an hour and consuming >>100M tokens. If you are in an organization, you should place any sourced or generated cache into `ALLEGRO_SITE` to avoid each user generating it themselves. Launching `claude` in Allegro will search for any cache and explain your options if it can't be found.
 
+### Site and user customization
+
+A few SKILL variables can be set *before* loading `allegro_claude.il` to customize behavior. These are intended for site `ilinit` files (organization-wide policy) or per-user `pcbenv/allegro.ilinit` (personal preferences):
+
+- `ACL_extraPromptFiles` -- list of absolute paths whose contents are appended to Claude's system prompt. Use this to add site-specific policies, coding standards, library conventions, or any other instructions every session should see. Files are read fresh on each session start; missing or non-string entries are skipped.
+- `ACL_claudeArgs` -- extra command-line flags appended to the `claude` CLI invocation.
+- `ACL_fast` -- skip preloading the Allegro documentation cache (faster startup, less context).
+
+Example site `ilinit`:
+
+```skill
+ACL_extraPromptFiles = list(
+  strcat(getShellEnvVar("ALLEGRO_SITE") "claude_policy.md")
+  strcat(getShellEnvVar("ALLEGRO_SITE") "library_conventions.md"))
+load("/path/to/allegro-claude/skill/allegro_claude.il")
+```
+
 ## Files
 
 ### skill/

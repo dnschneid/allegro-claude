@@ -245,6 +245,7 @@ procedure(ACL_pcbenvDir()
 
 defvar(ACL_fast nil)                ; set to t to skip preloading Allegro docs
 defvar(ACL_claudeArgs "")            ; extra flags appended to claude CLI invocation
+defvar(ACL_extraPromptFiles nil)     ; list of paths appended to the system prompt (set in site/user init)
 defvar(ACL_enableRawLog nil)       ; helps with debugging streams
 defvar(ACL_form nil)
 defvar(ACL_logContent nil)          ; accumulated log chunks (newest first)
@@ -597,6 +598,9 @@ procedure(ACL_buildSystemPrompt()
     template = strcat(template "\n\n" ACL_readFile(strcat(ACL_scriptDir "LESSONS.md")))
     when(isFile(strcat(ACL_notesDir "LESSONS.md"))
       template = strcat(template "\n\n" ACL_readFile(strcat(ACL_notesDir "LESSONS.md"))))
+    foreach(extra ACL_extraPromptFiles
+      when(and(stringp(extra) isFile(extra))
+        template = strcat(template "\n\n" ACL_readFile(extra))))
     template = pcreReplace(ACL_promptNotesRe template ACL_notesDir 0)
     template = pcreReplace(ACL_promptInstallRe template
       ACL_normPath(axlGetVariable("allegro_install_root")) 0)
@@ -2292,6 +2296,42 @@ procedure(ACL_runTests()
         ACL_runTool("mcp__allegro__allegro_read_file" list(list("path" p)))
         "one\ntwo\n"))
     ; Cleanup
+    foreach(f ACL_listDirFiles(tmpDir)
+      errset(deleteFile(strcat(tmpDir f))))
+    errset(deleteDir(tmpDir)))
+
+  printf("\n--- Extra prompt files ---\n")
+  let(((tmpDir strcat(ACL_homeDir "extraprompt_test/"))
+       (savedExtra ACL_extraPromptFiles)
+       p1 p2 fp basePrompt withExtras)
+    ACL_createDirP(tmpDir)
+    p1 = strcat(tmpDir "policy.md")
+    p2 = strcat(tmpDir "library.md")
+    fp = outfile(p1) when(fp fprintf(fp "SITE_POLICY_MARKER") close(fp))
+    fp = outfile(p2) when(fp fprintf(fp "LIBRARY_CONVENTIONS_MARKER") close(fp))
+    basePrompt = ACL_buildSystemPrompt()
+    ACL_check("extra prompt: marker absent by default"
+      pcreMatchp(pcreCompile("SITE_POLICY_MARKER") basePrompt) nil)
+    ACL_extraPromptFiles = list(p1 p2)
+    withExtras = ACL_buildSystemPrompt()
+    ACL_checkTrue("extra prompt: first file appended"
+      pcreMatchp(pcreCompile("SITE_POLICY_MARKER") withExtras))
+    ACL_checkTrue("extra prompt: second file appended"
+      pcreMatchp(pcreCompile("LIBRARY_CONVENTIONS_MARKER") withExtras))
+    ; Missing files are silently skipped (don't fail the build).
+    ACL_extraPromptFiles = list(p1 strcat(tmpDir "nope.md") p2)
+    let(((p ACL_buildSystemPrompt()))
+      ACL_checkTrue("extra prompt: missing skipped, others kept"
+        and(pcreMatchp(pcreCompile("SITE_POLICY_MARKER") p)
+            pcreMatchp(pcreCompile("LIBRARY_CONVENTIONS_MARKER") p))))
+    ; Non-string entries are skipped, not errored.
+    ACL_extraPromptFiles = list(p1 nil 42 p2)
+    let(((p ACL_buildSystemPrompt()))
+      ACL_checkTrue("extra prompt: non-strings skipped"
+        and(pcreMatchp(pcreCompile("SITE_POLICY_MARKER") p)
+            pcreMatchp(pcreCompile("LIBRARY_CONVENTIONS_MARKER") p))))
+    ; Cleanup
+    ACL_extraPromptFiles = savedExtra
     foreach(f ACL_listDirFiles(tmpDir)
       errset(deleteFile(strcat(tmpDir f))))
     errset(deleteDir(tmpDir)))
