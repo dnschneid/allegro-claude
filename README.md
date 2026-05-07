@@ -17,7 +17,21 @@ ACL_scriptDir = "/path/to/allegro-claude/skill/"
 load(strcat(ACL_scriptDir "allegro_claude.il"))
 ```
 
-Claude does its best work when it pre-loads the Allegro documentation, but this requires a massive (1MB pure markdown) cache. The cache differs by release and cannot be shared in this repo since the docs are only available to Cadence subscribers. Generating the cache is an extremely expensive operation -- taking an hour and consuming >>100M tokens. If you are in an organization, you should place any sourced or generated cache into `ALLEGRO_SITE` to avoid each user generating it themselves. Launching `claude` in Allegro will search for any cache and explain your options if it can't be found.
+### Documentation cache
+
+Claude does its best work when it pre-loads the Allegro documentation, but this requires a massive (1.5MB pure markdown) cache. The cache differs by release and cannot be shared in this repo since the docs are only available to Cadence subscribers.
+
+Generating the cache is run from a regular shell (not Allegro):
+
+```
+python3 cache_builder/build_doc_cache.py \
+  --install-root /opt/cadence/SPB251 \
+  --out ~/.local/share/allegro_claude/notes/SPB25_1_2025.md
+```
+
+The build runs unsupervised, takes hours and more than $1K in tokens to complete, and is safe to re-run -- it resumes from the work tree under `<out>.build/`.
+
+If you are in an organization, you should place any sourced or generated cache into `ALLEGRO_SITE` to avoid each user needing to generate it themselves. Launching `claude` in Allegro will search for any cache and tell you the exact build command if it can't be found.
 
 ### Site and user customization
 

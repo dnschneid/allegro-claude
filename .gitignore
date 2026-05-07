@@ -5,5 +5,9 @@
 *_
 .*.swo
 .*.swp
+*.pyc
 signoise.run/
 test/cadence.sh
+test/claude/
+plans/
+.claude/
