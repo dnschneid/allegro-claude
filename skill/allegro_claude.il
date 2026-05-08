@@ -275,6 +275,9 @@ defvar(ACL_lastCmdTime 0)
 defvar(ACL_recording nil)
 defvar(ACL_journalFile nil)
 defvar(ACL_gotText nil)          ; set to t when any text arrives
+defvar(ACL_sessionCostUsd 0.0)   ; cumulative within a claude run; cleared on (re)start
+defvar(ACL_lastContextTokens 0)  ; in+cache_read+cache_creation from latest result event
+defvar(ACL_lastContextWindow nil) ; modelUsage[*].contextWindow from latest result event
 defvar(ACL_streamingMsgId nil)    ; message ID currently being streamed
 defvar(ACL_streamedMsgLen nil)    ; alist of (msgId . textLen) for streamed messages
 defvar(ACL_hadToolUse nil)       ; true if tool_use occurred since last text block
@@ -797,6 +800,9 @@ procedure(ACL_startClaude(@optional resumeId fork)
       when(fp fprintf(fp "\n--- %s ---\n" getCurrentTime()) close(fp)))
     ACL_lineBuf = ""
     ACL_responseBuf = ""
+    ACL_sessionCostUsd = 0.0
+    ACL_lastContextTokens = 0
+    ACL_lastContextWindow = nil
     ACL_streamingMsgId = nil
     ACL_streamedMsgLen = nil
     ACL_promptId = 1
@@ -1290,11 +1296,20 @@ procedure(ACL_processStreamLine(line)
       ; received via streaming; only display new content beyond what
       ; was streamed for this message ID.
       (etype == "assistant"
-        let((msg content block msgId entry seenLen fullText newText)
+        let((msg content block msgId entry seenLen fullText newText u tot)
           msg = ACL_jGet(parsed "message")
           msgId = when(msg ACL_jGet(msg "id"))
           entry = when(msgId assoc(msgId ACL_streamedMsgLen))
           content = when(msg ACL_jGet(msg "content"))
+          ; Per-turn context numbers live on each assistant message
+          ; (message.usage). Result events report the SUM across all
+          ; internal turns in an exchange, so they're misleading for
+          ; "how full is the window" -- prefer this source instead.
+          u = when(msg ACL_jGet(msg "usage"))
+          tot = or(ACL_jGet(u "input_tokens") 0)
+              + or(ACL_jGet(u "cache_read_input_tokens") 0)
+              + or(ACL_jGet(u "cache_creation_input_tokens") 0)
+          when(plusp(tot) ACL_lastContextTokens = tot)
           when(content
             fullText = ""
             foreach(block content
@@ -1344,8 +1359,27 @@ procedure(ACL_processStreamLine(line)
                     ACL_appendChat(sprintf(nil "\n[%s]" stripped)))))))))
       ; Result (response complete)
       (etype == "result"
-        ACL_flushDisplay()
-        ACL_onResponseComplete()))))
+        let(((cost ACL_jGet(parsed "total_cost_usd"))
+             (isErr ACL_jGet(parsed "is_error"))
+             (errStatus ACL_jGet(parsed "api_error_status"))
+             (errReason ACL_jGet(parsed "terminal_reason"))
+             (resText ACL_jGet(parsed "result")))
+          ; total_cost_usd is session-cumulative within a claude run
+          when(numberp(cost) ACL_sessionCostUsd = cost)
+          ; modelUsage is an object keyed by model id; first entry's
+          ; contextWindow is what we need to compute % used.
+          ACL_lastContextWindow =
+            or(ACL_jGet(cadr(car(ACL_jGet(parsed "modelUsage"))) "contextWindow")
+               ACL_lastContextWindow)
+          ; Surface API/terminal errors
+          when(isErr
+            ACL_appendChat(sprintf(nil "\n[Error%s%s%s]\n"
+              if(errStatus sprintf(nil " %L" errStatus) "")
+              if(errReason sprintf(nil " %s" errReason) "")
+              if(and(stringp(resText) plusp(strlen(resText)))
+                sprintf(nil ": %s" resText) ""))))
+          ACL_flushDisplay()
+          ACL_onResponseComplete())))))
 
 ; ============================================================
 ; 8. Display Streaming
@@ -1464,9 +1498,21 @@ procedure(ACL_checkFuncDocs(code)
 ; 10. Response Complete Handler
 ; ============================================================
 
+procedure(ACL_readyStatus()
+  ; "Ready" decorated with cumulative cost and live context % when we
+  ; have any data yet. Bare "Ready" before the first result event.
+  if(plusp(ACL_sessionCostUsd)
+    sprintf(nil "Ready  -  $%.2f%s"
+      ACL_sessionCostUsd
+      if(and(ACL_lastContextWindow plusp(ACL_lastContextWindow))
+        sprintf(nil "  -  %d%% ctx"
+          round(100.0 * ACL_lastContextTokens / ACL_lastContextWindow))
+        ""))
+    "Ready"))
+
 procedure(ACL_onResponseComplete()
   ACL_responseBuf = ""
-  ACL_setStatus("Ready"))
+  ACL_setStatus(ACL_readyStatus()))
 
 ; ============================================================
 ; 11. Form Callback
@@ -1812,7 +1858,7 @@ procedure(ACL_handleRestoreSession(sid)
         ACL_handleNewSession()
       else
         ACL_appendChat(sprintf(nil "Restored session: %s" sid))
-        ACL_setStatus("Ready")))))
+        ACL_setStatus(ACL_readyStatus())))))
 
 procedure(ACL_handleForkSession(sid)
   prog((info oldBoard)
@@ -1871,7 +1917,7 @@ procedure(ACL_openPanel(@rest args)
           axlFormSetField(ACL_form "chatlog"
             ACL_logTail(ACL_logLineLimit)))
         ACL_setStatus(if(and(ACL_claude ipcIsAliveProcess(ACL_claude))
-          "Ready" "Starting..."))
+          ACL_readyStatus() "Starting..."))
       else
         letseq(((board axlGetDrawingName())
                 (sessions when(board ACL_getBoardSessions(board))))
