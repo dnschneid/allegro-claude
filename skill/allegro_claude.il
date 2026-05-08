@@ -225,6 +225,14 @@ procedure(ACL_normPath(path)
     pcreReplace(ACL_backslashRe path "/" 0)
     path))
 
+procedure(ACL_ensureTrailingSlash(path)
+  ; Append "/" iff path is a non-empty string that doesn't already end
+  ; in one. nil/empty pass through unchanged.
+  if(and(stringp(path) plusp(strlen(path))
+         nequal(substring(path strlen(path) 1) "/"))
+    strcat(path "/")
+    path))
+
 procedure(ACL_nonEmpty(s)
   ; True iff s is a non-empty string. Required because strlen errors
   ; on non-strings; bare `strlen(s) > 0` will crash on nil.
@@ -236,8 +244,7 @@ procedure(ACL_axlGetPath(name)
   ; happens with allegro_pcbenv) so callers can `or` against a
   ; default.
   let(((v axlGetVariable(name)))
-    when(ACL_nonEmpty(v)
-      pcreReplace(ACL_noTrailingSlashRe ACL_normPath(v) "$0/" 0))))
+    when(ACL_nonEmpty(v) ACL_ensureTrailingSlash(ACL_normPath(v)))))
 
 procedure(ACL_pcbenvDir()
   ; The user's pcbenv: allegro_pcbenv if set, otherwise $HOME/pcbenv
@@ -292,7 +299,6 @@ defvar(ACL_bignumRe  pcreCompile("^-?\\d{10,}$"))
 ; Path manipulation. Compiled once because they fire on hot paths
 ; (every IPC write, every stream-handler tool_use, etc).
 defvar(ACL_backslashRe       pcreCompile("\\\\"))
-defvar(ACL_noTrailingSlashRe pcreCompile("[^/]$"))
 defvar(ACL_trailingSlashesRe pcreCompile("/+$"))
 defvar(ACL_lastPathCompRe    pcreCompile("[^/\\\\]+$"))
 defvar(ACL_basenameStripRe   pcreCompile("^.*[/\\\\]"))
@@ -450,7 +456,7 @@ defvar(ACL_sessionLogDir ACL_logDir)
 ; Regardless, The first directory that has the required files is selected.
 procedure(ACL_validScriptDir(d)
   when(stringp(d)
-    let(((nd pcreReplace(ACL_noTrailingSlashRe ACL_normPath(d) "$0/" 0)))
+    let(((nd ACL_ensureTrailingSlash(ACL_normPath(d))))
       when(isFile(strcat(nd "allegro_mcp.py")) nd))))
 defvar(ACL_scriptDir nil)
 ACL_scriptDir = ACL_validScriptDir(car(exists(d
