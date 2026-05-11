@@ -597,30 +597,34 @@ procedure(ACL_setStatus(text)
         strcat(substring(text 1 ACL_statusTruncLimit-3) "...")
         text))))
 
+procedure(ACL_replacePaths(text)
+  ; Replaces $PATHs with the actual paths
+  text = pcreReplace(ACL_promptNotesRe text ACL_notesDir 0)
+  text = pcreReplace(ACL_promptInstallRe text
+    ACL_normPath(axlGetVariable("allegro_install_root")) 0)
+  text = pcreReplace(ACL_promptSiteRe text
+    ACL_normPath(or(ACL_axlGetPath("allegro_site") "")) 0)
+  pcreReplace(ACL_promptPcbenvRe text
+    ACL_normPath(ACL_pcbenvDir()) 0))
+
 procedure(ACL_buildSystemPrompt()
-  ; Read the PROMPT.md template, substitute $ALLEGRO_INSTALL_ROOT and
-  ; $ALLEGRO_CLAUDE_PATH with actual directories, and return the result.
-  let(((template ACL_readFile(strcat(ACL_scriptDir "PROMPT.md"))))
-    template = strcat(template "\n\n" ACL_readFile(strcat(ACL_scriptDir "LESSONS.md")))
-    when(isFile(strcat(ACL_notesDir "LESSONS.md"))
-      template = strcat(template "\n\n" ACL_readFile(strcat(ACL_notesDir "LESSONS.md"))))
-    foreach(extra ACL_extraPromptFiles
-      when(and(stringp(extra) isFile(extra))
-        template = strcat(template "\n\n" ACL_readFile(extra))))
-    template = pcreReplace(ACL_promptNotesRe template ACL_notesDir 0)
-    template = pcreReplace(ACL_promptInstallRe template
-      ACL_normPath(axlGetVariable("allegro_install_root")) 0)
-    template = pcreReplace(ACL_promptSiteRe template
-      ACL_normPath(or(ACL_axlGetPath("allegro_site") "")) 0)
-    template = pcreReplace(ACL_promptPcbenvRe template
-      ACL_normPath(ACL_pcbenvDir()) 0)
+  ; Read PROMPT.md plus optional companion files, join with blank lines,
+  ; then substitute $ALLEGRO_INSTALL_ROOT and $ALLEGRO_CLAUDE_PATH etc.
+  ; Missing files contribute "" (via ACL_readFile) and are filtered out.
+  let((paths chunks)
+    paths = append(
+      list(strcat(ACL_scriptDir "PROMPT.md")
+           strcat(ACL_scriptDir "LESSONS.md")
+           strcat(ACL_notesDir  "LESSONS.md"))
+      setof(p ACL_extraPromptFiles stringp(p)))
+    chunks = setof(s mapcar('ACL_readFile paths) (and s (nequal s "")))
     when(ACL_isWindows
-      template = strcat(template "\n\n"
-        "## Output Encoding\n\n"
-        "**Only use ASCII characters in responses.** Do not use Unicode "
-        "characters such as curly quotes, em dashes, bullets, or other "
-        "non-ASCII glyphs. Use straight quotes, `--`, and `*` instead."))
-    template))
+      chunks = append1(chunks
+        strcat("## Output Encoding\n\n"
+               "**Only use ASCII characters in responses.** Do not use Unicode "
+               "characters such as curly quotes, em dashes, bullets, or other "
+               "non-ASCII glyphs. Use straight quotes, `--`, and `*` instead.")))
+    ACL_replacePaths(buildString(chunks "\n\n"))))
 
 procedure(ACL_shellQuote(s)
   if(ACL_isWindows
@@ -1768,15 +1772,15 @@ procedure(ACL_handleNewSession()
         (t
           ; No -- skip this session, but explain where the file is
           ; expected so the user can drop in a pre-built copy.
-          ACL_appendChat(strcat(
+          ACL_appendChat(ACL_replacePaths(strcat(
             "Skipping documentation cache for this session. If you "
             "already have a cache file, place it at any of:\n"
-            "  " ACL_notesDir "\n"
-            "  " ACL_axlGetPath("allegro_pcbenv") "\n"
-            "  " ACL_axlGetPath("allegro_site") "\n"
+            "  $ALLEGRO_CLAUDE_NOTES\n"
+            "  $ALLEGRO_PCBENV\n"
+            "  $ALLEGRO_SITE\n"
             "  " ACL_scriptDir "\n"
             "named " ACL_basename(doc) " (or the version-without-hotfix "
-            "equivalent).")))))))
+            "equivalent)."))))))))
   ACL_sendMessage(sprintf(nil "Current board: %L\nSay hello" axlGetDrawingName())
     ?isSynthetic t))
 
