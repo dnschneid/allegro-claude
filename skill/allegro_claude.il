@@ -1857,7 +1857,10 @@ procedure(ACL_handleRestoreSession(sid)
       if(null(ACL_sessionId) then
         ACL_handleNewSession()
       else
-        ACL_appendChat(sprintf(nil "Restored session: %s" sid))
+        ACL_appendChat(strcat(
+          "Restored session: " sid "\n"
+          "Continuing the conversation from where you left off on this board.\n"
+          "If you want to start fresh, use the Session... button and choose 'New session'."))
         ACL_setStatus(ACL_readyStatus())))))
 
 procedure(ACL_handleForkSession(sid)
@@ -1883,7 +1886,8 @@ procedure(ACL_handleForkSession(sid)
         "The target board has changed from \"%s\" to \"%s\". Disregard any previous design-specific information and re-query the new design as needed."
         oldBoard axlGetDrawingName())
         ?isSynthetic t)
-      ACL_appendChat(sprintf(nil "Forked from session: %s" sid)))))
+      ACL_appendChat(strcat("Forked from session: " sid "\n"
+        "Continuing the conversation from where you left off on that other board.")))))
 
 ; ============================================================
 ; 15. Open Panel & Registration
