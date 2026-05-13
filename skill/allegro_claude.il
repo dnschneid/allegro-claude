@@ -2797,10 +2797,15 @@ procedure(ACL_runTests()
   let(((claudeExists errset(system(
           if(ACL_isWindows "where claude >NUL 2>&1"
             "env -u LD_LIBRARY_PATH which claude > /dev/null 2>&1"))))
-       (savedFast ACL_fast))
+       (savedFast ACL_fast)
+       (savedClaudeArgs ACL_claudeArgs))
     if(and(claudeExists car(claudeExists) == 0) then
       ; Force fast mode so the test doesn't pull in/generate the doc cache
       ACL_fast = t
+      ; Keep test runs out of the on-disk session history.
+      ACL_claudeArgs = strcat(
+        if(ACL_nonEmpty(ACL_claudeArgs) strcat(ACL_claudeArgs " ") "")
+        "--no-session-persistence")
       ACL_streamErrorCount = 0
       ACL_startClaude()
       ACL_checkTrue("claude start" and(ACL_claude ipcIsAliveProcess(ACL_claude)))
@@ -2852,7 +2857,8 @@ procedure(ACL_runTests()
       ACL_check("no stream errors" ACL_streamErrorCount 0)
     else
       printf("  SKIP: claude not in PATH\n"))
-    ACL_fast = savedFast)
+    ACL_fast = savedFast
+    ACL_claudeArgs = savedClaudeArgs)
 
   printf("\n=== Results: %d passed, %d failed ===\n\n" ACL_testPass ACL_testFail))
 
