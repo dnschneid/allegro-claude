@@ -214,6 +214,7 @@ when(and(boundp('ACL_claude) ACL_claude)
     if(ACL_isWindows
       ipcKillProcess(ACL_claude)
       ipcSignalProcess(ACL_claude 'TERM)))
+  ipcWait(ACL_claude)
   ACL_claude = nil)
 
 defvar(ACL_claude nil)
@@ -839,10 +840,13 @@ procedure(ACL_stopClaude()
   ; -- this exit was deliberate.
   ACL_claudeStopRequested = t
   when(and(ACL_claude ipcIsAliveProcess(ACL_claude))
+    ACL_setStatus("Saving session...")
     ; Windows has no POSIX signals, so we have to ipcKillProcess
     if(ACL_isWindows
       ipcKillProcess(ACL_claude)
-      ipcSignalProcess(ACL_claude 'TERM)))
+      ipcSignalProcess(ACL_claude 'TERM))
+    ipcWait(ACL_claude)
+    ACL_setStatus("Session ended"))
   ACL_claude = nil
   ACL_pendingInput = nil
   when(ACL_form axlFormSetField(ACL_form "send" "Send")))
