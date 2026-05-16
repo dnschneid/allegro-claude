@@ -214,7 +214,7 @@ when(and(boundp('ACL_claude) ACL_claude)
     if(ACL_isWindows
       ipcKillProcess(ACL_claude)
       ipcSignalProcess(ACL_claude 'TERM)))
-  ipcWait(ACL_claude)
+  when(ACL_claude ipcWait(ACL_claude))
   ACL_claude = nil)
 
 defvar(ACL_claude nil)
@@ -863,7 +863,7 @@ procedure(ACL_stopClaude()
     if(ACL_isWindows
       ipcKillProcess(ACL_claude)
       ipcSignalProcess(ACL_claude 'TERM))
-    ipcWait(ACL_claude)
+    when(ACL_claude ipcWait(ACL_claude))
     ACL_setStatus("Session ended"))
   ACL_claude = nil
   ACL_pendingInput = nil
