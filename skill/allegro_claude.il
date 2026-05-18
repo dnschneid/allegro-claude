@@ -262,6 +262,7 @@ defvar(ACL_extraPromptFiles nil)     ; list of paths appended to the system prom
 defvar(ACL_enableRawLog nil)       ; helps with debugging streams
 defvar(ACL_form nil)
 defvar(ACL_logContent nil)          ; accumulated log chunks (newest first)
+defvar(ACL_logUnflushed "")         ; log text to be flushed once ACL_sessionLogDir gets set
 defvar(ACL_logTruncLimit 12500)    ; max chars shown in form field
 defvar(ACL_statusTruncLimit 200)   ; max chars for the status bar (sanity cap; STRFILLIN scrolls)
 defvar(ACL_logLineLimit 50)        ; max lines shown in form field
@@ -510,8 +511,24 @@ procedure(ACL_readFile(path)
     else
       "")))
 
-procedure(ACL_appendChat(text)
-  ACL_logWrite(strcat(text "\n")))
+procedure(ACL_appendChat(text @key (toFile t))
+  ACL_logWrite(strcat(text "\n") ?toFile toFile))
+
+procedure(ACL_logFilePath()
+  ; The on-disk mirror of ACL_logContent. nil if we don't have a session dir yet
+  when(and(ACL_sessionLogDir ACL_sessionLogDir != ACL_logDir)
+    strcat(ACL_sessionLogDir "log.txt")))
+
+procedure(ACL_logFileAppend(text)
+  ; Mirror a logWrite to disk so Full Log and restore both stay fast.
+  ; Buffer until the per-session dir exists.
+  ACL_logUnflushed = strcat(ACL_logUnflushed text)
+  letseq(((path ACL_logFilePath())
+          (fp when(path outfile(path "a"))))
+    when(fp
+      fprintf(fp "%s" ACL_logUnflushed)
+      close(fp)
+      ACL_logUnflushed = "")))
 
 procedure(ACL_logEndsWithNL()
   ; True if the most recent log entry is a complete line. nil also
@@ -520,9 +537,12 @@ procedure(ACL_logEndsWithNL()
   or(null(ACL_logContent)
      substring(car(ACL_logContent) strlen(car(ACL_logContent)) 1) == "\n"))
 
-procedure(ACL_logWrite(text)
+procedure(ACL_logWrite(text @key (toFile t))
   ; Stores one line per list entry. Partial lines appended via rplaca.
-  ; Suppresses consecutive blank lines.
+  ; Suppresses consecutive blank lines. Mirrors accepted text to the
+  ; on-disk log file (buffered before sessionLogDir is known) unless
+  ; toFile is false -- used by restore to repopulate state from a file
+  ; we just read, without re-appending its content to itself.
   let((rest nlPos pre)
     rest = ACL_recode(text)
     while(and(rest strlen(rest) > 0)
@@ -532,16 +552,19 @@ procedure(ACL_logWrite(text)
         cond(
           (null(ACL_logEndsWithNL())
             ; Continue an open partial line.
-            rplaca(ACL_logContent strcat(car(ACL_logContent) pre)))
+            rplaca(ACL_logContent strcat(car(ACL_logContent) pre))
+            when(toFile ACL_logFileAppend(pre)))
           (or(pre != "\n" car(ACL_logContent) != "\n")
             ; New line; suppress consecutive blanks.
-            ACL_logContent = cons(pre ACL_logContent)))
+            ACL_logContent = cons(pre ACL_logContent)
+            when(toFile ACL_logFileAppend(pre))))
         rest = substring(rest (nlPos + 1))
       else
         if(null(ACL_logEndsWithNL()) then
           rplaca(ACL_logContent strcat(car(ACL_logContent) rest))
         else
           ACL_logContent = cons(rest ACL_logContent))
+        when(toFile ACL_logFileAppend(rest))
         rest = nil)))
   when(ACL_form
     axlFormSetField(ACL_form "chatlog" ACL_logTail(ACL_logLineLimit))))
@@ -565,17 +588,38 @@ procedure(ACL_logTail(n)
     return(if(lines strcat("...\n" result) result))))
 
 procedure(ACL_logReset()
+  ; Drop the in-memory log + clear the chat panel.
   ACL_logContent = nil
+  ACL_logUnflushed = ""
   when(ACL_form axlFormSetField(ACL_form "chatlog" "")))
 
+procedure(ACL_logLoadFromFile()
+  ; Repopulate ACL_logContent from the persisted log.txt so a resumed
+  ; session shows its prior chat history. Terminate any partial messages
+  ; that may have been interrupted in the previous session.
+  letseq(((path ACL_logFilePath())
+          (text when(and(path isFile(path)) ACL_readFile(path))))
+    when(and(text strlen(text) > 0)
+      ACL_logWrite(text ?toFile nil)
+      when(and(ACL_logContent not(ACL_logEndsWithNL()))
+        rplaca(ACL_logContent strcat(car(ACL_logContent) "\n"))))))
+
 procedure(ACL_showFullLog()
-  ; Write full log to file and open in a viewer window
-  letseq(((logfile strcat(ACL_sessionLogDir "log.txt"))
-          (fp outfile(logfile)))
-    when(fp
-      fprintf(fp "%s" ACL_logString())
-      close(fp)
-      axlUIViewFileCreate(logfile "Claude - Full Log" nil '(50 120) nil ACL_form))))
+  ; The log file is written incrementally as messages stream in, so we
+  ; just open it. The button is disabled (see ACL_refreshLogButtons)
+  ; until ACL_sessionLogDir is set, so we don't need a fallback.
+  let(((path ACL_logFilePath()))
+    when(and(path isFile(path))
+      axlUIViewFileCreate(path "Claude - Full Log" nil '(50 120) nil ACL_form))))
+
+procedure(ACL_refreshLogButtons()
+  ; Full Log / Files... both depend on ACL_sessionLogDir being set to a
+  ; real per-session path. Toggle their editability so the user can't
+  ; click into an inert state.
+  let(((haveDir ACL_logFilePath()))
+    when(ACL_form
+      axlFormSetFieldEditable(ACL_form "fulllog" haveDir)
+      axlFormSetFieldEditable(ACL_form "files" haveDir))))
 
 procedure(ACL_openLogDir()
   ; Open the per-session log directory in the OS file explorer so the
@@ -835,7 +879,7 @@ procedure(ACL_claudeExitHandler(id status)
   unless(ACL_claudeStopRequested
     ACL_setStatus(sprintf(nil "Claude exited (status %L)" status))
     ACL_appendChat(sprintf(nil
-      "[Claude process exited unexpectedly (status %L). Send any message to restart.]"
+      "\n\n[Claude process exited unexpectedly (status %L). Send any message to restart.]"
       status)))
   ACL_claudeStopRequested = nil
   when(ACL_form axlFormSetField(ACL_form "send" "Send")))
@@ -1229,7 +1273,12 @@ procedure(ACL_processStreamLine(line)
           ; CURRENT board (handleForkSession reset ACL_sessionSaved).
           when(and(ACL_resumeIsFork oldDir isDir(oldDir))
             ACL_copyDirFiles(oldDir newDir))
-          ACL_sessionLogDir = newDir))
+          ACL_sessionLogDir = newDir
+          ; Drain any pre-init log buffer now that we know where to
+          ; persist (passing "" is a no-op text-wise but flushes
+          ; ACL_logUnflushed).
+          ACL_logFileAppend("")
+          ACL_refreshLogButtons()))
       ; Always seed cmd seq from existing files: critical for resume
       ; (sid didn't change so the block above is a no-op) and harmless
       ; for fresh sessions (dir is empty). Forks land here too after
@@ -1557,7 +1606,8 @@ procedure(ACL_handleUserMessage(text)
   ACL_responseBuf = ""
   let(((elapsed stringToTime(getCurrentTime()) - ACL_lastCmdTime))
     when(and(ACL_lastCmdTime elapsed > 60)
-      ACL_sendMessage("[The board may have been edited. Re-query the design instead of relying on memory.]"
+      ACL_sendMessage(
+        "[NOTE, BUT DON'T ACKNOWLEDGE: The board may have been edited. Re-query instead of relying on memory.]"
         ?isSynthetic t ?noQuery t))
     ACL_sendMessage(text)))
 
@@ -1735,6 +1785,8 @@ procedure(ACL_handleRestoreSession(sid)
       ACL_sessionLogDir = strcat(ACL_logDir ACL_sessionId "/")
       ACL_sessionSaved = t
       ACL_logReset()
+      ACL_logLoadFromFile()
+      ACL_refreshLogButtons()
       ACL_applySettings(or(
         ACL_loadSettings(strcat(ACL_sessionLogDir "settings.json"))
         ACL_loadSettings(ACL_settingsFile)
@@ -1747,9 +1799,10 @@ procedure(ACL_handleRestoreSession(sid)
         ACL_handleNewSession()
       else
         ACL_appendChat(strcat(
-          "Restored session: " sid "\n"
+          "\n\nRestored session: " sid "\n"
           "Continuing the conversation from where you left off on this board.\n"
-          "If you want to start fresh, use the Session... button and choose 'New session'."))
+          "If you want to start fresh, use the Session... button and choose 'New session'.")
+          ?toFile nil)
         ACL_setStatus(ACL_readyStatus())))))
 
 procedure(ACL_handleForkSession(sid)
@@ -1771,12 +1824,14 @@ procedure(ACL_handleForkSession(sid)
       ACL_handleNewSession()
     else
       ACL_responseBuf = ""
+      ACL_appendChat(strcat("\n\nForked from session: "
+        letseq(((name ACL_sessionName(info)))
+          if(name strcat("\"" name "\" (" sid ")") sid)) "\n"
+        "Continuing the conversation from where you left off on that other board."))
       ACL_sendMessage(sprintf(nil
         "The target board has changed from \"%s\" to \"%s\". Disregard any previous design-specific information and re-query the new design as needed."
         oldBoard axlGetDrawingName())
-        ?isSynthetic t)
-      ACL_appendChat(strcat("Forked from session: " sid "\n"
-        "Continuing the conversation from where you left off on that other board.")))))
+        ?isSynthetic t))))
 
 ; ============================================================
 ; 14. Open Panel & Registration
@@ -1801,6 +1856,7 @@ procedure(ACL_openPanel(@rest args)
       axlFormSetField(ACL_form "mode" ACL_mode)
       axlFormSetField(ACL_form "loglines" sprintf(nil "%d" ACL_logLineLimit))
       axlFormSetField(ACL_form "statuslabel" "Starting...")
+      ACL_refreshLogButtons()
       axlFormDisplay(ACL_form)
       axlFormSetActiveField(ACL_form "userinput")
       if(ACL_sessionId then
