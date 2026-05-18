@@ -263,10 +263,8 @@ defvar(ACL_enableRawLog nil)       ; helps with debugging streams
 defvar(ACL_form nil)
 defvar(ACL_logContent nil)          ; accumulated log chunks (newest first)
 defvar(ACL_logTruncLimit 12500)    ; max chars shown in form field
-defvar(ACL_resultTruncLimit 150)   ; max chars shown for results in manual mode
 defvar(ACL_statusTruncLimit 200)   ; max chars for the status bar (sanity cap; STRFILLIN scrolls)
 defvar(ACL_logLineLimit 50)        ; max lines shown in form field
-defvar(ACL_logFile nil)            ; temp file for full log viewer
 defvar(ACL_logCodeLimit 250)       ; max chars for each code preview
 defvar(ACL_sessionId nil)
 defvar(ACL_sessionSaved nil)       ; true after first successful reply
@@ -284,12 +282,7 @@ defvar(ACL_lastContextWindow nil) ; modelUsage[*].contextWindow from latest resu
 defvar(ACL_streamingMsgId nil)    ; message ID currently being streamed
 defvar(ACL_streamedMsgLen nil)    ; alist of (msgId . textLen) for streamed messages
 defvar(ACL_hadToolUse nil)       ; true if tool_use occurred since last text block
-defvar(ACL_promptId 1)            ; counter for message UUIDs (combined with launch epoch)
-defvar(ACL_uuidEpoch 0)           ; per-launch component to keep uuids unique across restarts
 defvar(ACL_resumeIsFork nil)      ; t if the current launch was --fork-session (skip session migrate)
-defvar(ACL_synthId 0)             ; counter for synthetic message UUIDs
-defvar(ACL_pendingInput nil)      ; text being sent (nil = not queued)
-defvar(ACL_autoUpdateInput nil)   ; t to enable auto-polling of input edits
 
 ; Match "approve"/"approved" (and similar light variants) at the
 ; start of the message, optionally followed by punctuation and free
@@ -316,7 +309,6 @@ defvar(ACL_singleQuoteRe     pcreCompile("'"))
 defvar(ACL_cmdSeqFileRe      pcreCompile("^cmd_(\\d+)\\.il$"))
 defvar(ACL_mcpToolPrefixRe   pcreCompile("^.*__"))
 defvar(ACL_mcpAllegroToolRe  pcreCompile("^mcp__allegro__allegro_"))
-defvar(ACL_xmlTagRe          pcreCompile("<[^>]+>"))
 defvar(ACL_trimWSRe          pcreCompile("^\\s+|\\s+$"))
 defvar(ACL_collapseWSRe      pcreCompile("\\s+"))
 defvar(ACL_journalTSRe       pcreCompile("^\\\\[te] \\(\\d+:\\d+:\\d+\\) ?"))
@@ -727,7 +719,8 @@ procedure(ACL_sortSessionsByTime(sessions)
 ; ============================================================
 
 procedure(ACL_startClaude(@optional resumeId fork)
-  let((cmd promptFile fp installRoot projectDir args mcpConfigFile)
+  let((cmd promptFile fp installRoot siteDir pcbenvDir projectDir args
+       mcpConfigFile)
     ACL_stopClaude()
     ACL_createDirP(ACL_homeDir)
     createDir(ACL_notesDir)
@@ -758,25 +751,24 @@ procedure(ACL_startClaude(@optional resumeId fork)
       ; so the cached docs (if any) get concatenated onto our own
       ; prompt and passed via a single flag.
       unless(ACL_fast
-        let(((doc ACL_findOrPlanDocs()))
-          when(isFile(doc)
-            let((sz)
-              sz = fileLength(doc)
-              cond(
-                ((sz > ACL_docCacheHardLimit)
-                 printf(strcat(
-                   "*Error* ACL: doc cache %s is %d bytes (> %d). "
-                   "Refusing to load -- claude rejects oversized prompts. "
-                   "Trim the cache or set ACL_fast = t.\n")
-                   doc sz ACL_docCacheHardLimit))
-                (t
-                  when(sz > ACL_docCacheSoftLimit
-                    printf(strcat(
-                      "*Warning* ACL: doc cache %s is %d bytes "
-                      "(soft limit %d). Approaching the prompt-too-long "
-                      "threshold; consider trimming.\n")
-                      doc sz ACL_docCacheSoftLimit))
-                  fprintf(fp "\n\n%s" ACL_replacePaths(ACL_readFile(doc)))))))))
+        letseq(((doc ACL_findOrPlanDocs())
+                (sz when(isFile(doc) fileLength(doc))))
+          cond(
+            (null(sz) nil)  ; no cache file -- skip silently
+            ((sz > ACL_docCacheHardLimit)
+             printf(strcat(
+               "*Error* ACL: doc cache %s is %d bytes (> %d). "
+               "Refusing to load -- claude rejects oversized prompts. "
+               "Trim the cache or set ACL_fast = t.\n")
+               doc sz ACL_docCacheHardLimit))
+            (t
+              when(sz > ACL_docCacheSoftLimit
+                printf(strcat(
+                  "*Warning* ACL: doc cache %s is %d bytes "
+                  "(soft limit %d). Approaching the prompt-too-long "
+                  "threshold; consider trimming.\n")
+                  doc sz ACL_docCacheSoftLimit))
+              fprintf(fp "\n\n%s" ACL_replacePaths(ACL_readFile(doc)))))))
       close(fp))
     installRoot = ACL_axlGetPath("allegro_install_root")
     siteDir = ACL_axlGetPath("allegro_site")
@@ -789,7 +781,6 @@ procedure(ACL_startClaude(@optional resumeId fork)
       "--input-format stream-json"
       "--output-format stream-json"
       "--include-partial-messages"
-      "--replay-user-messages"
       "--append-system-prompt-file" ACL_shellQuote(promptFile)
       "--mcp-config" ACL_shellQuote(mcpConfigFile)
       "--add-dir" ACL_shellQuote(installRoot)
@@ -824,9 +815,6 @@ procedure(ACL_startClaude(@optional resumeId fork)
     ACL_lastContextWindow = nil
     ACL_streamingMsgId = nil
     ACL_streamedMsgLen = nil
-    ACL_promptId = 1
-    ACL_uuidEpoch = stringToTime(getCurrentTime())
-    ACL_pendingInput = nil
     ACL_claude = ipcBeginProcess(cmd ""
       'ACL_claudeDataHandler
       lambda((id data)
@@ -844,7 +832,6 @@ procedure(ACL_claudeExitHandler(id status)
   ; postFunc registered with ipcBeginProcess. Surfaces unexpected
   ; exits in the chat log; quiet on deliberate stop (see ACL_stopClaude).
   ACL_claude = nil
-  ACL_pendingInput = nil
   unless(ACL_claudeStopRequested
     ACL_setStatus(sprintf(nil "Claude exited (status %L)" status))
     ACL_appendChat(sprintf(nil
@@ -866,7 +853,6 @@ procedure(ACL_stopClaude()
     when(ACL_claude ipcWait(ACL_claude))
     ACL_setStatus("Session ended"))
   ACL_claude = nil
-  ACL_pendingInput = nil
   when(ACL_form axlFormSetField(ACL_form "send" "Send")))
 
 procedure(ACL_ensureClaude()
@@ -877,7 +863,11 @@ procedure(ACL_ensureClaude()
   unless(ACL_claude
     ACL_startClaude(ACL_sessionId)))
 
-procedure(ACL_sendMessage(text @key (uuid nil) (isSynthetic nil) (noQuery nil))
+procedure(ACL_sendMessage(text @key (isSynthetic nil) (noQuery nil))
+  ; isSynthetic tags the message as infrastructure-emitted, not user-typed,
+  ; so claude weights it accordingly in its own context. noQuery additionally
+  ; tells claude not to spend a turn responding (used for "here's some
+  ; ambient state, fold it into your next reply" sidebar messages).
   ACL_ensureClaude()
   when(ACL_claude
     let(((pairs list(
@@ -885,10 +875,6 @@ procedure(ACL_sendMessage(text @key (uuid nil) (isSynthetic nil) (noQuery nil))
         list("message" list(
           list("role" "user")
           list("content" text))))))
-      when(and(isSynthetic null(uuid))
-        ACL_synthId++
-        uuid = sprintf(nil "synth%d" ACL_synthId))
-      when(uuid pairs = append(pairs list(list("uuid" uuid))))
       when(isSynthetic pairs = append(pairs list(list("isSynthetic" t))))
       when(noQuery pairs = append(pairs list(list("shouldQuery" 'false))))
       ipcWriteProcess(ACL_claude strcat(ACL_jsonVal(pairs) "\n")))))
@@ -1252,7 +1238,6 @@ procedure(ACL_processStreamLine(line)
     cond(
       ; System events (init, api_retry, etc.)
       (etype == "system"
-        subtype = ACL_jGet(parsed "subtype")
         cond(
           (subtype == "init"
             ACL_setStatus("Connected"))
@@ -1273,32 +1258,30 @@ procedure(ACL_processStreamLine(line)
               ACL_setStatus("Responding..."))
             (evtype == "content_block_delta"
               delta = ACL_jGet(event "delta")
-              when(delta
-                cond(
-                  (ACL_jGet(delta "type") == "text_delta"
-                    text = ACL_jGet(delta "text")
-                    when(text
-                      ; Track streamed text length per message
-                      when(ACL_streamingMsgId
-                        let(((entry assoc(ACL_streamingMsgId ACL_streamedMsgLen)))
-                          when(entry
-                            rplaca(cdr(entry) (cadr(entry) + strlen(text))))))
-                      ACL_responseBuf = strcat(ACL_responseBuf text)
-                      ACL_streamToDisplay(text)
-                      ; Save session on first text
-                      when(and(null(ACL_sessionSaved) ACL_sessionId
-                               axlGetDrawingName())
-                        ACL_addSession(ACL_sessionId list(
-                          list("board" ACL_normPath(axlGetDrawingName()))
-                          list("time" sprintf(nil "%d"
-                            stringToTime(getCurrentTime())))))
-                        ACL_sessionSaved = t
-                        ; Tell claude where its prior commands live so it
-                        ; can grep them instead of re-running discovery.
-                        ACL_sendMessage(sprintf(nil
-                          "[Session log dir: %s -- holds your prior cmd_<n>.il/.out (allegro_execute code/output) from this session (reference them as appropriate), and is your scratch space for any reports, generated scripts, or working files the user might want to inspect via the Files... button.]"
-                          ACL_sessionLogDir)
-                          ?isSynthetic t ?noQuery t)))))))
+              when(and(delta ACL_jGet(delta "type") == "text_delta")
+                text = ACL_jGet(delta "text")
+                when(text
+                  ; Track streamed text length per message
+                  when(ACL_streamingMsgId
+                    let(((entry assoc(ACL_streamingMsgId ACL_streamedMsgLen)))
+                      when(entry
+                        rplaca(cdr(entry) (cadr(entry) + strlen(text))))))
+                  ACL_responseBuf = strcat(ACL_responseBuf text)
+                  ACL_streamToDisplay(text)
+                  ; Save session on first text
+                  when(and(null(ACL_sessionSaved) ACL_sessionId
+                           axlGetDrawingName())
+                    ACL_addSession(ACL_sessionId list(
+                      list("board" ACL_normPath(axlGetDrawingName()))
+                      list("time" sprintf(nil "%d"
+                        stringToTime(getCurrentTime())))))
+                    ACL_sessionSaved = t
+                    ; Tell claude where its prior commands live so it
+                    ; can grep them instead of re-running discovery.
+                    ACL_sendMessage(sprintf(nil
+                      "[Session log dir: %s -- holds your prior cmd_<n>.il/.out (allegro_execute code/output) from this session (reference them as appropriate), and is your scratch space for any reports, generated scripts, or working files the user might want to inspect via the Files... button.]"
+                      ACL_sessionLogDir)
+                      ?isSynthetic t ?noQuery t)))))
             (evtype == "content_block_start"
               cblock = ACL_jGet(event "content_block")
               cond(
@@ -1358,27 +1341,6 @@ procedure(ACL_processStreamLine(line)
                 ACL_streamToDisplay(newText))
               when(entry
                 rplaca(cdr(entry) strlen(fullText)))))))
-      ; Replayed messages: skip synthetic, show everything else
-      (etype == "user"
-        let((uuid msg content)
-          uuid = or(ACL_jGet(parsed "uuid") "")
-          msg = ACL_jGet(parsed "message")
-          content = when(msg ACL_jGet(msg "content"))
-          when(and(content stringp(content))
-            unless(substring(uuid 1 5) == "synth"
-              cond(
-                (and(ACL_autoUpdateInput substring(uuid 1 4) == "user")
-                  ACL_promptId++
-                  ACL_pendingInput = nil
-                  when(ACL_form
-                    axlFormSetField(ACL_form "userinput" "")
-                    axlFormSetField(ACL_form "send" "Send")
-                    axlFormSetActiveField(ACL_form "userinput"))
-                  ACL_appendChat(sprintf(nil "\n\nYou: %s\n" content)))
-                (substring(uuid 1 4) != "user"
-                  let(((stripped pcreReplace(ACL_xmlTagRe content "" 0)))
-                    ACL_setStatus(stripped)
-                    ACL_appendChat(sprintf(nil "\n[%s]" stripped)))))))))
       ; Result (response complete)
       (etype == "result"
         let(((cost ACL_jGet(parsed "total_cost_usd"))
@@ -1417,9 +1379,6 @@ procedure(ACL_flushDisplay()
 ; ============================================================
 ; 9. SKILL Execution
 ; ============================================================
-
-procedure(ACL_stripWS(code)
-  pcreReplace(ACL_trimWSRe code "" 0))
 
 procedure(ACL_execBlock(code)
   ; Execute one SKILL block with error handling.
@@ -1548,12 +1507,6 @@ procedure(ACL_formCB(form)
     cond(
       (field == "send"
         ACL_doSend(form))
-      (field == "userinput"
-        ; If queued and text changed, re-send with same UUID
-        when(ACL_pendingInput
-          when((val != ACL_pendingInput)
-            ACL_pendingInput = val
-            ACL_sendMessage(val ?uuid sprintf(nil "user%d-%d" ACL_uuidEpoch ACL_promptId)))))
       (field == "mode"
         ACL_mode = val
         ACL_saveSettings(ACL_settingsFile ACL_currentSettings())
@@ -1584,36 +1537,29 @@ procedure(ACL_formCB(form)
 procedure(ACL_doSend(form)
   let(((text axlFormGetField(form "userinput"))
        (inManual and(ACL_mode == "manual" ACL_mcpPending)))
-    when(and(text strlen(text) > 0)
-      cond(
-        ; approve/reject are only special-cased while we're actively
-        ; holding tool calls in manual mode -- otherwise they're
-        ; ordinary chat words that should reach claude.
-        (and(inManual pcreMatchp(ACL_approveRe text))
-          axlFormSetField(form "userinput" "")
-          axlFormSetActiveField(form "userinput")
-          ACL_handleApprove(pcreSubstitute(ACL_approveRe "\\1")))
-        (and(inManual pcreMatchp(ACL_rejectRe text))
-          axlFormSetField(form "userinput" "")
-          axlFormSetActiveField(form "userinput")
-          ACL_handleReject(pcreSubstitute(ACL_rejectRe "\\1")))
-        ; Already queued - re-send if text changed
-        (ACL_pendingInput
-          unless(text == ACL_pendingInput
-            ACL_pendingInput = text
-            ACL_sendMessage(text ?uuid sprintf(nil "user%d-%d" ACL_uuidEpoch ACL_promptId))))
-        ; New message - send (queue or echo depending on auto-update mode)
-        (t
-          if(ACL_autoUpdateInput then
-            axlFormSetField(form "send" "Queued")
-          else
-            ACL_appendChat(sprintf(nil "\n\nYou: %s" text))
-            axlFormSetField(form "userinput" "")
-            axlFormSetActiveField(form "userinput"))
-          ACL_handleUserMessage(text)
-          unless(ACL_autoUpdateInput
-            ACL_promptId++
-            ACL_pendingInput = nil))))))
+    axlFormSetField(form "userinput" "")
+    axlFormSetActiveField(form "userinput")
+    cond(
+      (and(inManual pcreMatchp(ACL_approveRe text))
+        ACL_handleApprove(pcreSubstitute(ACL_approveRe "\\1")))
+      (and(inManual pcreMatchp(ACL_rejectRe text))
+        ACL_handleReject(pcreSubstitute(ACL_rejectRe "\\1")))
+      (strlen(text) > 0
+        ACL_appendChat(sprintf(nil "\n\nYou: %s" text))
+        ACL_handleUserMessage(text)))))
+
+; ============================================================
+; 12. Message Handlers
+; ============================================================
+
+procedure(ACL_handleUserMessage(text)
+  ACL_setStatus("Thinking...")
+  ACL_responseBuf = ""
+  let(((elapsed stringToTime(getCurrentTime()) - ACL_lastCmdTime))
+    when(and(ACL_lastCmdTime elapsed > 60)
+      ACL_sendMessage("[The board may have been edited. Re-query the design instead of relying on memory.]"
+        ?isSynthetic t ?noQuery t))
+    ACL_sendMessage(text)))
 
 procedure(ACL_toggleRecording(form)
   if(ACL_recording then
@@ -1632,46 +1578,6 @@ procedure(ACL_toggleRecording(form)
     ACL_appendChat(
       "\n\nRecording... Perform the action in Allegro, then click Done.")
     ACL_setStatus("Recording macro...")))
-
-; ============================================================
-; 12. Input Polling (auto-update queued messages)
-; ============================================================
-
-procedure(ACL_startInputPoll()
-  ; Schedule first poll after 500ms (one-shot, self-rescheduling)
-  axlUIWTimerAdd(nil 30 t 'ACL_pollInput))
-
-procedure(ACL_pollInput(@rest args)
-  ; Timer callback: check if queued input text has changed.
-  ; Self-terminates when ACL_pendingInput becomes nil.
-  when(and(ACL_pendingInput ACL_form)
-    let(((text axlFormGetField(ACL_form "userinput")))
-      when(text != ACL_pendingInput
-        ACL_pendingInput = text
-        ACL_sendMessage(text ?uuid sprintf(nil "user%d-%d" ACL_uuidEpoch ACL_promptId))))
-    ; Re-schedule while still queued
-    ACL_startInputPoll()))
-
-; ============================================================
-; 13. Message Handlers
-; ============================================================
-
-procedure(ACL_handleUserMessage(text)
-  ACL_setStatus("Thinking...")
-  ACL_responseBuf = ""
-  ACL_pendingInput = text
-  letseq(((elapsed stringToTime(getCurrentTime()) - ACL_lastCmdTime)
-          (prefix if(and(ACL_lastCmdTime elapsed > 60)
-                     "[The board may have been edited. Re-query the design instead of relying on memory.] "
-                     ""))
-          (userUuid sprintf(nil "user%d-%d" ACL_uuidEpoch ACL_promptId)))
-    ; Send system prefix as synthetic (not displayed, no response generated)
-    when(strlen(prefix) > 0
-      ACL_sendMessage(prefix ?isSynthetic t ?noQuery t))
-    ; Send user's actual message
-    ACL_sendMessage(text ?uuid userUuid)
-    ; Start polling for input changes (if enabled)
-    when(ACL_autoUpdateInput ACL_startInputPoll())))
 
 procedure(ACL_handleApprove(@optional (extra ""))
   ; Caller has already trimmed the leading "approve". Anything left
@@ -1718,7 +1624,7 @@ procedure(ACL_handleJournal(contents)
     ?isSynthetic t))
 
 ; ============================================================
-; 14. Session Management UI
+; 13. Session Management UI
 ; ============================================================
 
 procedure(ACL_handleSessionPick()
@@ -1873,7 +1779,7 @@ procedure(ACL_handleForkSession(sid)
         "Continuing the conversation from where you left off on that other board.")))))
 
 ; ============================================================
-; 15. Open Panel & Registration
+; 14. Open Panel & Registration
 ; ============================================================
 
 procedure(ACL_openPanel(@rest args)
@@ -1882,7 +1788,7 @@ procedure(ACL_openPanel(@rest args)
     ; opens the dialog with that text pre-populated and sends it.
     prompt = if(args buildString(args " ") "")
     when(and(ACL_form errset(axlFormDisplay(ACL_form)))
-      ; Form already exists -- just queue the prompt if any
+      ; Form already exists -- send any new prompt and reuse it.
       when(strlen(prompt) > 0
         axlFormSetField(ACL_form "userinput" prompt)
         ACL_doSend(ACL_form))
@@ -1924,7 +1830,7 @@ axlCmdRegister("claude" 'ACL_openPanel ?cmdType "general")
 regExitBefore('ACL_stopClaude)
 
 ; ============================================================
-; 16. Tests  --  run with:  ACL_runTests()
+; 15. Tests  --  run with:  ACL_runTests()
 ; ============================================================
 
 defvar(ACL_testPass 0)

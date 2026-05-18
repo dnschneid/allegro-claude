@@ -16,7 +16,7 @@ the same path independently.
 The session UUID is discovered from CLAUDE_LAUNCHER_SESSION_FILE
 (Claude CLI sets this when launching MCP servers).
 
-Protocol (Phase 1+: SKILL-driven):
+Protocol (SKILL-driven):
   1. Claude streams a tool_use block to SKILL with the full code.
   2. SKILL extracts the code and the tool_use_id, executes via
      ACL_execBlock, and writes <tool_use_id>.out to the session dir.
