@@ -261,6 +261,17 @@ defvar(ACL_claudeArgs "")            ; extra flags appended to claude CLI invoca
 defvar(ACL_extraPromptFiles nil)     ; list of paths appended to the system prompt (set in site/user init)
 defvar(ACL_enableRawLog nil)       ; helps with debugging streams
 defvar(ACL_form nil)
+defvar(ACL_sessionPickerForm nil)    ; transient session-picker dialog
+defvar(ACL_sessionPickerSids nil)    ; sids in listbox order; index 0
+                                     ; (the "+ New session" pseudo-row)
+                                     ; is held as nil
+defvar(ACL_sessionPickerSelIdx 0)    ; last selection index reported by
+                                     ; the listbox callback. Tracked so
+                                     ; Rename/Delete know which row the
+                                     ; user had highlighted at click time
+                                     ; (the button click is its own
+                                     ; field-change event and doesn't
+                                     ; carry the list's curValueInt).
 defvar(ACL_logContent nil)          ; accumulated log chunks (newest first)
 defvar(ACL_logUnflushed "")         ; log text to be flushed once ACL_sessionLogDir gets set
 defvar(ACL_logTruncLimit 12500)    ; max chars shown in form field
@@ -284,6 +295,7 @@ defvar(ACL_streamingMsgId nil)    ; message ID currently being streamed
 defvar(ACL_streamedMsgLen nil)    ; alist of (msgId . textLen) for streamed messages
 defvar(ACL_hadToolUse nil)       ; true if tool_use occurred since last text block
 defvar(ACL_resumeIsFork nil)      ; t if the current launch was --fork-session (skip session migrate)
+defvar(ACL_pendingForkName nil)   ; parent name to inherit on first-text save
 
 ; Match "approve"/"approved" (and similar light variants) at the
 ; start of the message, optionally followed by punctuation and free
@@ -679,6 +691,11 @@ procedure(ACL_shellQuote(s)
     strcat("\"" pcreReplace(ACL_doubleQuoteRe s "\\\"" 0) "\"")
     strcat("'" pcreReplace(ACL_singleQuoteRe s "'\\''" 0) "'")))
 
+procedure(ACL_formIsAlive(formHandle)
+  ; True if formHandle can be redisplayed; nil if stale (eg after a
+  ; script reload). errset traps the failed redisplay.
+  and(formHandle errset(axlFormDisplay(formHandle))))
+
 ; ============================================================
 ; 4b. Settings Persistence
 ; ============================================================
@@ -733,11 +750,15 @@ procedure(ACL_handleStaleSession(stderrLine)
   ; --resume id. Strip the id from sessions.json so we don't try to
   ; restore it next time, and clear ACL_sessionId so the next
   ; ACL_ensureClaude starts fresh instead of looping on the bad id.
+  ; Surface the failure to chat so the user sees why their restore/
+  ; fork silently became a new session.
   when(pcreMatchp(ACL_noSessionRe stderrLine)
     let(((sid pcreSubstitute(ACL_noSessionRe "\\1")))
       when(ACL_nonEmpty(sid)
         printf("ACL: removing stale session id %s from sessions.json\n" sid)
         ACL_removeSession(sid)
+        ACL_appendChat(sprintf(nil
+          "\n[claude: No conversation found with session ID: %s]\n" sid))
         when(ACL_sessionId == sid
           ACL_sessionId = nil)))))
 
@@ -757,6 +778,48 @@ procedure(ACL_sortSessionsByTime(sessions)
       let(((ta atoi(or(ACL_jGet(cadr(a) "time") "0")))
            (tb atoi(or(ACL_jGet(cadr(b) "time") "0"))))
         ta > tb))))
+
+procedure(ACL_sessionName(info)
+  ; nil for sessions saved before the "name" field existed.
+  when(info ACL_jGet(info "name")))
+
+procedure(ACL_setSessionName(sid newName)
+  ; Pass nil or "" to clear the name. Missing sid is a no-op.
+  letseq(((sessions ACL_loadSessions())
+          (entry assoc(sid sessions))
+          (info when(entry cadr(entry)))
+          (clean when(and(stringp(newName) strlen(newName) > 0) newName)))
+    when(entry
+      info = setof(p info car(p) != "name")
+      when(clean info = append(info list(list("name" clean))))
+      rplaca(cdr(entry) info)
+      ACL_saveSessions(sessions))))
+
+procedure(ACL_sessionLabel(sid info @key (currentSid nil))
+  ; Picker row text: name (or UUID prefix), board basename, time, and
+  ; a "(current)" suffix when this entry is the running session.
+  letseq(((name ACL_sessionName(info))
+          (label or(name
+                    when(and(stringp(sid) strlen(sid) >= 8)
+                      strcat(substring(sid 1 8) "..."))
+                    or(sid "?")))
+          (board ACL_basename(or(ACL_jGet(info "board") "?")))
+          (rawTime ACL_jGet(info "time"))
+          (time if(and(rawTime numberp(atoi(rawTime)))
+                   timeToString(atoi(rawTime))
+                   "?"))
+          (suffix if(sid == currentSid "  (current)" "")))
+    sprintf(nil "%s  [%s]  (%s)%s" label board time suffix)))
+
+procedure(ACL_deleteSessionFiles(sid)
+  ; Caller is responsible for ACL_removeSession on sessions.json.
+  ; SKILL's deleteDir refuses non-empty dirs, so unlink files first.
+  ; Session dirs are flat -- no recursion needed.
+  let(((dir strcat(ACL_logDir sid "/")))
+    when(isDir(dir)
+      foreach(f ACL_listDirFiles(dir)
+        deleteFile(strcat(dir f)))
+      deleteDir(dir))))
 
 ; ============================================================
 ; 6. Claude Process Management
@@ -1317,14 +1380,24 @@ procedure(ACL_processStreamLine(line)
                         rplaca(cdr(entry) (cadr(entry) + strlen(text))))))
                   ACL_responseBuf = strcat(ACL_responseBuf text)
                   ACL_streamToDisplay(text)
-                  ; Save session on first text
+                  ; Save session on first text. Forks inherit the
+                  ; parent's name via ACL_pendingForkName.
                   when(and(null(ACL_sessionSaved) ACL_sessionId
                            axlGetDrawingName())
-                    ACL_addSession(ACL_sessionId list(
-                      list("board" ACL_normPath(axlGetDrawingName()))
-                      list("time" sprintf(nil "%d"
-                        stringToTime(getCurrentTime())))))
+                    letseq(((base list(
+                              list("board" ACL_normPath(axlGetDrawingName()))
+                              list("time" sprintf(nil "%d"
+                                stringToTime(getCurrentTime())))))
+                            (info if(ACL_pendingForkName
+                                     append(base list(list("name"
+                                       ACL_pendingForkName)))
+                                     base)))
+                      ACL_addSession(ACL_sessionId info))
+                    ACL_pendingForkName = nil
                     ACL_sessionSaved = t
+                    ; Refresh the picker if it's open so the new session appears
+                    when(ACL_sessionPickerForm
+                      ACL_renderSessionPicker(?selectIdx ACL_sessionPickerSelIdx))
                     ; Tell claude where its prior commands live so it
                     ; can grep them instead of re-running discovery.
                     ACL_sendMessage(sprintf(nil
@@ -1678,34 +1751,146 @@ procedure(ACL_handleJournal(contents)
 ; ============================================================
 
 procedure(ACL_handleSessionPick()
-  prog((sessions labels sids choice sid board)
-    unless(axlGetDrawingName()
-      ACL_appendChat("No board file loaded.")
-      return(nil))
-    sessions = ACL_loadSessions()
-    unless(sessions
-      ACL_appendChat("No previous sessions. Starting new session.")
-      ACL_handleNewSession()
-      return(nil))
-    ; Build parallel lists of labels and session IDs
-    sids = mapcar('car sessions)
-    labels = mapcar(lambda((entry)
-      letseq(((info cadr(entry))
-              (board or(ACL_jGet(info "board") "?"))
-              (rawTime ACL_jGet(info "time"))
-              (time if(and(rawTime numberp(atoi(rawTime)))
-                       timeToString(atoi(rawTime))
-                       "?")))
-        sprintf(nil "%s  [%s]  (%s)" car(entry) board time)))
-      sessions)
-    labels = cons("New session" labels)
-    choice = axlUIMultipleChoice("Select a session" labels "Claude Sessions")
-    when(and(choice choice >= 0)
-      if(choice == 0 then
-        ACL_handleNewSession()
+  unless(axlGetDrawingName()
+    ACL_appendChat("No board file loaded.")
+    return(nil))
+  unless(ACL_formIsAlive(ACL_sessionPickerForm)
+    ACL_sessionPickerForm = nil
+    axlFormCreate('ACL_sessionPickerForm
+                  strcat(ACL_scriptDir "allegro_claude_sessions.form")
+                  nil 'ACL_sessionPickerCB t t))
+  when(ACL_sessionPickerForm
+    ACL_renderSessionPicker()
+    axlFormDisplay(ACL_sessionPickerForm)))
+
+procedure(ACL_renderSessionPicker(@key (selectIdx 0))
+  ; Rebuild the listbox from sessions.json. selectIdx is clamped to the
+  ; new row count.
+  letseq(((form ACL_sessionPickerForm)
+          (sessions when(form ACL_sortSessionsByTime(ACL_loadSessions())))
+          (rows mapcar(lambda((entry)
+                        ACL_sessionLabel(car(entry) cadr(entry)
+                                         ?currentSid ACL_sessionId))
+                       sessions))
+          (allRows cons("+ New session" rows))
+          (clamped min(selectIdx (length(allRows) - 1))))
+    when(form
+      ACL_sessionPickerSids = cons(nil mapcar('car sessions))
+      ACL_sessionPickerSelIdx = clamped
+      axlFormListDeleteAll(form "sessionlist")
+      axlFormListAddItem(form "sessionlist" allRows nil)
+      ; SetActiveField on a LIST resets the cursor; do it before select.
+      axlFormSetActiveField(form "sessionlist")
+      axlFormListSelect(form "sessionlist" nth(clamped allRows))
+      ACL_updateSessionPickerButtons())))
+
+procedure(ACL_selectedSessionSid()
+  ; Index 0 is the "+ New session" pseudo-row (nil); real sids follow.
+  nth(ACL_sessionPickerSelIdx ACL_sessionPickerSids))
+
+procedure(ACL_selectedIsNewSession()
+  ACL_sessionPickerSelIdx == 0)
+
+procedure(ACL_updateSessionPickerButtons()
+  ; Re-label and enable/disable Rename/Delete to match the highlighted
+  ; row. "+ New session" and the current-session row both target the
+  ; running session, so they share the "current session" label and the
+  ; "no current session yet" disabled state. Any other row targets
+  ; whichever entry is highlighted.
+  letseq(((form ACL_sessionPickerForm)
+          (selSid ACL_selectedSessionSid())
+          (targetsCurrent or(ACL_selectedIsNewSession()
+                             and(selSid selSid == ACL_sessionId)))
+          (currentInfo when(ACL_sessionId ACL_getSession(ACL_sessionId)))
+          (haveCurrent and(ACL_sessionId currentInfo)))
+    when(form
+      if(targetsCurrent then
+        axlFormSetField(form "rename" "Rename current session")
+        axlFormSetField(form "delete" "Delete current session")
+        axlFormSetFieldEditable(form "rename" haveCurrent)
+        axlFormSetFieldEditable(form "delete" haveCurrent)
       else
-        sid = nth((choice - 1) sids)
-        board = or(ACL_jGet(ACL_getSession(sid) "board") "")
+        axlFormSetField(form "rename" "Rename selected session")
+        axlFormSetField(form "delete" "Delete selected session")
+        axlFormSetFieldEditable(form "rename" t)
+        axlFormSetFieldEditable(form "delete" t)))))
+
+procedure(ACL_sessionPickerCB(form)
+  prog((field)
+    when(form->doneState != 0
+      ; Window-manager dismiss: clear refs so no later code touches a
+      ; dead form.
+      ACL_sessionPickerForm = nil
+      ACL_sessionPickerSids = nil
+      ACL_sessionPickerSelIdx = 0
+      return(t))
+    field = form->curField
+    cond(
+      (field == "sessionlist"
+        ; Cache the index; button clicks fire as their own field events
+        ; and won't see the list's curValueInt.
+        ACL_sessionPickerSelIdx = or(form->curValueInt 0)
+        ACL_updateSessionPickerButtons())
+      (field == "rename" ACL_handlePickerRename())
+      (field == "delete" ACL_handlePickerDelete())
+      (field == "restore" ACL_handlePickerRestore()))))
+
+procedure(ACL_handlePickerRename()
+  letseq(((newRow ACL_selectedIsNewSession())
+          (sid if(newRow ACL_sessionId ACL_selectedSessionSid()))
+          (info when(sid ACL_getSession(sid)))
+          (curName when(info ACL_sessionName(info))))
+    when(and(sid info)
+      letseq(((label ACL_sessionLabel(sid info ?currentSid ACL_sessionId))
+              (prompt sprintf(nil
+                "New name for session\n  %s\n(blank to clear; Enter keeps existing)"
+                label))
+              ; axlUIPrompt shows curName as a bracketed default;
+              ; bare Return returns it. No editable prefill exists.
+              (entered axlUIPrompt(prompt or(curName ""))))
+        ; nil = Cancel; empty string = explicit clear.
+        if(entered ACL_setSessionName(sid entered))
+        ; Re-render to restore focus (prompt stole it).
+        ACL_renderSessionPicker(?selectIdx ACL_sessionPickerSelIdx)))))
+
+procedure(ACL_handlePickerDelete()
+  letseq(((newRow ACL_selectedIsNewSession())
+          (sid if(newRow ACL_sessionId ACL_selectedSessionSid()))
+          (info when(sid ACL_getSession(sid))))
+    when(and(sid info)
+      letseq(((label ACL_sessionLabel(sid info ?currentSid ACL_sessionId))
+              (isCurrent sid == ACL_sessionId)
+              (msg sprintf(nil
+                "Delete this session?\n  %s\n\nThis removes the conversation log and cannot be undone.%s"
+                label
+                if(isCurrent
+                  "\n\nThe active session will stop and a new session will start."
+                  ""))))
+        when(axlUIYesNo(msg)
+          ACL_removeSession(sid)
+          ACL_deleteSessionFiles(sid)
+          if(isCurrent then
+            axlFormClose(ACL_sessionPickerForm)
+            ACL_sessionPickerForm = nil
+            ; ACL_handleNewSession handles the process tear-down and
+            ; state reset; no need to pre-stop ourselves.
+            ACL_handleNewSession()
+          else
+            ; Keep cursor in place so it lands on the next session.
+            ACL_renderSessionPicker(?selectIdx ACL_sessionPickerSelIdx)))))))
+
+procedure(ACL_handlePickerRestore()
+  ; Open the selected session: New, Restore-on-same-board, or
+  ; Fork-from-another-board. Closes the picker before handing off.
+  letseq(((newRow ACL_selectedIsNewSession())
+          (sid if(newRow nil ACL_selectedSessionSid()))
+          (info when(sid ACL_getSession(sid)))
+          (board when(info or(ACL_jGet(info "board") ""))))
+    axlFormClose(ACL_sessionPickerForm)
+    ACL_sessionPickerForm = nil
+    cond(
+      (newRow ACL_handleNewSession())
+      (and(sid info)
         if(ACL_normPath(board) == ACL_normPath(axlGetDrawingName())
           ACL_handleRestoreSession(sid)
           ACL_handleForkSession(sid))))))
@@ -1743,7 +1928,13 @@ procedure(ACL_findOrPlanDocs()
 
 procedure(ACL_handleNewSession()
   ACL_sessionId = nil
+  ; Drop the previous session's dir so logFileAppend buffers into
+  ; logUnflushed until the init handler assigns the new sid's dir.
+  ; Otherwise the "Starting new session..." line and any warnings
+  ; here land in the OLD session's log.txt while claude is launching.
+  ACL_sessionLogDir = ACL_logDir
   ACL_sessionSaved = nil
+  ACL_pendingForkName = nil
   ACL_logReset()
   ACL_startClaude()
   ACL_appendChat("Starting new session...")
@@ -1798,11 +1989,13 @@ procedure(ACL_handleRestoreSession(sid)
       if(null(ACL_sessionId) then
         ACL_handleNewSession()
       else
-        ACL_appendChat(strcat(
-          "\n\nRestored session: " sid "\n"
-          "Continuing the conversation from where you left off on this board.\n"
-          "If you want to start fresh, use the Session... button and choose 'New session'.")
-          ?toFile nil)
+        letseq(((name ACL_sessionName(info))
+                (label if(name strcat("\"" name "\" (" sid ")") sid)))
+          ACL_appendChat(strcat(
+            "\n\nRestored session: " label "\n"
+            "Continuing the conversation from where you left off on this board.\n"
+            "If you want to start fresh, use the Session... button and choose 'New session'.")
+            ?toFile nil))
         ACL_setStatus(ACL_readyStatus())))))
 
 procedure(ACL_handleForkSession(sid)
@@ -1812,14 +2005,18 @@ procedure(ACL_handleForkSession(sid)
       ACL_appendChat(sprintf(nil "Session not found: %s" sid))
       return(nil))
     oldBoard = or(ACL_jGet(info "board") "unknown")
-    ; Reset save state so the fork registers itself with the CURRENT
-    ; board (not the parent's) on its first text response.
-    ACL_sessionId = nil
+    ; Seed sessionId with the parent so init can find the parent log
+    ; dir to copy. Cleared sessionSaved makes the fork register under
+    ; the CURRENT board on first text. pendingForkName carries the name.
+    ; Reset sessionLogDir so pre-init chat lines (Forked message,
+    ; target-board sendMessage) buffer rather than landing in parent.
+    ACL_pendingForkName = ACL_sessionName(info)
+    ACL_sessionId = sid
+    ACL_sessionLogDir = ACL_logDir
     ACL_sessionSaved = nil
     ACL_logReset()
     ACL_startClaude(sid t)
-    ; If claude rejected the --resume id, fall through to a fresh
-    ; session so the user isn't left staring at a dead dialog.
+    ; Stderr handler clears sessionId if claude rejected --resume.
     if(null(ACL_sessionId) then
       ACL_handleNewSession()
     else
@@ -1838,18 +2035,18 @@ procedure(ACL_handleForkSession(sid)
 ; ============================================================
 
 procedure(ACL_openPanel(@rest args)
-  prog((formFile prompt)
+  prog((prompt)
     ; Any args become the initial prompt: typing `claude show me the netlist`
     ; opens the dialog with that text pre-populated and sends it.
     prompt = if(args buildString(args " ") "")
-    when(and(ACL_form errset(axlFormDisplay(ACL_form)))
-      ; Form already exists -- send any new prompt and reuse it.
+    when(ACL_formIsAlive(ACL_form)
       when(strlen(prompt) > 0
         axlFormSetField(ACL_form "userinput" prompt)
         ACL_doSend(ACL_form))
       return(t))
-    formFile = strcat(ACL_scriptDir "allegro_claude.form")
-    ACL_form = axlFormCreate('ACL_form formFile nil 'ACL_formCB t t)
+    ACL_form = nil
+    ACL_form = axlFormCreate('ACL_form strcat(ACL_scriptDir "allegro_claude.form")
+                             nil 'ACL_formCB t t)
     when(ACL_form
       axlFormDefaultButton(ACL_form "send")
       ACL_applySettings(ACL_loadSettings(ACL_settingsFile))
@@ -1881,6 +2078,13 @@ procedure(ACL_openPanel(@rest args)
       when(strlen(prompt) > 0
         axlFormSetField(ACL_form "userinput" prompt)
         ACL_doSend(ACL_form)))))
+
+; Reload orphans any open dialogs (callbacks point at the old code).
+; Close them so the next open rebuilds against the new procedures.
+when(ACL_form errset(axlFormClose(ACL_form)))
+when(ACL_sessionPickerForm errset(axlFormClose(ACL_sessionPickerForm)))
+ACL_form = nil
+ACL_sessionPickerForm = nil
 
 axlCmdRegister("claude" 'ACL_openPanel ?cmdType "general")
 regExitBefore('ACL_stopClaude)
@@ -2532,6 +2736,56 @@ procedure(ACL_runTests()
     ACL_sessionId = savedSid
     deleteFile(ACL_sessionsFile)
     ACL_sessionsFile = savedFile)
+
+  printf("\n--- Session names ---\n")
+  let(((savedFile ACL_sessionsFile) (savedLogDir ACL_logDir)
+       (savedSid ACL_sessionId)
+       tmpDir lbl1 lbl2 lbl3 sample dir)
+    ACL_sessionsFile = strcat(ACL_homeDir "sessions_name_test.json")
+    tmpDir = strcat(ACL_homeDir "logs_name_test/")
+    ACL_createDirP(tmpDir)
+    ACL_logDir = tmpDir
+    sample = list(
+      list("named-sid" list(list("board" "/tmp/x.brd") list("time" "100")
+                            list("name" "my favourite")))
+      list("plain-sid" list(list("board" "/tmp/y.brd") list("time" "200"))))
+    ACL_saveSessions(sample)
+    ACL_check("name field read back"
+      ACL_sessionName(ACL_getSession("named-sid")) "my favourite")
+    ACL_check("name absent -> nil"
+      ACL_sessionName(ACL_getSession("plain-sid")) nil)
+    ACL_setSessionName("plain-sid" "renamed")
+    ACL_check("setSessionName persists"
+      ACL_sessionName(ACL_getSession("plain-sid")) "renamed")
+    ACL_setSessionName("plain-sid" "")
+    ACL_check("blank clears name"
+      ACL_sessionName(ACL_getSession("plain-sid")) nil)
+    ACL_setSessionName("no-such-sid" "ignored")
+    ACL_check("no entry created for missing sid"
+      assoc("no-such-sid" ACL_loadSessions()) nil)
+    lbl1 = ACL_sessionLabel("named-sid" ACL_getSession("named-sid"))
+    ACL_checkTrue("label uses name when set"
+      nindex(lbl1 "my favourite"))
+    lbl2 = ACL_sessionLabel("plain-sid" ACL_getSession("plain-sid"))
+    ACL_checkTrue("label falls back to uuid prefix"
+      nindex(lbl2 "plain-si"))
+    lbl3 = ACL_sessionLabel("named-sid" ACL_getSession("named-sid")
+                             ?currentSid "named-sid")
+    ACL_checkTrue("label marks current"
+      nindex(lbl3 "(current)"))
+    dir = strcat(ACL_logDir "named-sid/")
+    ACL_createDirP(dir)
+    ACL_writeFile(strcat(dir "log.txt") "old log\n")
+    ACL_writeFile(strcat(dir "cmd_1.il") "(plus 1 1)")
+    ACL_deleteSessionFiles("named-sid")
+    ACL_check("deleteSessionFiles removes dir" isDir(dir) nil)
+    ACL_deleteSessionFiles("no-dir-sid")
+    ACL_check("deleteSessionFiles no-op on missing dir" t t)
+    deleteFile(ACL_sessionsFile)
+    when(isDir(tmpDir) deleteDir(tmpDir))
+    ACL_sessionsFile = savedFile
+    ACL_logDir = savedLogDir
+    ACL_sessionId = savedSid)
 
   printf("\n--- Session fork ---\n")
   ; Drive ACL_processStreamLine with a synthetic init event and check

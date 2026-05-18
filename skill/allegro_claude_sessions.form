@@ -1,0 +1,47 @@
+# SPDX-FileCopyrightText: (C) 2026 Meta Platforms Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+# Session picker dialog: list of sessions + Rename / Delete / Restore / Cancel.
+
+FILE_TYPE=FORM_DEFN VERSION=2
+
+FORM FIXED_FONT
+FIXED
+PORT 80 22
+HEADER "Claude Sessions"
+
+DEFAULT restore
+
+TILE
+
+FIELD sessionlist
+FLOC 0 0
+LIST "" 80 18
+FSIZE 80 18
+ENDFIELD
+
+FIELD rename
+FLOC 0 19
+MENUBUTTON "Rename selected session" 28 2
+ENDFIELD
+
+FIELD delete
+FLOC 28 19
+MENUBUTTON "Delete selected session" 28 2
+ENDFIELD
+
+FIELD restore
+FLOC 69 19
+MENUBUTTON "Open" 11 2
+ENDFIELD
+
+FLEX sessionlist 0 0 1 1
+FLEX rename 0 1 0 0
+FLEX delete 0 1 0 0
+FLEX restore 1 1 0 0
+FLEX cancel 1 1 0 0
+FLEXMODE StandButtons
+
+ENDTILE
+
+ENDFORM
