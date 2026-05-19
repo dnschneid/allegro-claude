@@ -296,6 +296,8 @@ defvar(ACL_streamedMsgLen nil)    ; alist of (msgId . textLen) for streamed mess
 defvar(ACL_hadToolUse nil)       ; true if tool_use occurred since last text block
 defvar(ACL_resumeIsFork nil)      ; t if the current launch was --fork-session (skip session migrate)
 defvar(ACL_pendingForkName nil)   ; parent name to inherit on first-text save
+defvar(ACL_claudeBusy nil)        ; t between message_start and result
+defvar(ACL_pendingChatQueue nil)  ; user msgs shown as "Queued:" until flush
 
 ; Match "approve"/"approved" (and similar light variants) at the
 ; start of the message, optionally followed by punctuation and free
@@ -585,19 +587,59 @@ procedure(ACL_logString()
   buildString(reverse(ACL_logContent) ""))
 
 procedure(ACL_logTail(n)
-  prog((lines count result chunk)
+  ; Reserve slots for the queue rows (one each, plus a blank separator)
+  ; so queued entries stay visible even when the log is long.
+  prog((lines count result chunk reserved budget)
+    reserved = if(ACL_pendingChatQueue (1 + length(ACL_pendingChatQueue)) 0)
+    budget = max(1 (n - reserved))
     lines = ACL_logContent
     count = 0
     result = ""
-    while(and(lines count < n)
+    while(and(lines count < budget)
       chunk = car(lines)
       when(strlen(result) + strlen(chunk) > ACL_logTruncLimit
-        return(strcat("...\n" result)))
+        return(ACL_withPendingChat(strcat("...\n" result))))
       result = strcat(chunk result)
       when(substring(chunk strlen(chunk) 1) == "\n"
         count++)
       lines = cdr(lines))
-    return(if(lines strcat("...\n" result) result))))
+    return(ACL_withPendingChat(
+      if(lines strcat("...\n" result) result)))))
+
+procedure(ACL_withPendingChat(tail)
+  ; Append queued user msgs (panel-only, not on disk) to the tail.
+  ; Leading "\n\n" separates from prior log; subsequent entries get
+  ; one newline so the queue reads as a tight block.
+  if(ACL_pendingChatQueue
+    strcat(tail "\n\n"
+      buildString(mapcar(lambda((s) strcat("Queued: " s)) ACL_pendingChatQueue)
+                  "\n") "\n")
+    tail))
+
+procedure(ACL_enqueueChatLine(text)
+  ACL_pendingChatQueue = append1(ACL_pendingChatQueue text)
+  ; If claude isn't busy, the message lands directly in the log; the
+  ; "Queued:" decoration only appears while it's actually waiting.
+  if(ACL_claudeBusy
+    when(ACL_form
+      axlFormSetField(ACL_form "chatlog" ACL_logTail(ACL_logLineLimit)))
+    ACL_flushPendingChat()))
+
+procedure(ACL_flushPendingChat(@key (one nil))
+  ; Move queued lines into log.txt as "You: ...". With ?one t, only
+  ; the oldest entry flushes -- matches claude's behavior of consuming
+  ; one queued message per turn-end (vs. all at tool-end).
+  letseq(((all ACL_pendingChatQueue)
+          (q if(one
+                when(all list(car(all)))
+                all))
+          (remaining if(one cdr(all) nil)))
+    ACL_pendingChatQueue = remaining
+    foreach(text q
+      ACL_appendChat(sprintf(nil "\n\nYou: %s" text)))))
+
+procedure(ACL_dropPendingChat()
+  ACL_pendingChatQueue = nil)
 
 procedure(ACL_logReset()
   ; Drop the in-memory log + clear the chat panel.
@@ -922,6 +964,8 @@ procedure(ACL_startClaude(@optional resumeId fork)
     ACL_lastContextWindow = nil
     ACL_streamingMsgId = nil
     ACL_streamedMsgLen = nil
+    ACL_claudeBusy = nil
+    ACL_dropPendingChat()
     ACL_claude = ipcBeginProcess(cmd ""
       'ACL_claudeDataHandler
       lambda((id data)
@@ -939,11 +983,14 @@ procedure(ACL_claudeExitHandler(id status)
   ; postFunc registered with ipcBeginProcess. Surfaces unexpected
   ; exits in the chat log; quiet on deliberate stop (see ACL_stopClaude).
   ACL_claude = nil
+  ACL_claudeBusy = nil
   unless(ACL_claudeStopRequested
     ACL_setStatus(sprintf(nil "Claude exited (status %L)" status))
     ACL_appendChat(sprintf(nil
       "\n\n[Claude process exited unexpectedly (status %L). Send any message to restart.]"
       status)))
+  ; Surface unsent queued lines so they're not silently lost.
+  ACL_flushPendingChat()
   ACL_claudeStopRequested = nil
   when(ACL_form axlFormSetField(ACL_form "send" "Send")))
 
@@ -960,6 +1007,8 @@ procedure(ACL_stopClaude()
     when(ACL_claude ipcWait(ACL_claude))
     ACL_setStatus("Session ended"))
   ACL_claude = nil
+  ACL_claudeBusy = nil
+  ACL_flushPendingChat()
   when(ACL_form axlFormSetField(ACL_form "send" "Send")))
 
 procedure(ACL_ensureClaude()
@@ -977,6 +1026,9 @@ procedure(ACL_sendMessage(text @key (isSynthetic nil) (noQuery nil))
   ; ambient state, fold it into your next reply" sidebar messages).
   ACL_ensureClaude()
   when(ACL_claude
+    ; Claude will respond unless explicitly told not to -- mark busy so
+    ; user messages typed before the first stream event get queued.
+    unless(noQuery ACL_claudeBusy = t)
     let(((pairs list(
         list("type" "user")
         list("message" list(
@@ -1354,6 +1406,7 @@ procedure(ACL_processStreamLine(line)
           (subtype == "init"
             ACL_setStatus("Connected"))
           (subtype == "status"
+            ACL_claudeBusy = t
             ACL_setStatus("Thinking..."))))
       ; Stream events (text deltas, tool use, etc.)
       (etype == "stream_event"
@@ -1367,6 +1420,7 @@ procedure(ACL_processStreamLine(line)
                 ACL_streamingMsgId = msgId
                 when(and(msgId null(assoc(msgId ACL_streamedMsgLen)))
                   ACL_streamedMsgLen = cons(list(msgId 0) ACL_streamedMsgLen)))
+              ACL_claudeBusy = t
               ACL_setStatus("Responding..."))
             (evtype == "content_block_delta"
               delta = ACL_jGet(event "delta")
@@ -1413,10 +1467,10 @@ procedure(ACL_processStreamLine(line)
                     pcreReplace(ACL_mcpToolPrefixRe
                       or(ACL_jGet(cblock "name") "tool") "" 0))))
                 (and(cblock ACL_jGet(cblock "type") == "text")
-                  ; Add separator only if a tool_use occurred since last text
-                  when(ACL_hadToolUse
-                    ACL_logWrite("\n")
-                    ACL_hadToolUse = nil))))
+                  ; Blank line before text that follows other content
+                  ; (prior turn, tool, prior text block).
+                  when(ACL_logContent ACL_logWrite("\n\n"))
+                  ACL_hadToolUse = nil)))
             (evtype == "content_block_stop"
               ACL_setStatus("Thinking...")))))
       ; Assistant message (complete, non-streaming). Skip text already
@@ -1463,12 +1517,15 @@ procedure(ACL_processStreamLine(line)
                 ACL_streamToDisplay(newText))
               when(entry
                 rplaca(cdr(entry) strlen(fullText)))))))
-      ; Result (response complete)
+      ; Result (response complete). Claude Code emits spurious empty
+      ; result events (num_turns=0, stop_reason=null) on resume/init;
+      ; only the real turn-end carries a stop_reason.
       (etype == "result"
         let(((cost ACL_jGet(parsed "total_cost_usd"))
              (isErr ACL_jGet(parsed "is_error"))
              (errStatus ACL_jGet(parsed "api_error_status"))
              (errReason ACL_jGet(parsed "terminal_reason"))
+             (stopReason ACL_jGet(parsed "stop_reason"))
              (resText ACL_jGet(parsed "result")))
           ; total_cost_usd is session-cumulative within a claude run
           when(numberp(cost) ACL_sessionCostUsd = cost)
@@ -1484,8 +1541,17 @@ procedure(ACL_processStreamLine(line)
               if(errReason sprintf(nil " %s" errReason) "")
               if(and(stringp(resText) plusp(strlen(resText)))
                 sprintf(nil ": %s" resText) ""))))
-          ACL_flushDisplay()
-          ACL_onResponseComplete())))))
+          when(or(stopReason isErr)
+            ACL_onResponseComplete())))
+      ; User events carrying tool_result are how claude reports tool
+      ; completion back to itself. Flush queued user msgs here so they
+      ; land before claude's next assistant message.
+      (etype == "user"
+        letseq(((msg ACL_jGet(parsed "message"))
+                (content when(msg ACL_jGet(msg "content"))))
+          when(and(listp(content)
+                   exists(b content ACL_jGet(b "type") == "tool_result"))
+            ACL_flushPendingChat()))))))
 
 ; ============================================================
 ; 8. Display Streaming
@@ -1494,9 +1560,6 @@ procedure(ACL_processStreamLine(line)
 procedure(ACL_streamToDisplay(text)
   ACL_gotText = t
   ACL_logWrite(text))
-
-procedure(ACL_flushDisplay()
-  nil)
 
 ; ============================================================
 ; 9. SKILL Execution
@@ -1615,6 +1678,9 @@ procedure(ACL_readyStatus()
 
 procedure(ACL_onResponseComplete()
   ACL_responseBuf = ""
+  ACL_claudeBusy = nil
+  ; Claude eats one queued msg per turn end (rest stay queued).
+  ACL_flushPendingChat(?one t)
   ACL_setStatus(ACL_readyStatus()))
 
 ; ============================================================
@@ -1667,7 +1733,7 @@ procedure(ACL_doSend(form)
       (and(inManual pcreMatchp(ACL_rejectRe text))
         ACL_handleReject(pcreSubstitute(ACL_rejectRe "\\1")))
       (strlen(text) > 0
-        ACL_appendChat(sprintf(nil "\n\nYou: %s" text))
+        ACL_enqueueChatLine(text)
         ACL_handleUserMessage(text)))))
 
 ; ============================================================
@@ -1677,6 +1743,7 @@ procedure(ACL_doSend(form)
 procedure(ACL_handleUserMessage(text)
   ACL_setStatus("Thinking...")
   ACL_responseBuf = ""
+  ACL_claudeBusy = t
   let(((elapsed stringToTime(getCurrentTime()) - ACL_lastCmdTime))
     when(and(ACL_lastCmdTime elapsed > 60)
       ACL_sendMessage(
@@ -1813,7 +1880,9 @@ procedure(ACL_updateSessionPickerButtons()
         axlFormSetField(form "rename" "Rename selected session")
         axlFormSetField(form "delete" "Delete selected session")
         axlFormSetFieldEditable(form "rename" t)
-        axlFormSetFieldEditable(form "delete" t)))))
+        axlFormSetFieldEditable(form "delete" t))
+      axlFormSetField(form "restore"
+        if(ACL_selectedIsNewSession() "Create" "Open")))))
 
 procedure(ACL_sessionPickerCB(form)
   prog((field)
@@ -2047,6 +2116,8 @@ procedure(ACL_openPanel(@rest args)
     ACL_form = nil
     ACL_form = axlFormCreate('ACL_form strcat(ACL_scriptDir "allegro_claude.form")
                              nil 'ACL_formCB t t)
+    unless(ACL_form
+      printf("*Warning* ACL: axlFormCreate returned nil; reload may have left a stale handle.\n"))
     when(ACL_form
       axlFormDefaultButton(ACL_form "send")
       ACL_applySettings(ACL_loadSettings(ACL_settingsFile))
@@ -2080,9 +2151,9 @@ procedure(ACL_openPanel(@rest args)
         ACL_doSend(ACL_form)))))
 
 ; Reload orphans any open dialogs (callbacks point at the old code).
-; Close them so the next open rebuilds against the new procedures.
-when(ACL_form errset(axlFormClose(ACL_form)))
-when(ACL_sessionPickerForm errset(axlFormClose(ACL_sessionPickerForm)))
+; Close all temp windows + null our refs so axlFormCreate doesn't see
+; a stale r_form and silently re-expose the dead one.
+errset(axlUIWCloseAll())
 ACL_form = nil
 ACL_sessionPickerForm = nil
 
@@ -2972,6 +3043,54 @@ procedure(ACL_runTests()
     ACL_streamingMsgId = savedId
     ACL_logContent = savedLog
     ACL_responseBuf = savedBuf)
+
+  printf("\n--- Busy-time chat queue ---\n")
+  let(((savedQueue ACL_pendingChatQueue) (savedLog ACL_logContent)
+       (savedUnflushed ACL_logUnflushed) (savedBusy ACL_claudeBusy)
+       (savedForm ACL_form))
+    ACL_form = nil
+    ACL_logContent = nil
+    ACL_logUnflushed = ""
+    ACL_pendingChatQueue = nil
+    ; Idle: enqueue auto-flushes straight to log.
+    ACL_claudeBusy = nil
+    ACL_enqueueChatLine("idle msg")
+    ACL_check("queue: idle auto-flushed" ACL_pendingChatQueue nil)
+    ACL_check("queue: idle wrote You:"
+      ACL_logString() "\nYou: idle msg\n")
+    ; Busy: enqueue holds in queue, log unchanged.
+    ACL_logContent = nil
+    ACL_logUnflushed = ""
+    ACL_claudeBusy = t
+    ACL_enqueueChatLine("first queued")
+    ACL_enqueueChatLine("second queued")
+    ACL_enqueueChatLine("third queued")
+    ACL_check("queue: busy logContent empty" ACL_logContent nil)
+    ACL_check("queue: busy tail shows queued"
+      ACL_logTail(50) "\n\nQueued: first queued\nQueued: second queued\nQueued: third queued\n")
+    ; ?one flushes the oldest only.
+    ACL_flushPendingChat(?one t)
+    ACL_check("queue: one leaves remainder"
+      ACL_pendingChatQueue '("second queued" "third queued"))
+    ACL_check("queue: one wrote first"
+      ACL_logString() "\nYou: first queued\n")
+    ; Plain flush drains everything.
+    ACL_flushPendingChat()
+    ACL_check("queue: cleared after flush" ACL_pendingChatQueue nil)
+    ACL_check("queue: flushed as You:"
+      ACL_logString() "\nYou: first queued\n\nYou: second queued\n\nYou: third queued\n")
+    ; Drop discards without writing.
+    ACL_logContent = nil
+    ACL_logUnflushed = ""
+    ACL_enqueueChatLine("discard me")
+    ACL_dropPendingChat()
+    ACL_check("queue: drop clears" ACL_pendingChatQueue nil)
+    ACL_check("queue: drop wrote nothing" ACL_logContent nil)
+    ACL_form = savedForm
+    ACL_claudeBusy = savedBusy
+    ACL_logUnflushed = savedUnflushed
+    ACL_logContent = savedLog
+    ACL_pendingChatQueue = savedQueue)
 
   printf("\n--- IPC ---\n")
   let((proc buf ready)
