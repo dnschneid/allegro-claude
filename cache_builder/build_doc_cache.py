@@ -97,7 +97,18 @@ def main(argv: list[str] | None = None) -> int:
                              "time. Pass an explicit model to override, or '' "
                              "to fall back to --model.")
     parser.add_argument("--effort", default="high",
-                        help="Effort level for slice agents")
+                        help="Effort level for slice agents. "
+                             "Reference and concept modes both benefit "
+                             "from sustained reasoning -- 'high' produces "
+                             "richer behavior phrases and preserves "
+                             "caveats.")
+    parser.add_argument("--reference-effort", default="",
+                        help="Effort level for reference-mode slice "
+                             "agents only. Empty (default) inherits "
+                             "--effort. Setting this lower (e.g. 'low') "
+                             "tends to trade per-entry depth for broader "
+                             "index coverage -- one-line entries instead of "
+                             "behavior+caveats.")
     parser.add_argument("--inactivity-timeout", type=int, default=600,
                         help="Per-Claude-call inactivity kill timeout (s). "
                              "Survey uses 3x this (long thinking phases). "
@@ -135,6 +146,8 @@ def main(argv: list[str] | None = None) -> int:
         install_root=install_root,
         work_dir=work_dir,
         mode_models={"reference": args.reference_model} if args.reference_model
+                     else {},
+        mode_efforts={"reference": args.reference_effort} if args.reference_effort
                      else {},
     )
 

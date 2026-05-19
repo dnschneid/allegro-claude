@@ -264,14 +264,16 @@ def _run_slices_parallel(
     def _one(grp: dict):
         sys_p, usr_p = prompts_mod.build_slice_prompt(
             grp, shadow_root, gap_addendum=gap_addenda.get(grp["id"]))
-        # Per-mode model override (e.g. sonnet for reference, opus for concept).
+        # Per-mode overrides
         model = runner.mode_models.get(grp["mode"])
+        effort = runner.mode_efforts.get(grp["mode"])
         res = runner.run(
             prompt=usr_p,
             system_prompt=sys_p,
             tag=f"slice.{grp['id']}",
             retries=2,
             model=model,
+            effort=effort,
         )
         stats = RunStats(
             slice_id=grp["id"], rc=res.rc,

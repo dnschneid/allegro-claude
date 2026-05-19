@@ -55,6 +55,8 @@ class Runner:
     extra_tools: list[str] = field(default_factory=list)
     # Optional per-slice-mode model overrides (e.g. {"reference": "sonnet"})
     mode_models: dict[str, str] = field(default_factory=dict)
+    # Optional per-slice-mode effort overrides
+    mode_efforts: dict[str, str] = field(default_factory=dict)
     # Running totals across all run() calls. Threadsafe via lock.
     total_cost_usd: float = 0.0
     total_calls: int = 0
@@ -70,11 +72,13 @@ class Runner:
         retries: int = 2,
         inactivity_timeout_s: int | None = None,
         model: str | None = None,
+        effort: str | None = None,
     ) -> RunResult:
         """Run a one-shot Claude call. Returns when the process exits."""
         timeout = (inactivity_timeout_s if inactivity_timeout_s is not None
                    else self.inactivity_timeout_s)
         eff_model = model if model is not None else self.model
+        eff_effort = effort if effort is not None else self.effort
         attempt = 0
         last: RunResult | None = None
         while attempt <= retries:
@@ -87,6 +91,7 @@ class Runner:
                 extra_add_dirs=extra_add_dirs or [],
                 inactivity_timeout_s=timeout,
                 model=eff_model,
+                effort=eff_effort,
             )
             last = res
             if res.rc == 0 and not res.killed_for_inactivity:
@@ -105,6 +110,7 @@ class Runner:
         extra_add_dirs: list[Path],
         inactivity_timeout_s: int,
         model: str,
+        effort: str,
     ) -> RunResult:
         log_dir = self.work_dir / "claude_logs"
         log_dir.mkdir(exist_ok=True)
@@ -137,7 +143,7 @@ class Runner:
             "--add-dir", str(self.work_dir),
             "--add-dir", str(self.install_root),
             "--model", model,
-            "--effort", self.effort,
+            "--effort", effort,
         ]
         for d in extra_add_dirs:
             cmd += ["--add-dir", str(d)]
