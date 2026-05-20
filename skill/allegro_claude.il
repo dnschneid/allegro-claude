@@ -206,6 +206,14 @@ procedure(ACL_jsonObj(@rest pairs)
 ; 3. Global State
 ; ============================================================
 
+; Clean up any existing dialogs (callbacks point at the old code).
+when(and(boundp('ACL_sessionPickerForm) ACL_sessionPickerForm)
+  axlFormClose(ACL_sessionPickerForm)
+  ACL_sessionPickerForm = nil)
+when(and(boundp('ACL_form) ACL_form)
+  axlFormClose(ACL_form)
+  ACL_form = nil)
+
 ; Clean up any existing process from a previous load
 when(and(boundp('ACL_claude) ACL_claude)
   when(ipcIsAliveProcess(ACL_claude)
@@ -2149,13 +2157,6 @@ procedure(ACL_openPanel(@rest args)
       when(strlen(prompt) > 0
         axlFormSetField(ACL_form "userinput" prompt)
         ACL_doSend(ACL_form)))))
-
-; Reload orphans any open dialogs (callbacks point at the old code).
-; Close all temp windows + null our refs so axlFormCreate doesn't see
-; a stale r_form and silently re-expose the dead one.
-errset(axlUIWCloseAll())
-ACL_form = nil
-ACL_sessionPickerForm = nil
 
 axlCmdRegister("claude" 'ACL_openPanel ?cmdType "general")
 regExitBefore('ACL_stopClaude)
