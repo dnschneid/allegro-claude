@@ -1003,10 +1003,10 @@ procedure(ACL_claudeExitHandler(id status)
   when(ACL_form axlFormSetField(ACL_form "send" "Send")))
 
 procedure(ACL_stopClaude()
-  ; Suppress the unexpected-exit chat message in the postFunc handler
-  ; -- this exit was deliberate.
-  ACL_claudeStopRequested = t
+  ; Gate stopRequested on having a live process to kill, so a no-op
+  ; stopClaude() doesn't silence the next spawn's unexpected exit.
   when(and(ACL_claude ipcIsAliveProcess(ACL_claude))
+    ACL_claudeStopRequested = t
     ACL_setStatus("Saving session...")
     ; Windows has no POSIX signals, so we have to ipcKillProcess
     if(ACL_isWindows
