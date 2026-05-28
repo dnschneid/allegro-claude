@@ -306,6 +306,8 @@ defvar(ACL_resumeIsFork nil)      ; t if the current launch was --fork-session (
 defvar(ACL_pendingForkName nil)   ; parent name to inherit on first-text save
 defvar(ACL_claudeBusy nil)        ; t between message_start and result
 defvar(ACL_pendingChatQueue nil)  ; user msgs shown as "Queued:" until flush
+defvar(ACL_sessionTag nil)        ; per-launch handshake tag exported to claude/MCP
+defvar(ACL_sessionTagWritten nil) ; t once the tag has been stamped into the session dir
 
 ; Match "approve"/"approved" (and similar light variants) at the
 ; start of the message, optionally followed by punctuation and free
@@ -875,6 +877,22 @@ procedure(ACL_deleteSessionFiles(sid)
 ; 6. Claude Process Management
 ; ============================================================
 
+procedure(ACL_makeSessionTag()
+  ; Per-launch handshake tag exported via ACL_SESSION_TAG so the MCP
+  ; server can find this session's log dir via the acl_tag file.
+  ; Epoch seconds suffice since ACL_stopClaude waits for the prior
+  ; process to exit before the next launch.
+  sprintf(nil "acl-%d" stringToTime(getCurrentTime())))
+
+procedure(ACL_writeSessionTag()
+  ; Idempotent per launch; skipped until the init handler assigns
+  ; a real per-session dir.
+  when(and(ACL_sessionTag ACL_sessionLogDir
+           ACL_sessionLogDir != ACL_logDir
+           null(ACL_sessionTagWritten))
+    ACL_writeFileAtomic(strcat(ACL_sessionLogDir "acl_tag") ACL_sessionTag)
+    ACL_sessionTagWritten = t))
+
 procedure(ACL_startClaude(@optional resumeId fork)
   let((cmd promptFile fp installRoot siteDir pcbenvDir projectDir args
        mcpConfigFile)
@@ -974,6 +992,11 @@ procedure(ACL_startClaude(@optional resumeId fork)
     ACL_streamedMsgLen = nil
     ACL_claudeBusy = nil
     ACL_dropPendingChat()
+    ; Fresh tag exported into claude's env; MCP inherits it and
+    ; pairs us up via the acl_tag file SKILL stamps after init.
+    ACL_sessionTag = ACL_makeSessionTag()
+    ACL_sessionTagWritten = nil
+    setShellEnvVar("ACL_SESSION_TAG" ACL_sessionTag)
     ACL_claude = ipcBeginProcess(cmd ""
       'ACL_claudeDataHandler
       lambda((id data)
@@ -1402,6 +1425,8 @@ procedure(ACL_processStreamLine(line)
           ; ACL_logUnflushed).
           ACL_logFileAppend("")
           ACL_refreshLogButtons()))
+      ; Stamp the tag into the session dir so MCP can locate us.
+      ACL_writeSessionTag()
       ; Always seed cmd seq from existing files: critical for resume
       ; (sid didn't change so the block above is a no-op) and harmless
       ; for fresh sessions (dir is empty). Forks land here too after
@@ -2929,6 +2954,39 @@ procedure(ACL_runTests()
     errset(deleteFile(strcat(logDir "/cmd_7.il")))
     errset(deleteDir(logDir))
     ACL_mcpCmdSeq = savedSeq
+    ACL_sessionLogDir = savedLogDir
+    ACL_sessionId = savedSid)
+
+  printf("\n--- Session tag handshake ---\n")
+  let(((savedSid ACL_sessionId) (savedLogDir ACL_sessionLogDir)
+       (savedTag ACL_sessionTag) (savedWritten ACL_sessionTagWritten)
+       sid logDir tagPath)
+    sid = "tag-handshake-test"
+    logDir = strcat(ACL_logDir sid "/")
+    tagPath = strcat(logDir "acl_tag")
+    errset(deleteFile(tagPath))
+    errset(deleteDir(logDir))
+    let(((t1 ACL_makeSessionTag()))
+      ACL_checkTrue("tag: nonempty" and(stringp(t1) strlen(t1) > 0)))
+    ; Init lands the tag in the per-session dir.
+    ACL_sessionTag = "acl-test-tag-handshake"
+    ACL_sessionTagWritten = nil
+    ACL_sessionId = nil
+    ACL_sessionLogDir = ACL_logDir
+    ACL_processStreamLine(sprintf(nil
+      "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"%s\"}" sid))
+    ACL_check("tag: file written" isFile(tagPath) t)
+    ACL_check("tag: file contents match" ACL_readFile(tagPath) ACL_sessionTag)
+    ACL_check("tag: written flag set" ACL_sessionTagWritten t)
+    ; Second init (resume) is a no-op -- writeSessionTag short-circuits.
+    ACL_writeFile(tagPath "")
+    ACL_processStreamLine(sprintf(nil
+      "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"%s\"}" sid))
+    ACL_check("tag: idempotent on second init" ACL_readFile(tagPath) "")
+    errset(deleteFile(tagPath))
+    errset(deleteDir(logDir))
+    ACL_sessionTagWritten = savedWritten
+    ACL_sessionTag = savedTag
     ACL_sessionLogDir = savedLogDir
     ACL_sessionId = savedSid)
 

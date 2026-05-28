@@ -10,11 +10,13 @@ Layout:
 
 SKILL copies this script into ACL_homeDir before launching claude, so
 the script's own directory is the project home; the per-session log
-dir lives under logs/<sid>/. SKILL writes the .out file there from
-the same path independently.
+dir lives under logs/<sid>/.
 
-The session UUID is discovered from CLAUDE_LAUNCHER_SESSION_FILE
-(Claude CLI sets this when launching MCP servers).
+Session matchup: SKILL exports a per-launch ACL_SESSION_TAG into
+claude's env (which the MCP server inherits) and -- once claude
+reveals its real session UUID -- stamps the same tag into
+<session-dir>/acl_tag. This server scans logs/*/acl_tag for the match,
+so the handshake doesn't depend on any claude-internal state.
 
 Protocol (SKILL-driven):
   1. Claude streams a tool_use block to SKILL with the full code.
@@ -35,7 +37,6 @@ MCP stdio transport: newline-delimited JSON-RPC 2.0 messages.
 
 import json
 import os
-import re
 import sys
 import time
 
@@ -165,51 +166,79 @@ TOOLS = [
 ]
 
 BASE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
-UUID_RE = re.compile(r"\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b")
+TAG_FILE = "acl_tag"
+# Cap the wait for SKILL to stamp the tag (it does so right after
+# claude's system/init event). No cap on tool outputs -- allegro_execute
+# can run arbitrarily long SKILL.
+SESSION_TAG_TIMEOUT_S = 30.0
+POLL_INTERVAL_S = 0.01
 
 
-def discover_session_id():
-    path = os.environ.get("CLAUDE_LAUNCHER_SESSION_FILE")
-    if not path:
-        return None
+def find_session_dir_by_tag(tag):
+    # Returns the path of the session dir whose acl_tag matches, or None.
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                m = UUID_RE.search(line)
-                if m:
-                    return m.group(1)
+        entries = os.listdir(BASE_DIR)
     except OSError:
-        pass
+        return None
+    for name in entries:
+        sd = os.path.join(BASE_DIR, name)
+        tag_path = os.path.join(sd, TAG_FILE)
+        try:
+            with open(tag_path, "r", encoding="utf-8") as f:
+                if f.read().strip() == tag:
+                    return sd
+        except OSError:
+            continue
     return None
 
 
-# Resolved lazily on first tool call (Claude CLI may not have populated
-# the launcher session file yet at startup).
+# Resolved lazily on first tool call; SKILL may not have stamped
+# the tag yet at startup.
 _session_dir = None
+_session_resolve_error = None
 
 
 def session_dir():
-    global _session_dir
+    # (path, None) on success; (None, error) if unresolvable. Error is
+    # sticky so repeated tool calls don't each burn the full timeout.
+    global _session_dir, _session_resolve_error
     if _session_dir is not None:
-        return _session_dir
-    sid = None
-    # Retry briefly: claude may write the file just after spawning us
-    for _ in range(300):  # ~3s
-        sid = discover_session_id()
-        if sid:
-            break
-        time.sleep(0.01)
-    sid = sid or "unknown"
-    _session_dir = os.path.join(BASE_DIR, sid)
-    os.makedirs(_session_dir, exist_ok=True)
-    log_session(f"resolved session={sid}")
-    return _session_dir
+        return _session_dir, None
+    if _session_resolve_error is not None:
+        return None, _session_resolve_error
+    tag = os.environ.get("ACL_SESSION_TAG")
+    if not tag:
+        _session_resolve_error = (
+            "ACL_SESSION_TAG env var not set; SKILL didn't export the "
+            "session handshake tag when launching claude."
+        )
+        return None, _session_resolve_error
+    deadline = time.monotonic() + SESSION_TAG_TIMEOUT_S
+    while True:
+        sd = find_session_dir_by_tag(tag)
+        if sd:
+            _session_dir = sd
+            log_session(f"resolved session dir={sd} tag={tag}")
+            return sd, None
+        if time.monotonic() >= deadline:
+            _session_resolve_error = (
+                f"No session dir under {BASE_DIR} contains acl_tag={tag} "
+                f"after {SESSION_TAG_TIMEOUT_S:.0f}s; SKILL hasn't stamped "
+                f"the tag (claude system/init may not have fired)."
+            )
+            return None, _session_resolve_error
+        time.sleep(POLL_INTERVAL_S)
 
 
 def log_session(msg):
-    path = os.path.join(_session_dir or BASE_DIR, "mcp_server.log")
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+    # Best-effort; swallow errors so logging never breaks a tool call.
+    target = _session_dir or BASE_DIR
+    try:
+        os.makedirs(target, exist_ok=True)
+        with open(os.path.join(target, "mcp_server.log"), "a", encoding="utf-8") as f:
+            f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+    except OSError:
+        pass
 
 
 def read_message():
@@ -229,7 +258,6 @@ def send_result(msg_id, result):
 
 
 def handle_call(msg):
-    sd = session_dir()
     params = msg.get("params", {})
     meta = params.get("_meta") or {}
     tool_use_id = meta.get("claudecode/toolUseId")
@@ -243,11 +271,22 @@ def handle_call(msg):
                       "message": "Missing _meta.claudecode/toolUseId"},
         })
         return
+    sd, err = session_dir()
+    if not sd:
+        # Fail instead of hanging on a file that will never appear.
+        log_session(f"call tool_use_id={tool_use_id} aborted: {err}")
+        send_message({
+            "jsonrpc": "2.0",
+            "id": msg["id"],
+            "error": {"code": -32603,
+                      "message": f"allegro MCP: cannot resolve session dir: {err}"},
+        })
+        return
 
     log_session(f"call tool_use_id={tool_use_id}")
     out_path = os.path.join(sd, f"tool_{tool_use_id}.out")
     while not os.path.exists(out_path):
-        time.sleep(0.01)
+        time.sleep(POLL_INTERVAL_S)
 
     with open(out_path, "r", encoding="utf-8") as f:
         result = f.read()
