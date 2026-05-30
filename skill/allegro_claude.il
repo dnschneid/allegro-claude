@@ -268,6 +268,19 @@ defvar(ACL_docCacheHardLimit 2000000)  ; refuse to load above this many bytes
 defvar(ACL_claudeArgs "")            ; extra flags appended to claude CLI invocation
 defvar(ACL_extraPromptFiles nil)     ; list of paths appended to the system prompt (set in site/user init)
 defvar(ACL_enableRawLog nil)       ; helps with debugging streams
+; Model preference and runtime fallback. ACL_primaryModel is tried
+; first; if a request hits a model-specific error matched by any
+; ACL_fallbackTriggers entry, ACL_activeModel swaps to ACL_fallbackModel
+; for the rest of the Allegro session and the failed message is replayed.
+; Add more triggers via ACL_fallbackTriggers without touching internals.
+defvar(ACL_primaryModel  "opus[1m]")
+defvar(ACL_fallbackModel "claude-opus-4-7[1m]")
+defvar(ACL_activeModel   ACL_primaryModel)
+; Each entry: (label predicate(errStatus resText) -> t/nil). First match wins.
+defvar(ACL_fallbackTriggers
+  list(
+    list("API rejected role:\"system\" in messages[]"
+         'ACL_is422RoleSystemError)))
 defvar(ACL_form nil)
 defvar(ACL_sessionPickerForm nil)    ; transient session-picker dialog
 defvar(ACL_sessionPickerSids nil)    ; sids in listbox order; index 0
@@ -308,6 +321,8 @@ defvar(ACL_claudeBusy nil)        ; t between message_start and result
 defvar(ACL_pendingChatQueue nil)  ; user msgs shown as "Queued:" until flush
 defvar(ACL_sessionTag nil)        ; per-launch handshake tag exported to claude/MCP
 defvar(ACL_sessionTagWritten nil) ; t once the tag has been stamped into the session dir
+defvar(ACL_lastSent nil)          ; (text isSynthetic noQuery) of the most recent send; replayed on model fallback
+defvar(ACL_fallbackRetryPending nil) ; non-nil = the trigger label that fired; ACL_claudeDataHandler runs the relaunch after returning
 
 ; Match "approve"/"approved" (and similar light variants) at the
 ; start of the message, optionally followed by punctuation and free
@@ -971,7 +986,9 @@ procedure(ACL_startClaude(@optional resumeId fork)
         "mcp__allegro__allegro_edit_file,"
         "mcp__allegro__allegro_multi_edit_file"))
       "--disallowedTools" "AskUserQuestion,Edit,Write,NotebookEdit"
-      "--model" "opus[1m]"
+      ; Starts at ACL_primaryModel; ACL_fallbackRetry swaps to
+      ; ACL_fallbackModel after a matching error.
+      "--model" ACL_activeModel
       "--effort" "max")
     ACL_resumeIsFork = and(resumeId fork t)
     when(resumeId
@@ -1042,6 +1059,56 @@ procedure(ACL_stopClaude()
   ACL_flushPendingChat()
   when(ACL_form axlFormSetField(ACL_form "send" "Send")))
 
+; --- Model fallback on misbehaving API responses ---------------------
+;
+; Some API providers reject newer claude betas with errors that need a
+; per-Allegro-session model swap. Each ACL_fallbackTriggers predicate
+; tests one such failure pattern against the result event; the first
+; match swaps ACL_activeModel to ACL_fallbackModel, relaunches claude
+; (resuming on the same sid so prior turns survive), and replays the
+; message that triggered the error.
+
+procedure(ACL_is422RoleSystemError(errStatus resText)
+  ; HTTP 422 with role:"system" inside messages[] -- some providers
+  ; reject Anthropic's mid-conversation-system beta this way.
+  and(equal(errStatus 422)
+      stringp(resText)
+      nindex(resText "\"role\"")
+      nindex(resText "\"system\"")
+      t))
+
+procedure(ACL_findFallbackTrigger(errStatus resText)
+  ; Returns the label of the first matching trigger, or nil.
+  let((match)
+    foreach(spec ACL_fallbackTriggers
+      unless(match
+        when(funcall(cadr(spec) errStatus resText)
+          match = car(spec))))
+    match))
+
+procedure(ACL_scheduleFallbackRetry(triggerLabel)
+  ; Stash the trigger and let ACL_claudeDataHandler call ACL_fallbackRetry
+  ; after returning from the current dataHandler invocation
+  ; (axlUIWTimerAdd doesn't fire under -nograph batch mode).
+  ACL_fallbackRetryPending = or(triggerLabel t))
+
+procedure(ACL_fallbackRetry()
+  let(((trigger ACL_fallbackRetryPending)
+       (sid ACL_sessionId)
+       (replay ACL_lastSent))
+    ACL_fallbackRetryPending = nil
+    ACL_activeModel = ACL_fallbackModel
+    printf("ACL: switching to %s after %L\n" ACL_fallbackModel trigger)
+    ACL_appendChat(sprintf(nil
+      "\n[Switched to %s after API error: %L]\n"
+      ACL_fallbackModel trigger))
+    ACL_stopClaude()
+    ACL_startClaude(sid)
+    when(replay
+      ACL_sendMessage(car(replay)
+        ?isSynthetic cadr(replay)
+        ?noQuery     caddr(replay)))))
+
 procedure(ACL_ensureClaude()
   when(and(ACL_claude null(ipcIsAliveProcess(ACL_claude)))
     printf("*Warning* ACL: claude process died (exit status: %L)\n"
@@ -1060,6 +1127,8 @@ procedure(ACL_sendMessage(text @key (isSynthetic nil) (noQuery nil))
     ; Claude will respond unless explicitly told not to -- mark busy so
     ; user messages typed before the first stream event get queued.
     unless(noQuery ACL_claudeBusy = t)
+    ; Snapshot for ACL_scheduleFallbackRetry to replay if the API 422s.
+    ACL_lastSent = list(text isSynthetic noQuery)
     let(((pairs list(
         list("type" "user")
         list("message" list(
@@ -1386,7 +1455,13 @@ procedure(ACL_claudeDataHandler(id data)
           ACL_streamErrorCount++
           printf("*Warning* ACL: stream error: %L\n" errset.errset)
           axlFlushDisplay()))
-      pos = nindex(ACL_lineBuf "\n"))))
+      pos = nindex(ACL_lineBuf "\n"))
+    ; A trigger from ACL_fallbackTriggers armed this flag during line
+    ; processing; relaunch with the fallback model now that we're back
+    ; at the top of the handler (no nested dataHandler frames to
+    ; deadlock on stopClaude).
+    when(ACL_fallbackRetryPending
+      ACL_fallbackRetry())))
 
 procedure(ACL_processStreamLine(line)
   prog((parsed etype subtype sid event evtype delta text cblock)
@@ -1567,15 +1642,22 @@ procedure(ACL_processStreamLine(line)
           ACL_lastContextWindow =
             or(ACL_jGet(cadr(car(ACL_jGet(parsed "modelUsage"))) "contextWindow")
                ACL_lastContextWindow)
-          ; Surface API/terminal errors
-          when(isErr
-            ACL_appendChat(sprintf(nil "\n[Error%s%s%s]\n"
-              if(errStatus sprintf(nil " %L" errStatus) "")
-              if(errReason sprintf(nil " %s" errReason) "")
-              if(and(stringp(resText) plusp(strlen(resText)))
-                sprintf(nil ": %s" resText) ""))))
-          when(or(stopReason isErr)
-            ACL_onResponseComplete())))
+          ; Auto-fallback on a recognized model-specific API error.
+          ; Only retries while we're still on the primary; if the
+          ; fallback itself errors, we surface it normally below.
+          let(((trigger when(isErr ACL_findFallbackTrigger(errStatus resText))))
+            if(and(trigger ACL_activeModel == ACL_primaryModel)
+              ACL_scheduleFallbackRetry(trigger)
+              progn(
+                ; Surface API/terminal errors
+                when(isErr
+                  ACL_appendChat(sprintf(nil "\n[Error%s%s%s]\n"
+                    if(errStatus sprintf(nil " %L" errStatus) "")
+                    if(errReason sprintf(nil " %s" errReason) "")
+                    if(and(stringp(resText) plusp(strlen(resText)))
+                      sprintf(nil ": %s" resText) ""))))
+                when(or(stopReason isErr)
+                  ACL_onResponseComplete()))))))
       ; User events carrying tool_result are how claude reports tool
       ; completion back to itself. Flush queued user msgs here so they
       ; land before claude's next assistant message.
@@ -2990,6 +3072,89 @@ procedure(ACL_runTests()
     ACL_sessionLogDir = savedLogDir
     ACL_sessionId = savedSid)
 
+  printf("\n--- Model fallback on error ---\n")
+  let(((savedActive ACL_activeModel)
+       (savedPending ACL_fallbackRetryPending)
+       (savedLastSent ACL_lastSent)
+       (savedLogDir ACL_sessionLogDir)
+       (savedTriggers ACL_fallbackTriggers)
+       (errBody "API Error: 422 {\"detail\":[{\"type\":\"enum\",\"loc\":[\"body\",\"messages\",1,\"role\"],\"msg\":\"Input should be 'user' or 'assistant'\",\"input\":\"system\"}]}")
+       errEvent err500Event)
+    ; Surface-normal branches call appendChat; mute it so we don't
+    ; pollute a real session log.
+    ACL_sessionLogDir = nil
+    errEvent = strcat(
+      "{\"type\":\"result\",\"is_error\":true,\"api_error_status\":422,"
+      "\"terminal_reason\":\"completed\","
+      "\"result\":" ACL_jsonEscStr(errBody) "}")
+    err500Event = strcat(
+      "{\"type\":\"result\",\"is_error\":true,\"api_error_status\":500,"
+      "\"terminal_reason\":\"completed\",\"result\":\"oops\"}")
+    ; Detector: only the role+system 422 shape triggers fallback.
+    ACL_check("detect: 422 role/system" ACL_is422RoleSystemError(422 errBody) t)
+    ACL_check("detect: 422 unrelated body" ACL_is422RoleSystemError(422 "other 422") nil)
+    ACL_check("detect: 500 ignored" ACL_is422RoleSystemError(500 errBody) nil)
+    ACL_check("detect: nil status ignored" ACL_is422RoleSystemError(nil errBody) nil)
+    ACL_check("detect: nil body ignored" ACL_is422RoleSystemError(422 nil) nil)
+    ; findFallbackTrigger returns the trigger label or nil.
+    ACL_checkTrue("trigger lookup: hit"
+      ACL_findFallbackTrigger(422 errBody))
+    ACL_check("trigger lookup: miss" ACL_findFallbackTrigger(500 errBody) nil)
+    ; Stream event with the 422 arms the retry-pending flag (storing
+    ; the trigger label) and does NOT surface the error to chat.
+    ACL_activeModel = ACL_primaryModel
+    ACL_fallbackRetryPending = nil
+    ACL_processStreamLine(errEvent)
+    ACL_checkTrue("trigger: retry pending" ACL_fallbackRetryPending)
+    ACL_check("trigger: pending holds label"
+      stringp(ACL_fallbackRetryPending) t)
+    ACL_fallbackRetryPending = nil
+    ; If already on fallback, another error must NOT loop -- surface normally.
+    ACL_activeModel = ACL_fallbackModel
+    ACL_processStreamLine(errEvent)
+    ACL_check("no retry when already on fallback"
+      ACL_fallbackRetryPending nil)
+    ; An error not matching any trigger stays on the normal surface path.
+    ACL_activeModel = ACL_primaryModel
+    ACL_processStreamLine(err500Event)
+    ACL_check("no retry on untriggered error" ACL_fallbackRetryPending nil)
+    ; Custom trigger gets picked up just by mutating ACL_fallbackTriggers.
+    ACL_fallbackTriggers = list(list("custom-500-oops"
+      lambda((s r) and(equal(s 500) stringp(r) nindex(r "oops") t))))
+    ACL_activeModel = ACL_primaryModel
+    ACL_fallbackRetryPending = nil
+    ACL_processStreamLine(err500Event)
+    ACL_check("custom trigger: pending label"
+      ACL_fallbackRetryPending "custom-500-oops")
+    ACL_lastSent = savedLastSent
+    ACL_fallbackRetryPending = savedPending
+    ACL_activeModel = savedActive
+    ACL_sessionLogDir = savedLogDir
+    ACL_fallbackTriggers = savedTriggers
+    ; Drop anything appendChat buffered while sessionLogDir was nil so
+    ; it doesn't leak into the next real session's log.txt.
+    ACL_logUnflushed = "")
+
+  printf("\n--- sendMessage snapshots replay payload ---\n")
+  ; sendMessage records the last (text, isSynthetic, noQuery) so the
+  ; fallback retry can replay it after relaunching with the new model.
+  let(((savedLastSent ACL_lastSent)
+       (savedClaude ACL_claude)
+       (proc ipcBeginProcess(if(ACL_isWindows "cmd /c more" "cat") "")))
+    when(proc
+      ACL_claude = proc
+      ACL_lastSent = nil
+      ACL_sendMessage("hello world")
+      ACL_check("snapshot: text" car(ACL_lastSent) "hello world")
+      ACL_check("snapshot: not synthetic" cadr(ACL_lastSent) nil)
+      ACL_check("snapshot: not noQuery" caddr(ACL_lastSent) nil)
+      ACL_sendMessage("ambient" ?isSynthetic t ?noQuery t)
+      ACL_check("snapshot: synthetic" cadr(ACL_lastSent) t)
+      ACL_check("snapshot: noQuery" caddr(ACL_lastSent) t)
+      ipcKillProcess(proc))
+    ACL_claude = savedClaude
+    ACL_lastSent = savedLastSent)
+
   printf("\n--- Hook session_id ignored ---\n")
   ; SessionStart:resume hook events carry transient session_ids that
   ; must not be mistaken for a real sid change. Only system/init is
@@ -3179,7 +3344,8 @@ procedure(ACL_runTests()
           if(ACL_isWindows "where claude >NUL 2>&1"
             "env -u LD_LIBRARY_PATH which claude > /dev/null 2>&1"))))
        (savedFast ACL_fast)
-       (savedClaudeArgs ACL_claudeArgs))
+       (savedClaudeArgs ACL_claudeArgs)
+       (savedActiveModel ACL_activeModel))
     if(and(claudeExists car(claudeExists) == 0) then
       ; Force fast mode so the test doesn't pull in/generate the doc cache
       ACL_fast = t
@@ -3187,6 +3353,11 @@ procedure(ACL_runTests()
       ACL_claudeArgs = strcat(
         if(ACL_nonEmpty(ACL_claudeArgs) strcat(ACL_claudeArgs " ") "")
         "--no-session-persistence")
+      ; Pin to fallback so the test never exercises the auto-retry
+      ; path: --no-session-persistence breaks --resume, which
+      ; ACL_fallbackRetry uses for continuity. The retry logic itself
+      ; is unit-tested in the "Model fallback on error" section.
+      ACL_activeModel = ACL_fallbackModel
       ACL_streamErrorCount = 0
       ACL_startClaude()
       ACL_checkTrue("claude start" and(ACL_claude ipcIsAliveProcess(ACL_claude)))
@@ -3239,7 +3410,8 @@ procedure(ACL_runTests()
     else
       printf("  SKIP: claude not in PATH\n"))
     ACL_fast = savedFast
-    ACL_claudeArgs = savedClaudeArgs)
+    ACL_claudeArgs = savedClaudeArgs
+    ACL_activeModel = savedActiveModel)
 
   printf("\n=== Results: %d passed, %d failed ===\n\n" ACL_testPass ACL_testFail))
 
