@@ -22,3 +22,4 @@ while [ ! -f "$OUT" -a "$TIMEOUT" -gt 0 ]; do
 done
 
 cat "$OUT"
+echo "Test output is cached in $OUT until next run." >&2

@@ -1,15 +1,19 @@
 ; SPDX-FileCopyrightText: (C) 2026 Meta Platforms Inc.
 ; SPDX-License-Identifier: Apache-2.0
 ;
-; allegro_claude.il -- SKILL Claude integration
+; allegro_claude.il -- SKILL coding-assistant integration
 ;
 ; Architecture:
-;   A long-lived `claude` process is spawned via ipcBeginProcess with
-;   --input-format stream-json and --output-format stream-json.
-;   SKILL writes JSON user messages to claude's stdin and parses
-;   streaming JSON responses from stdout via the async dataHandler.
-;   Claude has an allegro_execute skill that uses a minimal python MCP
-;   server to exchange SKILL commands and output via files.
+;   A long-lived agent CLI process is spawned via ipcBeginProcess. Two
+;   drivers exist:
+;     "claude" -- Anthropic claude CLI in stream-json mode, newline-
+;                 delimited user/assistant JSON over stdio.
+;     "codex"  -- `codex app-server` in JSON-RPC stdio mode.
+;   Each driver translates its protocol into the shared event surface
+;   (text deltas, tool_use blocks, turn end, errors) that the rest of
+;   the SKILL code already consumes.
+;   Both drivers share the same allegro MCP server (allegro_mcp.py) for
+;   SKILL execution and file IO.
 
 ; ============================================================
 ; 1. JSON Parser
@@ -214,19 +218,19 @@ when(and(boundp('ACL_form) ACL_form)
   axlFormClose(ACL_form)
   ACL_form = nil)
 
-; Clean up any existing process from a previous load
-when(and(boundp('ACL_claude) ACL_claude)
-  when(ipcIsAliveProcess(ACL_claude)
-    printf("ACL: stopping previous claude process\n")
+; Clean up any existing agent process from a previous load
+when(and(boundp('ACL_proc) ACL_proc)
+  when(ipcIsAliveProcess(ACL_proc)
+    printf("ACL: stopping previous agent process\n")
     ; Windows has no POSIX signals, so we have to ipcKillProcess
     if(ACL_isWindows
-      ipcKillProcess(ACL_claude)
-      ipcSignalProcess(ACL_claude 'TERM)))
-  when(ACL_claude ipcWait(ACL_claude))
-  ACL_claude = nil)
+      ipcKillProcess(ACL_proc)
+      ipcSignalProcess(ACL_proc 'TERM)))
+  when(ACL_proc ipcWait(ACL_proc))
+  ACL_proc = nil)
 
-defvar(ACL_claude nil)
-defvar(ACL_claudeStopRequested nil)
+defvar(ACL_proc nil)               ; the live agent subprocess (any driver)
+defvar(ACL_procStopRequested nil)
 defvar(ACL_isWindows (getShellEnvVar("OS") == "Windows_NT"))
 
 procedure(ACL_normPath(path)
@@ -262,30 +266,188 @@ procedure(ACL_pcbenvDir()
      strcat(or(getShellEnvVar("HOME")
                getShellEnvVar("USERPROFILE")) "/pcbenv")))
 
-defvar(ACL_fast nil)                ; set to t to skip preloading Allegro docs
-defvar(ACL_docCacheSoftLimit 1800000)  ; warn above this many bytes
-defvar(ACL_docCacheHardLimit 2000000)  ; refuse to load above this many bytes
-defvar(ACL_claudeArgs "")            ; extra flags appended to claude CLI invocation
-defvar(ACL_extraPromptFiles nil)     ; list of paths appended to the system prompt (set in site/user init)
-defvar(ACL_enableRawLog nil)       ; helps with debugging streams
-; Model preference and runtime fallback. ACL_primaryModel is tried
-; first; if a request hits a model-specific error matched by any
-; ACL_fallbackTriggers entry, ACL_activeModel swaps to ACL_fallbackModel
-; for the rest of the Allegro session and the failed message is replayed.
-; Add more triggers via ACL_fallbackTriggers without touching internals.
-defvar(ACL_primaryModel  "opus[1m]")
-defvar(ACL_fallbackModel "claude-opus-4-7[1m]")
-defvar(ACL_activeModel   ACL_primaryModel)
+; defvar in SKILL is an unconditional assign (unlike Common Lisp's);
+; ACL_defOpt preserves a value the user set before loading us. Guard
+; the macro install too so dev reloads don't trip the "redefined"
+; warning.
+unless(getd('ACL_defOpt)
+  defmacro(ACL_defOpt (var val)
+    `unless(boundp(',var) ,var = ,val)))
+
+ACL_defOpt(ACL_fast nil)                ; set to t to skip preloading Allegro docs
+ACL_defOpt(ACL_claudeArgs "")            ; extra flags appended to claude CLI invocation
+ACL_defOpt(ACL_codexArgs "")             ; extra flags appended to codex CLI invocation
+ACL_defOpt(ACL_extraPromptFiles nil)     ; list of paths appended to the system prompt (set in site/user init)
+ACL_defOpt(ACL_extraModels "")           ; JSON object of additional model entries (set in site/user init)
+ACL_defOpt(ACL_useBuiltinModels 'last)   ; 'last: built-ins after user entries; t: before; nil: omit entirely.
+ACL_defOpt(ACL_enableRawLog nil)       ; helps with debugging streams
+
+; ---- Model registry ----
+;
+; A JSON object keyed by short slug id (stable; persisted in
+; settings/sessions; safe to use as a filesystem name). Each value
+; is an object with keys:
+;   label    -- user-facing display name (free-form string).
+;   driver   -- "claude" or "codex".
+;   model    -- driver-specific model identifier.
+;   context  -- context window in tokens; gates the ~1.5MB doc cache.
+;   fallback -- (optional) id of another entry to swap to on a
+;               matching ACL_fallbackTriggers error.
+;   effort   -- (optional) reasoning effort. Mapped per-driver:
+;               claude -> `--effort <value>`,
+;               codex  -> `-c model_reasoning_effort=<value>`.
+;   args     -- (optional) extra CLI args appended for this entry;
+;               the slot for per-model flags a wrapper needs
+;               (e.g. `--with-proxy URL`).
+;
+; The parser accepts `'` in place of `"` so the embedded SKILL string
+; literal stays readable; literal `"` quotes also work.
+;
+; ACL_modelsJson is the built-in list. ACL_extraModels (a JSON object
+; string) is merged with it at lookup time; sites set it via their
+; ilinit to expose private models. An extra entry whose key matches a
+; built-in always replaces the built-in (regardless of order).
+; ACL_useBuiltinModels controls placement:
+;   'last (default) -- user entries first, built-ins after.
+;   t               -- built-ins first, user entries after.
+;   nil             -- omit built-ins entirely.
+defvar(ACL_modelsJson "{
+  'opus-1m':         {'label':'Claude Opus (1M)',         'driver':'claude','model':'opus[1m]',
+                      'context':1000000, 'effort':'max', 'fallback':'opus-4-7-1m'},
+  'opus-4-7-1m':     {'label':'Claude Opus 4.7 (1M)',     'driver':'claude','model':'claude-opus-4-7[1m]',
+                      'context':1000000, 'effort':'max'},
+  'opus-4-7-200k':   {'label':'Claude Opus 4.7 (200K)',   'driver':'claude','model':'claude-opus-4-7',
+                      'context':200000,  'effort':'max'},
+  'sonnet-4-6-1m':   {'label':'Claude Sonnet 4.6 (1M)',   'driver':'claude','model':'claude-sonnet-4-6[1m]',
+                      'context':1000000, 'effort':'max'},
+  'sonnet-4-6-200k': {'label':'Claude Sonnet 4.6 (200K)', 'driver':'claude','model':'claude-sonnet-4-6',
+                      'context':200000,  'effort':'max'},
+  'gpt-5-5':         {'label':'Codex GPT-5.5',            'driver':'codex', 'model':'gpt-5.5',
+                      'context':256000,  'effort':'xhigh'}
+}")
+
+defvar(ACL_modelsApostropheRe pcreCompile("'"))
+
+procedure(ACL_parseModelsJson(text)
+  ; Parse a JSON object of model entries. Allows `'` as sugar for
+  ; `"` so the embedded literal stays readable (none of our model
+  ; field values legitimately contain apostrophes). The outer `{}`
+  ; is optional so site ilinits can compose entries with `strcat`
+  ; without each fragment having to balance braces. Returns the
+  ; parsed alist (((id entry) ...)), or nil with a warning on
+  ; malformed input.
+  when(ACL_nonEmpty(text)
+    letseq(((trimmed pcreReplace(pcreCompile("^\\s+|\\s+$") text "" 0))
+            (wrapped if(or(pcreMatchp("^\\{" trimmed)
+                           pcreMatchp("^\\[" trimmed))
+                      trimmed
+                      strcat("{" trimmed "}")))
+            (cooked pcreReplace(ACL_modelsApostropheRe wrapped "\"" 0))
+            (parsed car(errset(ACL_jParse(cooked)))))
+      cond(
+        (null(parsed)
+          printf("*Warning* ACL: failed to parse models JSON\n")
+          nil)
+        (null(ACL_jsonIsAlist(car(parsed)))
+          printf("*Warning* ACL: models JSON must be an object keyed by id\n")
+          nil)
+        (t car(parsed))))))
+
+procedure(ACL_models()
+  ; Live registry merged from ACL_modelsJson and ACL_extraModels.
+  ; User entries always win on id collision; ACL_useBuiltinModels
+  ; chooses where the surviving built-ins land ('last/t/nil).
+  letseq(((user ACL_parseModelsJson(ACL_extraModels))
+          (builtins when(ACL_useBuiltinModels
+                         ACL_parseModelsJson(ACL_modelsJson)))
+          (kept setof(b builtins null(assoc(car(b) user)))))
+    cond(
+      (equal(ACL_useBuiltinModels 'last)  append(user kept))
+      (null(ACL_useBuiltinModels)         user)
+      (t                                  append(kept user)))))
+
+; The model entry selected for the running session. The car is the
+; id (slug); the cadr is the field object. Set by ACL_resolveModel
+; before any driver call.
+defvar(ACL_activeEntry nil)
+
+procedure(ACL_modelById(id)
+  ; Look up a registry entry by its id slug. Returns the full alist
+  ; entry `(id fields)` or nil on miss.
+  when(stringp(id) assoc(id ACL_models())))
+
+procedure(ACL_defaultModelEntry() car(ACL_models()))
+
+procedure(ACL_resolveModel(id)
+  ; Return the registry entry matching id, defaulting to the first
+  ; entry. Warns when id was supplied but didn't match.
+  let(((entry and(ACL_nonEmpty(id) ACL_modelById(id))))
+    cond(
+      (entry entry)
+      (t
+        when(ACL_nonEmpty(id)
+          printf("*Warning* ACL: unknown model %L; falling back to %L\n"
+            id car(ACL_defaultModelEntry())))
+        ACL_defaultModelEntry()))))
+
+procedure(ACL_entryField(entry key)
+  ; Field lookup on an entry's value object (the cdr's first item is
+  ; the field alist).
+  when(entry ACL_jGet(cadr(entry) key)))
+
+procedure(ACL_entryLabel(entry)
+  ; Falls back to the id when no `label` is supplied.
+  or(ACL_entryField(entry "label") car(entry)))
+
+procedure(ACL_activeId()
+  car(or(ACL_activeEntry ACL_defaultModelEntry())))
+
+procedure(ACL_activeDriver()
+  ACL_entryField(or(ACL_activeEntry ACL_defaultModelEntry()) "driver"))
+
+procedure(ACL_activeModelId()
+  ACL_entryField(or(ACL_activeEntry ACL_defaultModelEntry()) "model"))
+
+procedure(ACL_activeLabel()
+  ACL_entryLabel(or(ACL_activeEntry ACL_defaultModelEntry())))
+
+procedure(ACL_activeContext()
+  ; Context window in tokens for the active model; nil if unset.
+  ACL_entryField(or(ACL_activeEntry ACL_defaultModelEntry()) "context"))
+
+ACL_defOpt(ACL_docCacheRatio 1.8)
+; Acceptance ratio: inline the cache when cache_bytes / context_tokens
+; <= ratio, otherwise fall back to a system-prompt reference and let
+; the agent grep the file via $MCP_read_file. Lower for tighter
+; inlining. plans/minimal-doc-cache.md sketches a trim that would
+; let small-context models keep some inline domain guidance.
+
+procedure(ACL_docCacheFits(@optional (entry ACL_activeEntry)
+                                     (cacheBytes nil))
+  ; t when the doc cache would fit alongside the rest of the system
+  ; prompt and a real conversation. Missing context counts as "unknown,
+  ; assume yes" so legacy entries don't silently lose the cache;
+  ; missing/empty cache file counts as "doesn't apply, return t".
+  ; cacheBytes overrides the auto-detected file size (tests use this).
+  letseq(((ctx ACL_entryField(or(entry ACL_defaultModelEntry()) "context"))
+          (sz or(cacheBytes
+                 let(((path ACL_findOrPlanDocs()))
+                   when(and(path isFile(path)) fileLength(path))))))
+    or(null(ctx) null(sz)
+       (sz / float(ctx)) <= ACL_docCacheRatio)))
+
 ; Each entry: (label predicate(errStatus resText) -> t/nil). First match wins.
 defvar(ACL_fallbackTriggers
   list(
     list("API rejected role:\"system\" in messages[]"
-         'ACL_is422RoleSystemError)))
+         'ACL_isRoleSystemError)))
 defvar(ACL_form nil)
+defvar(ACL_statusText "")            ; mirrors what setStatus pushed to the form
 defvar(ACL_sessionPickerForm nil)    ; transient session-picker dialog
 defvar(ACL_sessionPickerSids nil)    ; sids in listbox order; index 0
                                      ; (the "+ New session" pseudo-row)
                                      ; is held as nil
+defvar(ACL_sessionPickerModelIds nil) ; model ids in modelchoice listbox order
 defvar(ACL_sessionPickerSelIdx 0)    ; last selection index reported by
                                      ; the listbox callback. Tracked so
                                      ; Rename/Delete know which row the
@@ -299,30 +461,34 @@ defvar(ACL_logTruncLimit 12500)    ; max chars shown in form field
 defvar(ACL_statusTruncLimit 200)   ; max chars for the status bar (sanity cap; STRFILLIN scrolls)
 defvar(ACL_logLineLimit 50)        ; max lines shown in form field
 defvar(ACL_logCodeLimit 250)       ; max chars for each code preview
+defvar(ACL_maxReadBytes 20480)     ; allegro_read_file hard cap per call
 defvar(ACL_sessionId nil)
-defvar(ACL_sessionSaved nil)       ; true after first successful reply
+defvar(ACL_sessionSaved nil)       ; true once the session entry has been written
+defvar(ACL_sessionUserMsgSeen nil) ; true once a real (non-synthetic) user msg was sent
 defvar(ACL_mode "quiet")
 defvar(ACL_lineBuf "")
-defvar(ACL_streamErrorCount 0)   ; increments when ACL_processStreamLine throws
+defvar(ACL_streamErrorCount 0)   ; increments when the driver data handler throws
 defvar(ACL_responseBuf "")
 defvar(ACL_lastCmdTime 0)
 defvar(ACL_recording nil)
 defvar(ACL_journalFile nil)
 defvar(ACL_gotText nil)          ; set to t when any text arrives
-defvar(ACL_sessionCostUsd 0.0)   ; cumulative within a claude run; cleared on (re)start
+defvar(ACL_runtimeProbe nil)     ; tests poke this with a fresh value the model can only learn via allegro_execute
+defvar(ACL_sessionCostUsd 0.0)   ; cumulative within an agent run; cleared on (re)start
+defvar(ACL_sessionWeightedTokens 0.0) ; weighted token total when cost isn't reported
 defvar(ACL_lastContextTokens 0)  ; in+cache_read+cache_creation from latest result event
 defvar(ACL_lastContextWindow nil) ; modelUsage[*].contextWindow from latest result event
 defvar(ACL_streamingMsgId nil)    ; message ID currently being streamed
 defvar(ACL_streamedMsgLen nil)    ; alist of (msgId . textLen) for streamed messages
 defvar(ACL_hadToolUse nil)       ; true if tool_use occurred since last text block
-defvar(ACL_resumeIsFork nil)      ; t if the current launch was --fork-session (skip session migrate)
+defvar(ACL_resumeIsFork nil)      ; t if the current launch was a fork (skip session migrate)
 defvar(ACL_pendingForkName nil)   ; parent name to inherit on first-text save
-defvar(ACL_claudeBusy nil)        ; t between message_start and result
+defvar(ACL_busy nil)              ; t between turn start and turn end
 defvar(ACL_pendingChatQueue nil)  ; user msgs shown as "Queued:" until flush
-defvar(ACL_sessionTag nil)        ; per-launch handshake tag exported to claude/MCP
+defvar(ACL_sessionTag nil)        ; per-launch handshake tag exported to the agent/MCP
 defvar(ACL_sessionTagWritten nil) ; t once the tag has been stamped into the session dir
 defvar(ACL_lastSent nil)          ; (text isSynthetic noQuery) of the most recent send; replayed on model fallback
-defvar(ACL_fallbackRetryPending nil) ; non-nil = the trigger label that fired; ACL_claudeDataHandler runs the relaunch after returning
+defvar(ACL_fallbackRetryPending nil) ; non-nil = the trigger label that fired; data handler runs the relaunch after returning
 
 ; Match "approve"/"approved" (and similar light variants) at the
 ; start of the message, optionally followed by punctuation and free
@@ -344,6 +510,11 @@ defvar(ACL_basenameStripRe   pcreCompile("^.*[/\\\\]"))
 defvar(ACL_lastPathSegRe     pcreCompile("/[^/]+$"))
 defvar(ACL_doubleQuoteRe     pcreCompile("\""))
 defvar(ACL_singleQuoteRe     pcreCompile("'"))
+; Windows arg escape (MSVC CRT rules): backslashes before " must be
+; doubled, the " itself becomes \"; trailing backslashes (right before
+; the closing wrapper ") must also be doubled.
+defvar(ACL_winBsBeforeQuoteRe pcreCompile("(\\\\*)\""))
+defvar(ACL_winTrailingBsRe    pcreCompile("(\\\\+)$"))
 
 ; Stream / journal / status processing.
 defvar(ACL_cmdSeqFileRe      pcreCompile("^cmd_(\\d+)\\.il$"))
@@ -366,6 +537,9 @@ defvar(ACL_promptNotesRe     pcreCompile("[$]ALLEGRO_CLAUDE_NOTES"))
 defvar(ACL_promptInstallRe   pcreCompile("[$]ALLEGRO_INSTALL_ROOT"))
 defvar(ACL_promptSiteRe      pcreCompile("[$]ALLEGRO_SITE"))
 defvar(ACL_promptPcbenvRe    pcreCompile("[$]ALLEGRO_PCBENV"))
+; Tool prefix placeholder: PROMPT.md uses `$MCP_execute` and friends;
+; each driver substitutes its own MCP-tool prefix at build time.
+defvar(ACL_promptToolPrefixRe pcreCompile("[$]MCP_"))
 
 ; ============================================================
 ; UTF-8 -> CP-1252 recoding for the form widget on Windows.
@@ -645,7 +819,7 @@ procedure(ACL_enqueueChatLine(text)
   ACL_pendingChatQueue = append1(ACL_pendingChatQueue text)
   ; If claude isn't busy, the message lands directly in the log; the
   ; "Queued:" decoration only appears while it's actually waiting.
-  if(ACL_claudeBusy
+  if(ACL_busy
     when(ACL_form
       axlFormSetField(ACL_form "chatlog" ACL_logTail(ACL_logLineLimit)))
     ACL_flushPendingChat()))
@@ -715,48 +889,89 @@ procedure(ACL_setStatus(text)
   ; status update that would clobber it. Once the queue drains or
   ; the mode changes, status is open again.
   text = ACL_recode(text)
-  when(and(ACL_form
-           or(pcreMatchp(ACL_manualStatusRe text)
-              ACL_mode != "manual"
-              null(ACL_mcpPending)))
-    axlFormSetField(ACL_form "statuslabel"
-      if(strlen(text) > ACL_statusTruncLimit
-        strcat(substring(text 1 ACL_statusTruncLimit-3) "...")
-        text))))
+  when(or(pcreMatchp(ACL_manualStatusRe text)
+          ACL_mode != "manual"
+          null(ACL_mcpPending))
+    ACL_statusText = text
+    when(ACL_form
+      axlFormSetField(ACL_form "statuslabel"
+        if(strlen(text) > ACL_statusTruncLimit
+          strcat(substring(text 1 ACL_statusTruncLimit-3) "...")
+          text)))))
+
+procedure(ACL_toolPrefix(@optional (driver ACL_activeDriver()))
+  ; PROMPT.md uses `$MCP_` placeholders; the prefix differs per driver
+  ; because claude exposes MCP tools as `mcp__<server>__<tool>` while
+  ; codex hands the model the bare tool name.
+  cond(
+    (driver == "claude" "mcp__allegro__allegro_")
+    (driver == "codex"  "allegro_")
+    (t                  "allegro_")))
 
 procedure(ACL_replacePaths(text)
-  ; Replaces $PATHs with the actual paths
+  ; Replaces $PATHs with the actual paths plus $MCP_ with the current
+  ; driver's MCP tool naming convention.
   text = pcreReplace(ACL_promptNotesRe text ACL_notesDir 0)
   text = pcreReplace(ACL_promptInstallRe text
     ACL_normPath(axlGetVariable("allegro_install_root")) 0)
   text = pcreReplace(ACL_promptSiteRe text
     ACL_normPath(or(ACL_axlGetPath("allegro_site") "")) 0)
-  pcreReplace(ACL_promptPcbenvRe text
-    ACL_normPath(ACL_pcbenvDir()) 0))
+  text = pcreReplace(ACL_promptPcbenvRe text
+    ACL_normPath(ACL_pcbenvDir()) 0)
+  pcreReplace(ACL_promptToolPrefixRe text ACL_toolPrefix() 0))
 
 procedure(ACL_buildSystemPrompt()
-  ; Read PROMPT.md plus optional companion files, join with blank lines,
-  ; then substitute $ALLEGRO_INSTALL_ROOT and $ALLEGRO_CLAUDE_PATH etc.
-  ; Missing files contribute "" (via ACL_readFile) and are filtered out.
-  let((paths chunks)
-    paths = append(
-      list(strcat(ACL_scriptDir "PROMPT.md")
-           strcat(ACL_scriptDir "LESSONS.md")
-           strcat(ACL_notesDir  "LESSONS.md"))
-      setof(p ACL_extraPromptFiles stringp(p)))
-    chunks = setof(s mapcar('ACL_readFile paths) (and s (nequal s "")))
-    when(ACL_isWindows
-      chunks = append1(chunks
-        strcat("## Output Encoding\n\n"
-               "**Only use ASCII characters in responses.** Do not use Unicode "
-               "characters such as curly quotes, em dashes, bullets, or other "
-               "non-ASCII glyphs. Use straight quotes, `--`, and `*` instead.")))
+  ; PROMPT.md + LESSONS.md (+ per-site companions + windows ascii note
+  ; + offline-doc-cache reference when the cache won't be inlined),
+  ; joined with blank lines and run through ACL_replacePaths so the
+  ; $PATH / $MCP_ placeholders resolve.
+  letseq(((paths append(
+            list(strcat(ACL_scriptDir "PROMPT.md")
+                 strcat(ACL_scriptDir "LESSONS.md")
+                 strcat(ACL_notesDir  "LESSONS.md"))
+            setof(p ACL_extraPromptFiles stringp(p))))
+          (chunks setof(s mapcar('ACL_readFile paths) (and s (nequal s ""))))
+          (asciiNote when(ACL_isWindows
+            strcat("## Output Encoding\n\n"
+                   "**Only use ASCII characters in responses.** Do not use Unicode "
+                   "characters such as curly quotes, em dashes, bullets, or other "
+                   "non-ASCII glyphs. Use straight quotes, `--`, and `*` instead.")))
+          (docRef unless(ACL_shouldLoadDocCache()
+            ACL_docCacheReference())))
+    when(asciiNote chunks = append1(chunks asciiNote))
+    when(docRef chunks = append1(chunks docRef))
     ACL_replacePaths(buildString(chunks "\n\n"))))
 
 procedure(ACL_shellQuote(s)
+  ; Quote one argv value for ipcBeginProcess. Both platforms have a
+  ; two-pass eat (ipcBeginProcess + the real shell), so the escape
+  ; goes through twice.
+  ; Linux: sh single-quote with '\'' escape, then pre-escape `\` and
+  ; `"` so pass-1 emits exactly the sh form we wanted.
+  ; Windows: per-arg MSVC-CRT escape (doubled BS before `"`, doubled
+  ; trailing BS), applied twice, wrapped in `\"...\"` (escaped quotes
+  ; that survive ipcBeginProcess's bare-`"` strip). Callers must
+  ; wrap the assembled command in `cmd /c "..."` (see ACL_wrapCmd)
+  ; so ipcBeginProcess treats it as one token.
   if(ACL_isWindows
-    strcat("\"" pcreReplace(ACL_doubleQuoteRe s "\\\"" 0) "\"")
-    strcat("'" pcreReplace(ACL_singleQuoteRe s "'\\''" 0) "'")))
+    let(((esc s))
+      for(i 1 2
+        esc = pcreReplace(ACL_winBsBeforeQuoteRe esc "\\1\\1\\\\\"" 0)
+        esc = pcreReplace(ACL_winTrailingBsRe esc "\\1\\1" 0))
+      strcat("\\\"" esc "\\\""))
+    let(((sh strcat("'" pcreReplace(ACL_singleQuoteRe s "'\\\\''" 0) "'")))
+      sh = pcreReplace(ACL_backslashRe sh "\\\\\\\\" 0)
+      pcreReplace(ACL_doubleQuoteRe sh "\\\\\"" 0))))
+
+procedure(ACL_wrapCmd(cmd)
+  ; Finalize a command string built from ACL_shellQuote'd tokens for
+  ; handoff to ipcBeginProcess. Linux is a no-op (sh tokenizes the
+  ; whole string and each `'...'` arg survives). Windows wraps in
+  ; `cmd /c "..."` so the outer call sees one token and inner `"`
+  ; chars are preserved through CreateProcess.
+  if(ACL_isWindows
+    sprintf(nil "cmd /c \"%s\"" cmd)
+    cmd))
 
 procedure(ACL_formIsAlive(formHandle)
   ; True if formHandle can be redisplayed; nil if stale (eg after a
@@ -783,7 +998,9 @@ procedure(ACL_saveSettings(path settings)
 procedure(ACL_currentSettings()
   list(list("mode" ACL_mode)
        list("fast" or(ACL_fast 'false))
-       list("claudeArgs" or(ACL_claudeArgs ""))))
+       list("claudeArgs" or(ACL_claudeArgs ""))
+       list("codexArgs" or(ACL_codexArgs ""))
+       list("model" or(ACL_activeId() ""))))
 
 procedure(ACL_applySettings(settings)
   let(((val ACL_jGet(settings "mode")))
@@ -792,7 +1009,12 @@ procedure(ACL_applySettings(settings)
       when(ACL_form axlFormSetField(ACL_form "mode" val))))
   ACL_fast = ACL_jGet(settings "fast")
   let(((ca ACL_jGet(settings "claudeArgs")))
-    when(stringp(ca) ACL_claudeArgs = ca)))
+    when(stringp(ca) ACL_claudeArgs = ca))
+  let(((ca ACL_jGet(settings "codexArgs")))
+    when(stringp(ca) ACL_codexArgs = ca))
+  let(((m ACL_jGet(settings "model")))
+    when(stringp(m)
+      ACL_activeEntry = ACL_resolveModel(m))))
 
 ; ============================================================
 ; 5. Session Management
@@ -812,22 +1034,27 @@ procedure(ACL_removeSession(sid)
   let(((sessions ACL_loadSessions()))
     ACL_saveSessions(remove(assoc(sid sessions) sessions))))
 
+procedure(ACL_dropStaleSession(sid label)
+  ; Forget a session id the live agent has refused. `label` names the
+  ; driver-specific error for the chat surface so the user understands
+  ; why the restore quietly turned into a new session. Returns nil.
+  when(ACL_nonEmpty(sid)
+    printf("ACL: removing stale session id %s from sessions.json\n" sid)
+    ACL_removeSession(sid)
+    ACL_appendChat(sprintf(nil
+      "\n[%s: No conversation found with session ID: %s]\n"
+      or(label "agent") sid))
+    when(ACL_sessionId == sid
+      ACL_sessionId = nil)
+    nil))
+
 procedure(ACL_handleStaleSession(stderrLine)
-  ; Called from the stderr handler when claude reports an unknown
-  ; --resume id. Strip the id from sessions.json so we don't try to
-  ; restore it next time, and clear ACL_sessionId so the next
-  ; ACL_ensureClaude starts fresh instead of looping on the bad id.
-  ; Surface the failure to chat so the user sees why their restore/
-  ; fork silently became a new session.
+  ; Called from claude's stderr handler. Match the well-known
+  ; "No conversation found ..." line, then dispatch to the shared
+  ; cleanup so the next ACL_ensureAgent starts fresh rather than
+  ; looping on the bad id.
   when(pcreMatchp(ACL_noSessionRe stderrLine)
-    let(((sid pcreSubstitute(ACL_noSessionRe "\\1")))
-      when(ACL_nonEmpty(sid)
-        printf("ACL: removing stale session id %s from sessions.json\n" sid)
-        ACL_removeSession(sid)
-        ACL_appendChat(sprintf(nil
-          "\n[claude: No conversation found with session ID: %s]\n" sid))
-        when(ACL_sessionId == sid
-          ACL_sessionId = nil)))))
+    ACL_dropStaleSession(pcreSubstitute(ACL_noSessionRe "\\1") "claude")))
 
 procedure(ACL_getSession(sid)
   cadr(assoc(sid ACL_loadSessions())))
@@ -850,6 +1077,12 @@ procedure(ACL_sessionName(info)
   ; nil for sessions saved before the "name" field existed.
   when(info ACL_jGet(info "name")))
 
+procedure(ACL_sessionModel(info)
+  ; Returns the model id stored on the session, or the registry
+  ; default for legacy entries that predate the field.
+  or(when(info ACL_jGet(info "model"))
+     car(ACL_defaultModelEntry())))
+
 procedure(ACL_setSessionName(sid newName)
   ; Pass nil or "" to clear the name. Missing sid is a no-op.
   letseq(((sessions ACL_loadSessions())
@@ -863,20 +1096,26 @@ procedure(ACL_setSessionName(sid newName)
       ACL_saveSessions(sessions))))
 
 procedure(ACL_sessionLabel(sid info @key (currentSid nil))
-  ; Picker row text: name (or UUID prefix), board basename, time, and
-  ; a "(current)" suffix when this entry is the running session.
+  ; Picker row text: name (or UUID prefix), board basename, model, time,
+  ; and a "(current)" suffix when this entry is the running session.
+  ; Models no longer in the registry get a `(!)` suffix so users see
+  ; the row will refuse to open.
   letseq(((name ACL_sessionName(info))
           (label or(name
                     when(and(stringp(sid) strlen(sid) >= 8)
                       strcat(substring(sid 1 8) "..."))
                     or(sid "?")))
           (board ACL_basename(or(ACL_jGet(info "board") "?")))
+          (modelId ACL_sessionModel(info))
+          (entry ACL_modelById(modelId))
+          (model if(entry ACL_entryLabel(entry)
+                   strcat(modelId " (!)")))
           (rawTime ACL_jGet(info "time"))
           (time if(and(rawTime numberp(atoi(rawTime)))
                    timeToString(atoi(rawTime))
                    "?"))
           (suffix if(sid == currentSid "  (current)" "")))
-    sprintf(nil "%s  [%s]  (%s)%s" label board time suffix)))
+    sprintf(nil "%s  [%s]  [%s]  (%s)%s" label board model time suffix)))
 
 procedure(ACL_deleteSessionFiles(sid)
   ; Caller is responsible for ACL_removeSession on sessions.json.
@@ -888,14 +1127,42 @@ procedure(ACL_deleteSessionFiles(sid)
         deleteFile(strcat(dir f)))
       deleteDir(dir))))
 
+procedure(ACL_maybeSaveSession()
+  ; First-text save, gated on the user actually having sent a non-
+  ; synthetic message. The synthetic boot-up ping is NOT enough -- it
+  ; would otherwise clutter sessions.json with empty entries. Once
+  ; saved, this is a no-op (ACL_sessionSaved == t).
+  when(and(null(ACL_sessionSaved) ACL_sessionUserMsgSeen
+           ACL_sessionId axlGetDrawingName())
+    letseq(((base list(
+              list("board" ACL_normPath(axlGetDrawingName()))
+              list("time" sprintf(nil "%d"
+                stringToTime(getCurrentTime())))
+              list("model" or(ACL_activeId() ""))))
+            (info if(ACL_pendingForkName
+                     append(base list(list("name"
+                       ACL_pendingForkName)))
+                     base)))
+      ACL_addSession(ACL_sessionId info))
+    ACL_pendingForkName = nil
+    ACL_sessionSaved = t
+    when(ACL_sessionPickerForm
+      ACL_renderSessionPicker(?selectIdx ACL_sessionPickerSelIdx))
+    ; Tell the agent where its prior commands live so it can grep them
+    ; instead of re-running discovery.
+    ACL_sendMessage(sprintf(nil
+      "[Session log dir: %s -- holds your prior cmd_<n>.il/.out (allegro_execute code/output) from this session (reference them as appropriate), and is your scratch space for any reports, generated scripts, or working files the user might want to inspect via the Files... button.]"
+      ACL_sessionLogDir)
+      ?isSynthetic t ?noQuery t)))
+
 ; ============================================================
-; 6. Claude Process Management
+; 6. Agent Process Management
 ; ============================================================
 
 procedure(ACL_makeSessionTag()
   ; Per-launch handshake tag exported via ACL_SESSION_TAG so the MCP
   ; server can find this session's log dir via the acl_tag file.
-  ; Epoch seconds suffice since ACL_stopClaude waits for the prior
+  ; Epoch seconds suffice since ACL_stopAgent waits for the prior
   ; process to exit before the next launch.
   sprintf(nil "acl-%d" stringToTime(getCurrentTime())))
 
@@ -908,63 +1175,148 @@ procedure(ACL_writeSessionTag()
     ACL_writeFileAtomic(strcat(ACL_sessionLogDir "acl_tag") ACL_sessionTag)
     ACL_sessionTagWritten = t))
 
-procedure(ACL_startClaude(@optional resumeId fork)
-  let((cmd promptFile fp installRoot siteDir pcbenvDir projectDir args
-       mcpConfigFile)
-    ACL_stopClaude()
-    ACL_createDirP(ACL_homeDir)
-    createDir(ACL_notesDir)
-    createDir(ACL_logDir)
-    ACL_mcpPending = nil
-    ACL_mcpCmdSeq = 0
-    ; Write MCP config for Claude CLI. The MCP server discovers its
-    ; session UUID from CLAUDE_LAUNCHER_SESSION_FILE (set by claude on
-    ; launch) and constructs its log dir relative to its own location.
-    ;
-    ; Copy allegro_mcp.py into ACL_homeDir before pointing the config
-    ; at it to avoid potential sandboxing issues.
-    mcpConfigFile = ACL_normPath(strcat(ACL_homeDir "mcp_config.json"))
-    let(((mcpScript ACL_normPath(strcat(ACL_homeDir "allegro_mcp.py"))))
-      ACL_copyFile(strcat(ACL_scriptDir "allegro_mcp.py") mcpScript)
-      fp = outfile(mcpConfigFile)
+procedure(ACL_writeMcpConfig()
+  ; Stage the MCP server script alongside its config so paths are stable
+  ; regardless of where the agent process treats as its sandbox root.
+  ; Returns the absolute path of the config file.
+  letseq(((mcpConfigFile ACL_normPath(strcat(ACL_homeDir "mcp_config.json")))
+          (mcpScript ACL_normPath(strcat(ACL_homeDir "allegro_mcp.py"))))
+    ACL_copyFile(strcat(ACL_scriptDir "allegro_mcp.py") mcpScript)
+    let(((fp outfile(mcpConfigFile)))
       when(fp
         fprintf(fp "%s" ACL_jsonObj(list("mcpServers"
           list(list("allegro" list(
             list("command" if(ACL_isWindows "python" "python3"))
             list("args" list(mcpScript))))))))
         close(fp)))
-    promptFile = ACL_normPath(strcat(ACL_homeDir "PROMPT.md"))
-    fp = outfile(promptFile)
+    mcpConfigFile))
+
+procedure(ACL_shouldLoadDocCache()
+  ; Inline the full cache only when fast mode is off AND the cache
+  ; fits the active model's window. If it doesn't fit, the system
+  ; prompt instead carries a pointer to the cache file -- see
+  ; ACL_docCacheReference.
+  and(null(ACL_fast) ACL_docCacheFits()))
+
+procedure(ACL_docCacheReference()
+  ; System-prompt snippet inserted when the doc cache exists but
+  ; doesn't fit inline. Doc reading is read-only, so the agent's
+  ; built-in file/shell tools are fine; only steer to $MCP_execute
+  ; when the result needs to land in an Allegro SKILL expression.
+  let(((path ACL_findOrPlanDocs()))
+    when(and(path isFile(path))
+      strcat("## Allegro SKILL documentation cache (offline)\n\n"
+        "A condensed Allegro SKILL reference is on disk at\n"
+        "  " path "\n\n"
+        "It does not fit in this model's context, but it IS the "
+        "authoritative offline reference for axl* functions, "
+        "object property tables, and shell-command syntax. **Always** "
+        "read or grep it with your built-in file/shell tools "
+        "before guessing a SKILL signature, trawling the raw HTML "
+        "docs, or running speculative tool calls. Use `$MCP_execute` "
+        "shell grep when you need the result inside an Allegro SKILL "
+        "expression. It is faster, more accurate, and dramatically "
+        "cheaper than trial-and-error.\n"))))
+
+procedure(ACL_writeSystemPromptFile(@key (appendDocs t))
+  ; Write the assembled system prompt (optionally with the doc cache
+  ; inlined) to a per-launch file; return its absolute path. The cache
+  ; gate lives in ACL_shouldLoadDocCache; this just respects the flag.
+  letseq(((promptFile ACL_normPath(strcat(ACL_homeDir "PROMPT.md")))
+          (fp outfile(promptFile)))
     when(fp
       fprintf(fp "%s" ACL_buildSystemPrompt())
-      ; Claude only honors the LAST --append-system-prompt-file flag,
-      ; so the cached docs (if any) get concatenated onto our own
-      ; prompt and passed via a single flag.
-      unless(ACL_fast
-        letseq(((doc ACL_findOrPlanDocs())
-                (sz when(isFile(doc) fileLength(doc))))
-          cond(
-            (null(sz) nil)  ; no cache file -- skip silently
-            ((sz > ACL_docCacheHardLimit)
-             printf(strcat(
-               "*Error* ACL: doc cache %s is %d bytes (> %d). "
-               "Refusing to load -- claude rejects oversized prompts. "
-               "Trim the cache or set ACL_fast = t.\n")
-               doc sz ACL_docCacheHardLimit))
-            (t
-              when(sz > ACL_docCacheSoftLimit
-                printf(strcat(
-                  "*Warning* ACL: doc cache %s is %d bytes "
-                  "(soft limit %d). Approaching the prompt-too-long "
-                  "threshold; consider trimming.\n")
-                  doc sz ACL_docCacheSoftLimit))
-              fprintf(fp "\n\n%s" ACL_replacePaths(ACL_readFile(doc)))))))
+      when(appendDocs
+        let(((doc ACL_findOrPlanDocs()))
+          when(and(doc isFile(doc))
+            fprintf(fp "\n\n%s" ACL_replacePaths(ACL_readFile(doc))))))
       close(fp))
+    promptFile))
+
+procedure(ACL_resetAgentState()
+  ACL_mcpPending = nil
+  ACL_mcpCmdSeq = 0
+  ACL_lineBuf = ""
+  ACL_responseBuf = ""
+  ACL_sessionCostUsd = 0.0
+  ACL_sessionWeightedTokens = 0.0
+  ACL_lastContextTokens = 0
+  ACL_lastContextWindow = nil
+  ACL_streamingMsgId = nil
+  ACL_streamedMsgLen = nil
+  ACL_busy = nil
+  ACL_dropPendingChat()
+  let(((fp outfile(strcat(ACL_homeDir "raw.log") "a")))
+    when(fp fprintf(fp "\n--- %s ---\n" getCurrentTime()) close(fp)))
+  ACL_sessionTag = ACL_makeSessionTag()
+  ACL_sessionTagWritten = nil
+  setShellEnvVar("ACL_SESSION_TAG" ACL_sessionTag))
+
+procedure(ACL_startAgent(@optional resumeId fork)
+  ; Stop any previous process and dispatch to the driver named on the
+  ; active model entry. The driver populates ACL_proc and arranges its
+  ; own data/exit handlers.
+  ACL_stopAgent()
+  ACL_createDirP(ACL_homeDir)
+  createDir(ACL_notesDir)
+  createDir(ACL_logDir)
+  ACL_resetAgentState()
+  ACL_resumeIsFork = and(resumeId fork t)
+  let(((driver ACL_activeDriver()))
+    cond(
+      (driver == "claude" ACL_claudeDriverStart(resumeId fork))
+      (driver == "codex"  ACL_codexDriverStart(resumeId fork))
+      (t
+        printf("*Error* ACL: unknown driver %L for model %L\n"
+          driver ACL_activeId())
+        ACL_setStatus("Failed to initialize!"))))
+  unless(and(ACL_proc ipcIsAliveProcess(ACL_proc))
+    ACL_setStatus("Failed to initialize!")))
+
+procedure(ACL_exitHandler(id status)
+  ; Common postFunc registered with ipcBeginProcess by both drivers.
+  ; Surfaces unexpected exits in the chat log; quiet on deliberate stop.
+  ACL_proc = nil
+  ACL_busy = nil
+  unless(ACL_procStopRequested
+    ACL_setStatus(sprintf(nil "Agent exited (status %L)" status))
+    ACL_appendChat(sprintf(nil
+      "\n\n[Agent process exited unexpectedly (status %L). Send any message to restart.]"
+      status)))
+  ACL_flushPendingChat()
+  ACL_procStopRequested = nil
+  when(ACL_form axlFormSetField(ACL_form "send" "Send")))
+
+procedure(ACL_stopAgent()
+  ; Gate stopRequested on having a live process to kill, so a no-op
+  ; stopAgent() doesn't silence the next spawn's unexpected exit.
+  when(and(ACL_proc ipcIsAliveProcess(ACL_proc))
+    ACL_procStopRequested = t
+    ACL_setStatus("Saving session...")
+    if(ACL_isWindows
+      ipcKillProcess(ACL_proc)
+      ipcSignalProcess(ACL_proc 'TERM))
+    when(ACL_proc ipcWait(ACL_proc))
+    ACL_setStatus("Session ended"))
+  ACL_proc = nil
+  ACL_busy = nil
+  ACL_flushPendingChat()
+  when(ACL_form axlFormSetField(ACL_form "send" "Send")))
+
+; --- Claude driver ---
+
+procedure(ACL_claudeDriverStart(resumeId fork)
+  let((cmd promptFile installRoot siteDir pcbenvDir projectDir args
+       mcpConfigFile modelId effort)
+    mcpConfigFile = ACL_writeMcpConfig()
+    promptFile = ACL_writeSystemPromptFile(?appendDocs ACL_shouldLoadDocCache())
     installRoot = ACL_axlGetPath("allegro_install_root")
     siteDir = ACL_axlGetPath("allegro_site")
     pcbenvDir = ACL_pcbenvDir()
     projectDir = ACL_normPath(pcreReplace(ACL_lastPathCompRe
       simplifyFilename(axlGetDrawingName()) "" 0))
+    modelId = ACL_activeModelId()
+    effort = ACL_entryField(ACL_activeEntry "effort")
     args = list(
       if(ACL_isWindows "claude -p" "env -u LD_LIBRARY_PATH claude -p")
       "--verbose"
@@ -986,95 +1338,705 @@ procedure(ACL_startClaude(@optional resumeId fork)
         "mcp__allegro__allegro_edit_file,"
         "mcp__allegro__allegro_multi_edit_file"))
       "--disallowedTools" "AskUserQuestion,Edit,Write,NotebookEdit"
-      ; Starts at ACL_primaryModel; ACL_fallbackRetry swaps to
-      ; ACL_fallbackModel after a matching error.
-      "--model" ACL_activeModel
-      "--effort" "max")
-    ACL_resumeIsFork = and(resumeId fork t)
+      "--model" modelId)
+    when(ACL_nonEmpty(effort)
+      args = append(args list("--effort" ACL_shellQuote(effort))))
     when(resumeId
       args = append1(args "--resume")
       args = append1(args resumeId)
       when(fork args = append1(args "--fork-session")))
     cmd = buildString(args " ")
+    let(((entryArgs ACL_entryField(ACL_activeEntry "args")))
+      when(ACL_nonEmpty(entryArgs)
+        cmd = strcat(cmd " " entryArgs)))
     when(ACL_nonEmpty(ACL_claudeArgs)
       cmd = strcat(cmd " " ACL_claudeArgs))
-    let(((fp outfile(strcat(ACL_homeDir "raw.log") "a")))
-      when(fp fprintf(fp "\n--- %s ---\n" getCurrentTime()) close(fp)))
-    ACL_lineBuf = ""
-    ACL_responseBuf = ""
-    ACL_sessionCostUsd = 0.0
-    ACL_lastContextTokens = 0
-    ACL_lastContextWindow = nil
-    ACL_streamingMsgId = nil
-    ACL_streamedMsgLen = nil
-    ACL_claudeBusy = nil
-    ACL_dropPendingChat()
-    ; Fresh tag exported into claude's env; MCP inherits it and
-    ; pairs us up via the acl_tag file SKILL stamps after init.
-    ACL_sessionTag = ACL_makeSessionTag()
-    ACL_sessionTagWritten = nil
-    setShellEnvVar("ACL_SESSION_TAG" ACL_sessionTag)
-    ACL_claude = ipcBeginProcess(cmd ""
-      'ACL_claudeDataHandler
+    cmd = ACL_wrapCmd(cmd)
+    ACL_proc = ipcBeginProcess(cmd ""
+      lambda((id data)
+        ACL_dispatchStreamLines(data "claude" 'ACL_processStreamLine))
       lambda((id data)
         foreach(d parseString(data "\n")
           printf("claude: %s\n" d)
           ACL_handleStaleSession(d))
         axlFlushDisplay())
-      'ACL_claudeExitHandler)
-    ipcWaitForProcess(ACL_claude)
-    unless(and(ACL_claude ipcIsAliveProcess(ACL_claude))
-      ACL_setStatus("Failed to initialize!")
-      printf("*Error* ACL: claude process failed to start. Command: %s\n" cmd))))
+      'ACL_exitHandler)
+    ipcWaitForProcess(ACL_proc)
+    unless(and(ACL_proc ipcIsAliveProcess(ACL_proc))
+      printf("*Error* ACL: claude process failed to start. Command: %s\n"
+        cmd))))
 
-procedure(ACL_claudeExitHandler(id status)
-  ; postFunc registered with ipcBeginProcess. Surfaces unexpected
-  ; exits in the chat log; quiet on deliberate stop (see ACL_stopClaude).
-  ACL_claude = nil
-  ACL_claudeBusy = nil
-  unless(ACL_claudeStopRequested
-    ACL_setStatus(sprintf(nil "Claude exited (status %L)" status))
-    ACL_appendChat(sprintf(nil
-      "\n\n[Claude process exited unexpectedly (status %L). Send any message to restart.]"
-      status)))
-  ; Surface unsent queued lines so they're not silently lost.
-  ACL_flushPendingChat()
-  ACL_claudeStopRequested = nil
-  when(ACL_form axlFormSetField(ACL_form "send" "Send")))
+procedure(ACL_claudeDriverSend(text isSynthetic noQuery)
+  ; Pack one user message in claude's stream-json wire format.
+  let(((pairs list(
+      list("type" "user")
+      list("message" list(
+        list("role" "user")
+        list("content" text))))))
+    when(isSynthetic pairs = append(pairs list(list("isSynthetic" t))))
+    when(noQuery pairs = append(pairs list(list("shouldQuery" 'false))))
+    ipcWriteProcess(ACL_proc strcat(ACL_jsonVal(pairs) "\n"))))
 
-procedure(ACL_stopClaude()
-  ; Gate stopRequested on having a live process to kill, so a no-op
-  ; stopClaude() doesn't silence the next spawn's unexpected exit.
-  when(and(ACL_claude ipcIsAliveProcess(ACL_claude))
-    ACL_claudeStopRequested = t
-    ACL_setStatus("Saving session...")
-    ; Windows has no POSIX signals, so we have to ipcKillProcess
-    if(ACL_isWindows
-      ipcKillProcess(ACL_claude)
-      ipcSignalProcess(ACL_claude 'TERM))
-    when(ACL_claude ipcWait(ACL_claude))
-    ACL_setStatus("Session ended"))
-  ACL_claude = nil
-  ACL_claudeBusy = nil
-  ACL_flushPendingChat()
-  when(ACL_form axlFormSetField(ACL_form "send" "Send")))
+; --- Codex driver ---
+;
+; Talks to `codex app-server --listen stdio://` over newline-delimited
+; JSON-RPC (no jsonrpc:"2.0" header). Lifecycle: spawn once per
+; session, initialize -> thread/start (or thread/resume / thread/fork
+; on restore) -> turn/start per user message. The threadId returned
+; by codex becomes ACL_sessionId. Wrapper-routed targets (--with-proxy
+; etc.) live in the registry entry's `args` field.
+
+defvar(ACL_codexNextRpcId 0)        ; per-process JSON-RPC id sequence
+defvar(ACL_codexThreadId nil)       ; UUIDv7 from thread/started; mirrored to ACL_sessionId
+defvar(ACL_codexInitialized nil)    ; set after the initialize round-trip completes
+defvar(ACL_codexThreadStarted nil)  ; set after thread/start (or resume/fork) returns
+defvar(ACL_codexResumeId nil)       ; thread id requested at launch (for thread/resume / fork)
+defvar(ACL_codexResumeIsFork nil)   ; t if the launch should fork from codexResumeId
+defvar(ACL_codexPendingTurns nil)   ; user messages queued behind the active turn
+defvar(ACL_codexPendingAmbient "")  ; noQuery text buffered for the next real turn
+defvar(ACL_codexInflightSend nil)   ; t while a turn is in-flight (not yet turn/completed)
+defvar(ACL_codexCurrentTurnId nil)  ; id of the in-flight turn (used as turn/steer's expectedTurnId)
+defvar(ACL_codexInflightSteerId nil) ; RPC id of an in-flight turn/steer; non-nil while we await its response
+defvar(ACL_codexInflightSteerText nil) ; text of the in-flight steer; re-queued on failure
+defvar(ACL_codexInflightSteerCount 0) ; display-queue entries the in-flight steer represents
+defvar(ACL_codexSteeredPendingFlush 0) ; display entries waiting to flush at the next item/started (when codex's pending input actually reaches the model)
+
+; Filter codex's noisy stderr: ANSI escapes + recurring OTel /
+; web_search_mode chatter + model misuse of resources/list against
+; non-existent MCP servers.
+defvar(ACL_ansiEscRe pcreCompile(strcat(ACL_byte(0x1b) "\\[[0-9;]*[a-zA-Z]")))
+defvar(ACL_codexNoiseRe pcreCompile(strcat(
+  "BatchLogProcessor\\.|"
+  "BatchSpanProcessor\\.|"
+  "web_search_mode|"
+  "unknown MCP server")))
+; Router errors for the allegro MCP server -- counted so tests can
+; assert no router errors during an exchange. Misuse of built-ins
+; (update_plan, resources/*) is excluded.
+defvar(ACL_codexMcpErrorRe pcreCompile("router: error=tools/call .*allegro"))
+defvar(ACL_codexMcpErrorCount 0)
+defvar(ACL_codexAllegroToolRe pcreCompile("^allegro_"))
+
+procedure(ACL_codexCleanStderr(line)
+  ; ANSI-stripped line, or nil to suppress. Tallies allegro-MCP
+  ; router errors as a side effect (consumed by tests).
+  let(((clean pcreReplace(ACL_ansiEscRe line "" 0)))
+    when(pcreMatchp(ACL_codexMcpErrorRe clean)
+      ACL_codexMcpErrorCount = ACL_codexMcpErrorCount + 1)
+    unless(pcreMatchp(ACL_codexNoiseRe clean) clean)))
+
+procedure(ACL_codexAllocRpcId()
+  ACL_codexNextRpcId = ACL_codexNextRpcId + 1
+  ACL_codexNextRpcId)
+
+procedure(ACL_codexSend(method paramsObj @optional id)
+  ; id present -> request, id absent -> notification.
+  let(((envelope list(list("method" method)
+                      list("params" paramsObj))))
+    when(id envelope = cons(list("id" id) envelope))
+    let(((wire strcat(ACL_jsonVal(envelope) "\n")))
+      when(ACL_enableRawLog
+        let(((fp outfile(strcat(ACL_homeDir "raw.log") "a")))
+          when(fp fprintf(fp ">>> %s" wire) close(fp))))
+      ipcWriteProcess(ACL_proc wire))))
+
+procedure(ACL_tomlStr(s)
+  ; TOML basic-string ("...") with \" and \\ escapes. Same wire shape
+  ; as JSON, so reuse ACL_jsonEscStr -- safe for any UTF-8 input.
+  ACL_jsonEscStr(or(s "")))
+
+procedure(ACL_codexConfigArg(key tomlValue)
+  ; The two argv tokens of a `-c key=value` flag. tomlValue is
+  ; already TOML-encoded (string -> `"..."`, array -> `[...]`,
+  ; bareword -> as-is). Only the value is shell-quoted -- the bare
+  ; `-c` flag stays unquoted so cmd /sh parsing doesn't break.
+  list("-c" ACL_shellQuote(sprintf(nil "%s=%s" key tomlValue))))
+
+procedure(ACL_codexBuildCmd(mcpScript entryArgs)
+  ; Assemble the codex command line. Only `-c key=value` values are
+  ; shell-quoted (they carry TOML `"` chars and array commas that
+  ; must survive the cmd /sh parse). The executable name and bare
+  ; flags pass through as-is so cmd's command-name scanner can find
+  ; `codex` on PATH -- quoting the first token wraps it as
+  ; `\"codex\"` which cmd.exe can't resolve. User-supplied entryArgs
+  ; / ACL_codexArgs are injected raw (user owns the shell-quoting).
+  ; `-c` flags MUST land before `app-server`; wrapper flags
+  ; (--with-proxy etc.) share that constraint.
+  ;
+  ; Auto-approve allegro tools below: SKILL gates approvals via
+  ; ACL_mode (manual/auto/quiet); codex must not pop its own
+  ; approval prompts and deadlock the turn.
+  letseq(((pythonCmd if(ACL_isWindows "python" "python3"))
+          (tag or(ACL_sessionTag ""))
+          (effort ACL_entryField(ACL_activeEntry "effort"))
+          (tokens nil))
+    tokens = list(if(ACL_isWindows "codex"
+                                   "env -u LD_LIBRARY_PATH codex"))
+    foreach(pair list(
+        ACL_codexConfigArg("mcp_servers.allegro.command"
+          ACL_tomlStr(pythonCmd))
+        ACL_codexConfigArg("mcp_servers.allegro.args"
+          sprintf(nil "[%s, %s]"
+            ACL_tomlStr(mcpScript) ACL_tomlStr(tag)))
+        ACL_codexConfigArg("mcp_servers.allegro.default_tools_approval_mode"
+          ACL_tomlStr("auto"))
+        ACL_codexConfigArg("tools.experimental_request_user_input.enabled"
+          "false"))
+      tokens = append(tokens pair))
+    when(ACL_nonEmpty(effort)
+      tokens = append(tokens
+        ACL_codexConfigArg("model_reasoning_effort" effort)))
+    let(((cmd buildString(tokens " ")))
+      when(ACL_nonEmpty(entryArgs)
+        cmd = strcat(cmd " " entryArgs))
+      when(ACL_nonEmpty(ACL_codexArgs)
+        cmd = strcat(cmd " " ACL_codexArgs))
+      cmd = strcat(cmd " app-server --listen stdio://")
+      ACL_wrapCmd(cmd))))
+
+procedure(ACL_codexDriverStart(resumeId fork)
+  ; Run codex against the user's normal ~/.codex (no CODEX_HOME
+  ; override, same as the claude driver). Per-launch state (MCP
+  ; server registration with the session tag, entry args, model
+  ; effort) lands as `-c` overrides assembled inline.
+  letseq(((mcpScript ACL_normPath(strcat(ACL_homeDir "allegro_mcp.py")))
+          (entryArgs ACL_entryField(ACL_activeEntry "args"))
+          (cmd ACL_codexBuildCmd(mcpScript entryArgs)))
+    ACL_copyFile(strcat(ACL_scriptDir "allegro_mcp.py") mcpScript)
+    ACL_codexInitialized = nil
+    ACL_codexThreadStarted = nil
+    ACL_codexThreadId = nil
+    ACL_codexResumeId = resumeId
+    ACL_codexResumeIsFork = and(resumeId fork)
+    ACL_codexPendingTurns = nil
+    ACL_codexPendingAmbient = ""
+    ACL_codexInflightSend = nil
+    ACL_codexCurrentTurnId = nil
+    ACL_codexInflightSteerId = nil
+    ACL_codexInflightSteerText = nil
+    ACL_codexInflightSteerCount = 0
+    ACL_codexSteeredPendingFlush = 0
+    ACL_codexNextRpcId = 0
+    ACL_proc = ipcBeginProcess(cmd ""
+      lambda((id data)
+        ACL_dispatchStreamLines(data "codex" 'ACL_codexProcessLine))
+      lambda((id data)
+        foreach(d parseString(data "\n")
+          let(((clean ACL_codexCleanStderr(d)))
+            when(clean printf("codex: %s\n" clean))))
+        axlFlushDisplay())
+      'ACL_exitHandler)
+    ipcWaitForProcess(ACL_proc)
+    if(and(ACL_proc ipcIsAliveProcess(ACL_proc))
+      ; Kick off the JSON-RPC dance. thread/start gets queued in
+      ; the data handler once initialize completes.
+      ACL_codexSend("initialize"
+        list(list("clientInfo" list(list("name" "allegro-claude")
+                                    list("version" "1.0")))
+             list("capabilities" list(list("clientType" "ide"))))
+        ACL_codexAllocRpcId())
+      printf("*Error* ACL: codex process failed to start. Command: %s\n"
+        cmd))))
+
+procedure(ACL_dispatchStreamLines(data label processLineFn)
+  ; Shared stream demux for both drivers: optional raw-log mirror,
+  ; newline-split with trailing partial preserved, per-line errset so
+  ; one bad line can't deadlock the handler, then a single check for
+  ; an armed fallback retry (driver's stop+restart can't safely run
+  ; from a nested dataHandler frame).
+  let((pos line)
+    when(ACL_enableRawLog
+      let(((fp outfile(strcat(ACL_homeDir "raw.log") "a")))
+        when(fp fprintf(fp "%s" data) close(fp))))
+    ACL_lineBuf = strcat(ACL_lineBuf data)
+    pos = nindex(ACL_lineBuf "\n")
+    while(pos
+      line = substring(ACL_lineBuf 1 (pos - 1))
+      ACL_lineBuf = or(substring(ACL_lineBuf (pos + 1)) "")
+      when(and(line strlen(line) > 0)
+        unless(errset(funcall(processLineFn line))
+          ACL_streamErrorCount++
+          printf("*Warning* ACL: %s stream error: %L\n"
+            label errset.errset)
+          axlFlushDisplay()))
+      pos = nindex(ACL_lineBuf "\n"))
+    when(ACL_fallbackRetryPending
+      ACL_fallbackRetry())))
+
+procedure(ACL_codexBuildThreadParams()
+  ; thread/start params shared by start/resume/fork. SKILL handles
+  ; approvals via ACL_mode; sandbox=read-only forces every file write
+  ; through the allegro MCP server (whose Python process runs outside
+  ; codex's sandbox). Mirrors claude's --disallowedTools Edit/Write:
+  ; we don't want the model writing through shell or apply_patch and
+  ; silently hitting the sandbox redirect.
+  letseq(((projectDir ACL_normPath(pcreReplace(ACL_lastPathCompRe
+            simplifyFilename(or(axlGetDrawingName() ACL_homeDir)) "" 0)))
+          (devInstr ACL_buildSystemPrompt()))
+    when(ACL_shouldLoadDocCache()
+      let(((doc ACL_findOrPlanDocs()))
+        when(and(doc isFile(doc))
+          devInstr = strcat(devInstr "\n\n"
+                              ACL_replacePaths(ACL_readFile(doc))))))
+    list(
+      list("model" ACL_activeModelId())
+      list("developerInstructions" devInstr)
+      list("cwd" projectDir)
+      list("approvalPolicy" "never")
+      list("sandbox" "read-only"))))
+
+procedure(ACL_codexProcessLine(line)
+  prog((parsed method params id result errBody)
+    parsed = ACL_jParse(line)
+    unless(parsed return(nil))
+    parsed = car(parsed)
+    method = ACL_jGet(parsed "method")
+    params = ACL_jGet(parsed "params")
+    id = ACL_jGet(parsed "id")
+    result = ACL_jGet(parsed "result")
+    errBody = ACL_jGet(parsed "error")
+    cond(
+      ; Server-initiated request (has both method and id): we must
+      ; reply or codex stalls. ACL_codexHandleRequest auto-decides
+      ; (SKILL's ACL_mode is the real approval gate).
+      (and(id method) ACL_codexHandleRequest(id method params))
+      ; Response (has id, no method): correlate to outstanding request.
+      (and(id null(method))
+        ACL_codexHandleResponse(id result errBody))
+      ; Notification (has method, no id).
+      (method ACL_codexHandleNotification(method params)))))
+
+procedure(ACL_codexHandleRequest(id method params)
+  ; Server-initiated requests must be answered or codex stalls.
+  ; commandExecution approvals auto-accept (SKILL's ACL_mode is the
+  ; real gate). Anything else gets a JSON-RPC error so codex moves
+  ; on instead of hanging.
+  cond(
+    (method == "item/commandExecution/requestApproval"
+      let(((cmd or(ACL_jGet(params "command") "")))
+        when(ACL_nonEmpty(cmd)
+          ACL_setStatus(sprintf(nil "Running: %s"
+            pcreReplace(ACL_collapseWSRe cmd " " 0))))
+        ACL_codexSendResult(id list(list("decision" "accept")))))
+    (t
+      printf("*Warning* ACL: codex unhandled request %s id=%L\n" method id)
+      ACL_codexSendError(id -32601 sprintf(nil "Unknown method: %s" method)))))
+
+procedure(ACL_codexSendResult(id result)
+  ; Send a JSON-RPC response payload back to codex.
+  let(((wire strcat(ACL_jsonObj(list("id" id) list("result" result)) "\n")))
+    when(ACL_enableRawLog
+      let(((fp outfile(strcat(ACL_homeDir "raw.log") "a")))
+        when(fp fprintf(fp ">>> %s" wire) close(fp))))
+    ipcWriteProcess(ACL_proc wire)))
+
+procedure(ACL_codexSendError(id code message)
+  ; Send a JSON-RPC error reply for an unhandled server request.
+  let(((wire strcat(ACL_jsonObj(list("id" id)
+                                list("error" list(list("code" code)
+                                                  list("message" message)))) "\n")))
+    when(ACL_enableRawLog
+      let(((fp outfile(strcat(ACL_homeDir "raw.log") "a")))
+        when(fp fprintf(fp ">>> %s" wire) close(fp))))
+    ipcWriteProcess(ACL_proc wire)))
+
+procedure(ACL_codexExtractThreadId(result)
+  ; Both `result` (thread/start response) and `params` (thread/started
+  ; notification) carry the thread id at `.thread.id`.
+  let(((th ACL_jGet(result "thread")))
+    when(th ACL_jGet(th "id"))))
+
+procedure(ACL_codexCaptureThreadId(tid)
+  ; Idempotent across thread/{start,resume,fork} response and the
+  ; thread/started notification (either may arrive first). Skip the
+  ; "Connected" stamp if a queued turn will flip status to
+  ; "Thinking..." anyway.
+  when(and(stringp(tid) null(ACL_codexThreadStarted))
+    ACL_codexThreadId = tid
+    ACL_sessionId = tid
+    ACL_codexBootstrapSessionDir(tid)
+    ACL_codexThreadStarted = t
+    unless(ACL_codexPendingTurns ACL_setStatus("Connected"))
+    ACL_codexFlush()))
+
+procedure(ACL_codexHandleResponse(id result errBody)
+  ; Dispatch JSON-RPC responses we care about: turn/steer ack
+  ; (handleSteerResponse handles success+failure), pre-thread error
+  ; (stale-session reject), other errors (try auto-fallback, else
+  ; surface to chat), initialize success (advance to thread/start),
+  ; thread/{start,resume,fork} success (capture threadId).
+  cond(
+    (and(ACL_codexInflightSteerId equal(id ACL_codexInflightSteerId))
+      ACL_codexHandleSteerResponse(errBody))
+    (and(errBody ACL_codexResumeId null(ACL_codexThreadStarted))
+      ACL_codexHandleStaleThread(errBody))
+    (errBody
+      let(((trigger ACL_findFallbackTrigger(nil ACL_jsonVal(errBody))))
+        if(and(trigger ACL_fallbackEntry())
+          ACL_scheduleFallbackRetry(trigger)
+          progn(
+            ACL_appendChat(sprintf(nil "\n[codex error id=%L: %s]\n"
+              id ACL_jsonVal(errBody)))
+            ACL_setStatus("Error")
+            ACL_busy = nil))))
+    (null(ACL_codexInitialized)
+      ACL_codexInitialized = t
+      ACL_codexSend("initialized" nil)
+      ACL_codexIssueThread())
+    (null(ACL_codexThreadStarted)
+      ACL_codexCaptureThreadId(ACL_codexExtractThreadId(result)))))
+
+procedure(ACL_codexHandleSteerResponse(errBody)
+  ; Success: bank `inflightCount` for the next item/started to flush
+  ; (the steered text is in codex's pending input but the model
+  ; doesn't see it until its next LLM round). Failure: requeue the
+  ; failed text at the head of the transport queue; display untouched.
+  ; expectedTurnId mismatch is the routine race (turn ended between
+  ; our send and codex's reply) and stays silent.
+  letseq(((failedText ACL_codexInflightSteerText)
+          (inflightCount ACL_codexInflightSteerCount))
+    ACL_codexInflightSteerId = nil
+    ACL_codexInflightSteerText = nil
+    ACL_codexInflightSteerCount = 0
+    if(errBody
+      progn(
+        unless(ACL_codexIsSteerRaceError(errBody)
+          ACL_appendChat(sprintf(nil "\n[codex steer failed, requeued: %s]\n"
+            ACL_jsonVal(errBody))))
+        when(ACL_nonEmpty(failedText)
+          ACL_codexPendingTurns = cons(failedText ACL_codexPendingTurns)))
+      ACL_codexSteeredPendingFlush =
+        ACL_codexSteeredPendingFlush + inflightCount)
+    ACL_codexFlush()))
+
+procedure(ACL_codexFlushSteeredQueue()
+  ; Drain banked steered display entries. Called from item/started
+  ; (model just began a new LLM round, has consumed the steer) and
+  ; turn/completed (safety net for tool-less turns).
+  let(((n ACL_codexSteeredPendingFlush))
+    when(plusp(n)
+      ACL_codexSteeredPendingFlush = 0
+      for(i 1 n ACL_flushPendingChat(?one t)))))
+
+procedure(ACL_codexIsSteerRaceError(errBody)
+  ; expectedTurnId mismatch -- routine, the turn ended between our
+  ; decision-to-steer and the request landing.
+  let(((s ACL_jsonVal(errBody)))
+    and(stringp(s) nindex(s "expectedTurnId") t)))
+
+procedure(ACL_codexErrorMessage(err)
+  ; Unwrap codex's nested error shape into a chat-friendly string.
+  ; `err` is whatever sat in `params.error` / `errBody`; its
+  ; `message` field is often itself JSON-encoded ({"error":{...}}).
+  ; Peel one layer if present.
+  if(null(err) "?"
+    letseq(((raw or(ACL_jGet(err "message") ACL_jsonVal(err)))
+            (inner when(and(stringp(raw)
+                            equal(substring(raw 1 1) "{"))
+                       car(errset(ACL_jParse(raw))))))
+      if(inner
+        let(((nested when(inner ACL_jGet(car(inner) "error"))))
+          or(when(nested ACL_jGet(nested "message"))
+             raw))
+        or(raw "?")))))
+
+procedure(ACL_codexHandleStaleThread(errBody)
+  ; thread/resume or thread/fork rejected the sid we tried to attach
+  ; to. Forget it and fall back to a fresh thread/start so the user
+  ; lands in a working session instead of looping on the bad id.
+  let(((bad ACL_codexResumeId))
+    ACL_codexResumeId = nil
+    ACL_codexResumeIsFork = nil
+    ACL_dropStaleSession(bad "codex")
+    ACL_codexIssueThread()))
+
+procedure(ACL_codexIssueThread()
+  let(((paramsObj ACL_codexBuildThreadParams()))
+    cond(
+      (and(ACL_codexResumeId ACL_codexResumeIsFork)
+        ACL_codexSend("thread/fork"
+          append(paramsObj list(list("threadId" ACL_codexResumeId)))
+          ACL_codexAllocRpcId()))
+      (ACL_codexResumeId
+        ACL_codexSend("thread/resume"
+          append(paramsObj list(list("threadId" ACL_codexResumeId)))
+          ACL_codexAllocRpcId()))
+      (t ACL_codexSend("thread/start" paramsObj
+                       ACL_codexAllocRpcId())))))
+
+procedure(ACL_codexBootstrapSessionDir(sid)
+  ; Mirror the claude driver's session-dir setup so log file, MCP tag,
+  ; and cmd_<N>.il logging work identically.
+  let(((newDir strcat(ACL_logDir sid "/"))
+       (oldDir when(ACL_codexResumeId
+                    strcat(ACL_logDir ACL_codexResumeId "/"))))
+    createDir(ACL_logDir)
+    createDir(newDir)
+    when(and(ACL_codexResumeIsFork oldDir isDir(oldDir))
+      ACL_copyDirFiles(oldDir newDir))
+    ACL_sessionLogDir = newDir
+    ACL_logFileAppend("")
+    ACL_refreshLogButtons()
+    ACL_writeSessionTag()
+    ACL_mcpCmdSeq = ACL_mcpScanMaxSeq(ACL_sessionLogDir)))
+
+procedure(ACL_codexFlush()
+  ; Drain ACL_codexPendingTurns through whichever wire is available
+  ; right now:
+  ;   * thread not started      -> no-op (thread/started will re-flush)
+  ;   * steer in flight         -> no-op (its response will re-flush)
+  ;   * gap window: inflight    -> no-op (turn/started will re-flush)
+  ;     turn but no turn id
+  ;   * active turn, known id   -> single batched turn/steer
+  ;   * idle thread             -> single batched turn/start
+  ; Every queueing site just calls this; one decision tree governs
+  ; all transitions.
+  letseq(((haveTurn and(ACL_codexInflightSend ACL_codexCurrentTurnId))
+          (idle null(ACL_codexInflightSend))
+          (canSend and(ACL_codexThreadStarted
+                       null(ACL_codexInflightSteerId)
+                       or(haveTurn idle))))
+    when(and(ACL_codexPendingTurns canSend)
+      letseq(((batch ACL_codexPendingTurns)
+              (count length(batch))
+              (body buildString(batch "\n\n")))
+        ACL_codexPendingTurns = nil
+        if(haveTurn
+          ACL_codexIssueSteer(body count)
+          ACL_codexIssueTurn(body))))))
+
+procedure(ACL_codexConsumeAmbient(text)
+  ; Prepend any buffered noQuery context to `text` and clear the
+  ; ambient buffer. Both turn/start and turn/steer go through here
+  ; so noQuery hints ride the next real send regardless of which
+  ; wire it lands on.
+  letseq(((body if(ACL_nonEmpty(ACL_codexPendingAmbient)
+                strcat(ACL_codexPendingAmbient "\n\n" text)
+                text)))
+    ACL_codexPendingAmbient = ""
+    body))
+
+procedure(ACL_codexIssueTurn(text)
+  ; Fire turn/start with `text` + any buffered ambient context. Pin
+  ; status to "Thinking..." now since codex can take seconds to emit
+  ; turn/started, and the user shouldn't see "Connected" / "Ready"
+  ; meanwhile.
+  let(((body ACL_codexConsumeAmbient(text)))
+    ACL_codexInflightSend = t
+    ACL_busy = t
+    ACL_setStatus("Thinking...")
+    ACL_codexSend("turn/start"
+      list(list("threadId" ACL_codexThreadId)
+           list("input" list(list(list("type" "text") list("text" body))))
+           list("sandboxPolicy" list(list("type" "readOnly"))))
+      ACL_codexAllocRpcId())))
+
+procedure(ACL_codexIssueSteer(text count)
+  ; Inject `text` into the active turn via turn/steer. `count` is the
+  ; number of display-queue entries this steer represents so
+  ; ACL_codexHandleSteerResponse can bank the matching display flush
+  ; (success) or requeue (failure). Codex folds steered input into
+  ; the active turn's next LLM round.
+  letseq(((body ACL_codexConsumeAmbient(text))
+          (rpcId ACL_codexAllocRpcId()))
+    ACL_codexInflightSteerId = rpcId
+    ACL_codexInflightSteerText = text
+    ACL_codexInflightSteerCount = count
+    ACL_codexSend("turn/steer"
+      list(list("threadId" ACL_codexThreadId)
+           list("expectedTurnId" ACL_codexCurrentTurnId)
+           list("input" list(list(list("type" "text") list("text" body)))))
+      rpcId)))
+
+procedure(ACL_codexHandleNotification(method params)
+  cond(
+    (method == "thread/started"
+      ACL_codexCaptureThreadId(ACL_codexExtractThreadId(params)))
+    (method == "turn/started"
+      let(((turn ACL_jGet(params "turn")))
+        when(turn ACL_codexCurrentTurnId = ACL_jGet(turn "id")))
+      ACL_busy = t
+      ACL_setStatus("Thinking...")
+      ; currentTurnId is now known; ACL_codexFlush can promote any
+      ; gap-window queue to a steer.
+      ACL_codexFlush())
+    (method == "error"
+      ; Async failure mid-turn (bad MCP call, malformed tool args,
+      ; ...). Do NOT clear busy/status -- only turn/completed does
+      ; that. Auto-fallback first so a provider rejection swaps the
+      ; model instead of pasting raw JSON into chat.
+      letseq(((err ACL_jGet(params "error"))
+              (trigger when(err
+                        ACL_findFallbackTrigger(nil ACL_jsonVal(err)))))
+        if(and(trigger ACL_fallbackEntry())
+          ACL_scheduleFallbackRetry(trigger)
+          ACL_appendChat(sprintf(nil "\n[codex error: %s]\n"
+            ACL_codexErrorMessage(err))))))
+    (method == "turn/completed"
+      ACL_codexInflightSend = nil
+      ACL_codexCurrentTurnId = nil
+      letseq(((turn ACL_jGet(params "turn"))
+              (status when(turn ACL_jGet(turn "status")))
+              (err when(turn ACL_jGet(turn "error"))))
+        ACL_onResponseComplete()
+        ; Failed/interrupted turns: surface the error and pin "Error"
+        ; on the status bar instead of "Ready".
+        when(and(status status != "completed")
+          when(err
+            ACL_appendChat(sprintf(nil "\n[codex turn %s: %s]\n"
+              status ACL_codexErrorMessage(err))))
+          ACL_setStatus(sprintf(nil "Turn %s" status))))
+      ACL_codexFlush())
+    (method == "thread/tokenUsage/updated"
+      ; last.* = this turn, total.* = session cumulative. Weight
+      ; per ACL_weightedTokens so the status bar has a single
+      ; comparable figure when there's no $-cost.
+      let(((tu ACL_jGet(params "tokenUsage")))
+        when(tu
+          let(((last  ACL_jGet(tu "last"))
+               (total ACL_jGet(tu "total"))
+               (win   ACL_jGet(tu "modelContextWindow")))
+            when(integerp(win) ACL_lastContextWindow = win)
+            when(last
+              let(((tot ACL_jGet(last "totalTokens")))
+                when(integerp(tot) ACL_lastContextTokens = tot)))
+            when(total
+              ACL_sessionWeightedTokens = ACL_weightedTokens(total))))))
+    (method == "item/agentMessage/delta"
+      letseq(((delta ACL_jGet(params "delta"))
+              (itemId ACL_jGet(params "itemId")))
+        when(stringp(delta)
+          when(and(itemId null(assoc(itemId ACL_streamedMsgLen)))
+            ACL_streamingMsgId = itemId
+            ACL_streamedMsgLen = cons(list(itemId 0) ACL_streamedMsgLen))
+          let(((entry when(itemId assoc(itemId ACL_streamedMsgLen))))
+            when(entry
+              rplaca(cdr(entry) (cadr(entry) + strlen(delta)))))
+          ACL_responseBuf = strcat(ACL_responseBuf delta)
+          ACL_streamToDisplay(delta)
+          ACL_maybeSaveSession())))
+    (method == "item/started"
+      ; A new item means the model is starting a fresh LLM round and
+      ; has consumed any banked steered input; flush "You: ..." now.
+      ACL_codexFlushSteeredQueue()
+      let(((item ACL_jGet(params "item"))
+           itype)
+        when(item
+          itype = ACL_jGet(item "type")
+          cond(
+            (itype == "mcpToolCall"
+              ; Match allegro tools by server name or `allegro_`
+              ; prefix; rebuild the alist ACL_handleToolCall expects.
+              letseq(((tool or(ACL_jGet(item "tool") ""))
+                      (server or(ACL_jGet(item "server") ""))
+                      (pfx "mcp__allegro__")
+                      (isAllegro or(equal(server "allegro")
+                                    pcreMatchp(ACL_codexAllegroToolRe tool))))
+                ACL_hadToolUse = t
+                ACL_setStatus(sprintf(nil "Using %s..."
+                  if(isAllegro tool
+                    if(ACL_nonEmpty(server)
+                      sprintf(nil "%s/%s" server tool)
+                      tool))))
+                when(isAllegro
+                  ACL_handleToolCall(list(
+                    list("id" ACL_jGet(item "id"))
+                    list("name" if(and(strlen(tool) >= strlen(pfx)
+                                       substring(tool 1 strlen(pfx)) == pfx)
+                                 tool
+                                 strcat(pfx tool)))
+                    list("input" ACL_jGet(item "arguments")))))))
+            (itype == "commandExecution"
+              ; Codex's built-in shell tool -- preview the command.
+              let(((cmd or(ACL_jGet(item "command") "shell")))
+                ACL_hadToolUse = t
+                ACL_setStatus(sprintf(nil "Running: %s"
+                  pcreReplace(ACL_collapseWSRe cmd " " 0)))))
+            (itype == "agentMessage"
+              when(ACL_logContent ACL_logWrite("\n\n"))
+              ACL_hadToolUse = nil)))))
+    (method == "item/completed"
+      let(((item ACL_jGet(params "item"))
+           itype)
+        when(item
+          itype = ACL_jGet(item "type")
+          cond(
+            (or(itype == "mcpToolCall" itype == "commandExecution")
+              ; Reset to "Thinking..."; the next agentMessage delta
+              ; (or item/started) takes over from here.
+              ACL_setStatus("Thinking..."))
+            (itype == "agentMessage"
+              ; Final non-streaming form -- dedup vs the deltas.
+              let((text seenLen entry newText itemId)
+                itemId = ACL_jGet(item "id")
+                entry = when(itemId assoc(itemId ACL_streamedMsgLen))
+                text = or(ACL_jGet(item "text") "")
+                seenLen = if(entry cadr(entry) strlen(text))
+                when(strlen(text) > seenLen
+                  newText = substring(text (seenLen + 1))
+                  when(and(newText strlen(newText) > 0)
+                    ACL_responseBuf = strcat(ACL_responseBuf newText)
+                    ACL_streamToDisplay(newText))
+                  when(entry rplaca(cdr(entry) strlen(text))))))))))))
+
+procedure(ACL_codexDriverSend(text isSynthetic noQuery)
+  ; noQuery -> buffer ambient; real sends append to the transport
+  ; queue and let ACL_codexFlush pick the right wire. isSynthetic is
+  ; unused (codex has no equivalent weighting hint).
+  isSynthetic
+  if(noQuery
+    ACL_codexPendingAmbient = if(ACL_nonEmpty(ACL_codexPendingAmbient)
+      strcat(ACL_codexPendingAmbient "\n\n" text)
+      text)
+    progn(
+      ACL_codexPendingTurns = append1(ACL_codexPendingTurns text)
+      ACL_codexFlush())))
+
+; --- Generic send/ensure entry points ---
+
+procedure(ACL_ensureAgent()
+  when(and(ACL_proc null(ipcIsAliveProcess(ACL_proc)))
+    printf("*Warning* ACL: agent process died (exit status: %L)\n"
+      ACL_proc->exitStatus)
+    ACL_proc = nil)
+  unless(ACL_proc
+    ACL_startAgent(ACL_sessionId)))
+
+procedure(ACL_sendMessage(text @key (isSynthetic nil) (noQuery nil))
+  ; isSynthetic tags the message as infrastructure-emitted, not user-typed,
+  ; so the agent weights it accordingly in its own context. noQuery
+  ; additionally tells the agent not to spend a turn responding (used
+  ; for "here's some ambient state, fold it into your next reply"
+  ; sidebar messages).
+  ACL_ensureAgent()
+  when(ACL_proc
+    unless(noQuery ACL_busy = t)
+    ; Snapshot so ACL_scheduleFallbackRetry can replay on API error.
+    ACL_lastSent = list(text isSynthetic noQuery)
+    let(((driver ACL_activeDriver()))
+      cond(
+        (driver == "claude" ACL_claudeDriverSend(text isSynthetic noQuery))
+        (driver == "codex"  ACL_codexDriverSend(text isSynthetic noQuery))))))
 
 ; --- Model fallback on misbehaving API responses ---------------------
 ;
 ; Some API providers reject newer claude betas with errors that need a
 ; per-Allegro-session model swap. Each ACL_fallbackTriggers predicate
 ; tests one such failure pattern against the result event; the first
-; match swaps ACL_activeModel to ACL_fallbackModel, relaunches claude
-; (resuming on the same sid so prior turns survive), and replays the
-; message that triggered the error.
+; match swaps ACL_activeEntry to its declared fallback entry, relaunches
+; the agent (resuming on the same sid so prior turns survive), and
+; replays the message that triggered the error.
 
-procedure(ACL_is422RoleSystemError(errStatus resText)
-  ; HTTP 422 with role:"system" inside messages[] -- some providers
-  ; reject Anthropic's mid-conversation-system beta this way.
-  and(equal(errStatus 422)
-      stringp(resText)
-      nindex(resText "\"role\"")
-      nindex(resText "\"system\"")
+procedure(ACL_isRoleSystemError(errStatus resText)
+  ; Upstream provider rejected role:"system" inside messages[] -- some
+  ; providers refuse Anthropic's mid-conversation-system beta this way.
+  ; Triggers on the claude path (HTTP 422 + body) and the codex path
+  ; (no HTTP status, JSON-encoded error body carries the same markers,
+  ; possibly with escaped quotes).
+  and(stringp(resText)
+      pcreMatchp("\\\\?\"role\\\\?\"" resText)
+      pcreMatchp("\\\\?\"system\\\\?\"" resText)
+      or(equal(errStatus 422) null(errStatus))
       t))
 
 procedure(ACL_findFallbackTrigger(errStatus resText)
@@ -1087,56 +2049,36 @@ procedure(ACL_findFallbackTrigger(errStatus resText)
     match))
 
 procedure(ACL_scheduleFallbackRetry(triggerLabel)
-  ; Stash the trigger and let ACL_claudeDataHandler call ACL_fallbackRetry
-  ; after returning from the current dataHandler invocation
+  ; Stash the trigger and let the driver's data handler call
+  ; ACL_fallbackRetry after returning from the current handler invocation
   ; (axlUIWTimerAdd doesn't fire under -nograph batch mode).
   ACL_fallbackRetryPending = or(triggerLabel t))
+
+procedure(ACL_fallbackEntry()
+  ; The next entry to swap to, or nil when none is declared.
+  when(ACL_activeEntry
+    let(((target ACL_entryField(ACL_activeEntry "fallback")))
+      when(target ACL_modelById(target)))))
 
 procedure(ACL_fallbackRetry()
   let(((trigger ACL_fallbackRetryPending)
        (sid ACL_sessionId)
-       (replay ACL_lastSent))
+       (replay ACL_lastSent)
+       (next ACL_fallbackEntry()))
     ACL_fallbackRetryPending = nil
-    ACL_activeModel = ACL_fallbackModel
-    printf("ACL: switching to %s after %L\n" ACL_fallbackModel trigger)
-    ACL_appendChat(sprintf(nil
-      "\n[Switched to %s after API error: %L]\n"
-      ACL_fallbackModel trigger))
-    ACL_stopClaude()
-    ACL_startClaude(sid)
-    when(replay
-      ACL_sendMessage(car(replay)
-        ?isSynthetic cadr(replay)
-        ?noQuery     caddr(replay)))))
-
-procedure(ACL_ensureClaude()
-  when(and(ACL_claude null(ipcIsAliveProcess(ACL_claude)))
-    printf("*Warning* ACL: claude process died (exit status: %L)\n"
-      ACL_claude->exitStatus)
-    ACL_claude = nil)
-  unless(ACL_claude
-    ACL_startClaude(ACL_sessionId)))
-
-procedure(ACL_sendMessage(text @key (isSynthetic nil) (noQuery nil))
-  ; isSynthetic tags the message as infrastructure-emitted, not user-typed,
-  ; so claude weights it accordingly in its own context. noQuery additionally
-  ; tells claude not to spend a turn responding (used for "here's some
-  ; ambient state, fold it into your next reply" sidebar messages).
-  ACL_ensureClaude()
-  when(ACL_claude
-    ; Claude will respond unless explicitly told not to -- mark busy so
-    ; user messages typed before the first stream event get queued.
-    unless(noQuery ACL_claudeBusy = t)
-    ; Snapshot for ACL_scheduleFallbackRetry to replay if the API 422s.
-    ACL_lastSent = list(text isSynthetic noQuery)
-    let(((pairs list(
-        list("type" "user")
-        list("message" list(
-          list("role" "user")
-          list("content" text))))))
-      when(isSynthetic pairs = append(pairs list(list("isSynthetic" t))))
-      when(noQuery pairs = append(pairs list(list("shouldQuery" 'false))))
-      ipcWriteProcess(ACL_claude strcat(ACL_jsonVal(pairs) "\n")))))
+    when(next
+      ACL_activeEntry = next
+      printf("ACL: switching to %s after %L\n"
+        ACL_entryLabel(next) trigger)
+      ACL_appendChat(sprintf(nil
+        "\n[Switched to %s after API error: %L]\n"
+        ACL_entryLabel(next) trigger))
+      ACL_stopAgent()
+      ACL_startAgent(sid)
+      when(replay
+        ACL_sendMessage(car(replay)
+          ?isSynthetic cadr(replay)
+          ?noQuery     caddr(replay))))))
 
 ; ============================================================
 ; 6b. MCP File IPC
@@ -1197,7 +2139,14 @@ procedure(ACL_toolPreview(toolName input)
     (toolName == "mcp__allegro__allegro_execute"
       ACL_jGet(input "code"))
     (toolName == "mcp__allegro__allegro_read_file"
-      sprintf(nil "; read_file %L" ACL_jGet(input "path")))
+      letseq(((offset ACL_jGet(input "offset"))
+              (length ACL_jGet(input "length"))
+              (binary ACL_jGet(input "is_binary"))
+              (modes ""))
+        when(offset modes = strcat(modes sprintf(nil " offset=%L" offset)))
+        when(length modes = strcat(modes sprintf(nil " length=%L" length)))
+        when(binary modes = strcat(modes " binary"))
+        sprintf(nil "; read_file %L%s" ACL_jGet(input "path") modes)))
     (toolName == "mcp__allegro__allegro_write_file"
       sprintf(nil "; write_file %L\n%s"
         ACL_jGet(input "path") ACL_jGetStr(input "content")))
@@ -1240,12 +2189,42 @@ procedure(ACL_mcpDrainPending(@rest args)
               (seq cadddr(entry))
               (result ACL_runTool(toolName input))
               (ipcOutPath when(ACL_sessionLogDir
-                                sprintf(nil "%s/tool_%s.out" ACL_sessionLogDir toolId))))
+                                sprintf(nil "%s/tool_%s.out" ACL_sessionLogDir toolId)))
+              (ipcErrPath when(ACL_sessionLogDir
+                                sprintf(nil "%s/tool_%s.err" ACL_sessionLogDir toolId)))
+              (ipcReqPath when(ACL_sessionLogDir
+                                sprintf(nil "%s/tool_%s.req" ACL_sessionLogDir toolId))))
         when(ACL_sessionLogDir
           ACL_writeFile(sprintf(nil "%s/cmd_%d.out" ACL_sessionLogDir seq) result)
-          ; The IPC file the Python MCP server polls for: keyed by
-          ; tool_use_id. Atomic publish via temp + rename.
+          ; Sidecar describing the call by (driver-stripped name, args)
+          ; so the MCP server can match a codex tools/call -- whose
+          ; _meta carries no tool_use_id -- back to this result file.
+          ; The .req lands BEFORE the .out so the MCP server never sees
+          ; a stale match without its result waiting.
+          ACL_writeFileAtomic(ipcReqPath ACL_jsonObj(
+            list("name" ACL_stripMcpPrefix(toolName))
+            list("arguments" or(input nil))))
+          ; .err sidecar (empty marker) tells the MCP server to
+          ; return this tool result as a JSON-RPC error. Tool
+          ; returns starting with "*error*" or "*Error*" (SKILL
+          ; convention) signal failure -- everything else is
+          ; treated as success.
+          when(ACL_toolResultIsError(result)
+            ACL_writeFileAtomic(ipcErrPath ""))
           ACL_writeFileAtomic(ipcOutPath result))))))
+
+defvar(ACL_toolErrPrefixRe pcreCompile("^\\*[Ee]rror\\*"))
+
+procedure(ACL_toolResultIsError(result)
+  and(stringp(result) pcreMatchp(ACL_toolErrPrefixRe result)))
+
+procedure(ACL_stripMcpPrefix(toolName)
+  ; The claude CLI exposes tools as `mcp__<server>__<tool>`. Codex
+  ; exposes them as `mcp__<server>__.<tool>` (extra dot). Strip both
+  ; back to the bare tool name for content matching.
+  let(((bare pcreReplace(ACL_mcpToolPrefixRe toolName "" 0)))
+    if(and(strlen(bare) > 0 substring(bare 1 1) == ".")
+      substring(bare 2) bare)))
 
 procedure(ACL_runTool(toolName input)
   ; Dispatch one tool call by name. Each branch handles its own arg
@@ -1255,7 +2234,10 @@ procedure(ACL_runTool(toolName input)
       let(((raw errset(ACL_execBlock(ACL_jGet(input "code")))))
         if(raw car(raw) "*error* SKILL execution failed unexpectedly")))
     (toolName == "mcp__allegro__allegro_read_file"
-      ACL_toolReadFile(ACL_jGet(input "path")))
+      ACL_toolReadFile(ACL_jGet(input "path")
+                       or(ACL_jGet(input "offset") 0)
+                       or(ACL_jGet(input "length") 2000)
+                       and(ACL_jGet(input "is_binary") t)))
     (toolName == "mcp__allegro__allegro_write_file"
       ACL_toolWriteFile(ACL_jGet(input "path")
                         ACL_jGetStr(input "content")))
@@ -1291,9 +2273,75 @@ procedure(ACL_validateFilePath(opName path needExisting)
     (and(needExisting null(isFile(path)))
       sprintf(nil "*error* %s: not a file: %s" opName path))))
 
-procedure(ACL_toolReadFile(path)
+procedure(ACL_toolReadFile(path offset length isBinary)
+  ; Read `length` lines (or bytes if isBinary) starting at `offset`
+  ; lines (or bytes). offset/length default to 0/2000 at the caller
+  ; site. Hard-caps the returned content at ACL_maxReadBytes (20KB)
+  ; -- the model must chunk longer files by re-calling with smaller
+  ; length and an advancing offset. On cap failure, return a message
+  ; that includes the actual file size so the model can plan.
   or(ACL_validateFilePath("read_file" path t)
-     ACL_readFile(path)))
+     when(or(null(integerp(offset)) offset < 0)
+       sprintf(nil "*error* read_file: offset must be a non-negative integer, got %L" offset))
+     when(or(null(integerp(length)) length <= 0)
+       sprintf(nil "*error* read_file: length must be a positive integer, got %L" length))
+     if(isBinary
+       ACL_toolReadFileBinary(path offset length)
+       ACL_toolReadFileLines(path offset length))))
+
+procedure(ACL_toolReadFileBinary(path offset length)
+  ; Byte-based read: seek then collect up to ACL_maxReadBytes chars.
+  letseq(((sz fileLength(path))
+          (cap ACL_maxReadBytes))
+    cond(
+      (length > cap
+        sprintf(nil
+          "*error* read_file: requested %d bytes but cap is %d; file size %d bytes. Re-call with smaller length, advancing offset by the previous length."
+          length cap sz))
+      (t
+        let(((fp infile(path))
+             chars c read)
+          if(null(fp)
+            sprintf(nil "*error* read_file: cannot open %s" path)
+            progn(
+              when(offset > 0 fileSeek(fp offset 0))
+              chars = nil
+              read = 0
+              while(and(read < length (c = getc(fp)))
+                chars = cons(c chars)
+                read = read + 1)
+              close(fp)
+              buildString(reverse(chars) ""))))))))
+
+procedure(ACL_toolReadFileLines(path offset length)
+  ; Line-based read: skip offset lines, collect up to length more
+  ; while total bytes stay within ACL_maxReadBytes.
+  letseq(((sz fileLength(path))
+          (cap ACL_maxReadBytes)
+          (fp infile(path)))
+    if(null(fp)
+      sprintf(nil "*error* read_file: cannot open %s" path)
+      let((line lines skipped taken chars capped)
+        lines = nil
+        skipped = 0
+        taken = 0
+        chars = 0
+        capped = nil
+        while(and(skipped < offset gets(line fp))
+          skipped = skipped + 1)
+        while(and(null(capped) taken < length gets(line fp))
+          if(chars + strlen(line) > cap
+            capped = t
+            progn(
+              lines = cons(line lines)
+              chars = chars + strlen(line)
+              taken = taken + 1)))
+        close(fp)
+        if(capped
+          sprintf(nil
+            "*error* read_file: lines [%d, %d) would exceed %d-byte cap (file size %d bytes). Re-call with smaller length, advancing offset by the previous length."
+            offset (offset + length) cap sz)
+          buildString(reverse(lines) ""))))))
 
 procedure(ACL_toolWriteFile(path content)
   or(ACL_validateFilePath("write_file" path nil)
@@ -1357,30 +2405,101 @@ procedure(ACL_toolMultiEditFile(path edits)
            sprintf(nil "Edited %s (%d edits, %d bytes)"
              path length(edits) strlen(text)))))))
 
+defvar(ACL_readerLineColRe
+  ; Match "at line N column N" anywhere -- the useful core of any
+  ; reader/parser diagnostic regardless of which channel produced
+  ; it. Used to pick a candidate line out of captured errport text.
+  pcreCompile("at line \\d+ column \\d+"))
+
+defvar(ACL_readerLineNoiseRe
+  ; Strip the standard noisy parts that wrap a reader/parser line:
+  ;   "*Error* lineread/read: "  -- routine prefix
+  ;   " (in|of) file \*\S+\*"    -- "in file *stdin*" / "of file *string*"
+  pcreCompile("^\\*Error\\* \\S+:\\s*|\\s+(in|of) file \\*\\S+\\*\\s*$"))
+
+defvar(ACL_readerWarnHeadRe
+  ; Match the reader-warning prefix on the first line; strip it so
+  ; the message reads like a plain "a '(' at line N was still
+  ; unclosed on EOF" or "string at line N was not terminated on
+  ; EOF". The optional "*WARNING* " covers cases where Allegro
+  ; includes it; muffleWarnings typically drops it.
+  pcreCompile("^(\\s*\\*WARNING\\*)?\\s*\\(reader\\):\\s*"))
+
+defvar(ACL_firstLineRe pcreCompile("\\n[\\s\\S]*"))
+
+defvar(ACL_splitLinesRe pcreCompile("\\n"))
+
+procedure(ACL_extractReaderErrMsg(errOut)
+  ; Pull the most useful line out of captured reader/parser errport
+  ; output. Different Allegro builds split the diagnostic across
+  ; lines differently -- some put "at line N column N" on a
+  ; "SYNTAX ERROR found..." prelude, others append it to the
+  ; "*Error* lineread/read:" line itself. Find the first line that
+  ; carries the line/column, strip routine noise, return the rest.
+  when(ACL_nonEmpty(errOut)
+    let((line cleaned)
+      foreach(raw parseString(errOut "\n")
+        when(and(null(cleaned) pcreMatchp(ACL_readerLineColRe raw))
+          line = raw
+          cleaned = pcreReplace(ACL_trimWSRe
+                      pcreReplace(ACL_readerLineNoiseRe raw "" 0)
+                      "" 0)))
+      when(ACL_nonEmpty(cleaned) cleaned))))
+
+procedure(ACL_skillSyntaxCheckCode(content)
+  ; Reader-only structural check on a SKILL source block. Returns
+  ; nil if well-formed, otherwise a short reason string. When the
+  ; reader emits a line-numbered diagnostic (hard parse error on
+  ; errport, or a soft warning via muffleWarnings), surface that
+  ; instead of the generic reason. No eval -- nothing in `content`
+  ; runs even if it tries to escape the wrapper. Wrap as
+  ; `progn(<content>) ACL_synEOF__` and read top-level forms from
+  ; a string port. Well-formed content gives exactly two: a list
+  ; whose head is `progn`, then the EOF sentinel. Any other shape
+  ; is a syntax error.
+  ;
+  ; Hard errors (parser raises) and soft errors (auto-recovers with
+  ; a warning) take different channels:
+  ;   hard -- printed to errport; "at line N column N" appears on
+  ;           a "SYNTAX ERROR ..." line on some Allegro builds, on
+  ;           the "*Error* lineread/read:" line on others.
+  ;   soft -- captured by muffleWarnings; first warning's first
+  ;           line has the line number (no column).
+  let((p forms warns errPort errOut readerMsg reason)
+    p = instring(strcat("progn(" content "\n) ACL_synEOF__"))
+    errPort = outstring()
+    errset(let(((errport errPort))
+      forms = muffleWarnings(lineread(p))) t)
+    warns = getMuffleWarnings()
+    errOut = getOutstring(errPort)
+    close(errPort)
+    close(p)
+    readerMsg = or(
+      ACL_extractReaderErrMsg(errOut)
+      ; Soft warning fallback: first line, prefix stripped.
+      when(warns
+        pcreReplace(ACL_trimWSRe
+          pcreReplace(ACL_readerWarnHeadRe
+            pcreReplace(ACL_firstLineRe car(warns) "" 0)
+            "" 0)
+          "" 0)))
+    reason = cond(
+      (or(null(forms) listp(forms) == nil)
+        "syntax error")
+      (length(forms) != 2
+        "mismatched parens")
+      (cadr(forms) != 'ACL_synEOF__
+        "unterminated string or paren")
+      (or(null(listp(car(forms))) car(car(forms)) != 'progn)
+        "too many `)`"))
+    when(reason
+      if(ACL_nonEmpty(readerMsg) readerMsg reason))))
+
 procedure(ACL_skillSyntaxCheck(path content)
-  ; Syntax-check .il content using only the reader -- no eval, so
-  ; nothing in `content` runs even if it tries to escape a wrapper.
-  ; We wrap as `progn(<content>) ACL_synEOF__` and read top-level
-  ; forms from a string port. Well-formed content gives exactly two
-  ; forms: a list whose head is `progn`, then the EOF sentinel. Any
-  ; other shape -- extra forms (escape attempt or stray `)`),
-  ; missing sentinel (unterminated string / missing close eating
-  ; the rest), or wrong head -- is a syntax error.
+  ; File-path wrapper: only runs on .il paths and tags the error
+  ; with the path. Used by ACL_writeChecked.
   when(pcreMatchp(ACL_skillFileRe path)
-    let((p forms err)
-      p = instring(strcat("progn(\n" content "\n) ACL_synEOF__"))
-      forms = car(errset(lineread(p) t))
-      close(p)
-      cond(
-        (or(null(forms) listp(forms) == nil)
-          err = "form list missing")
-        (length(forms) != 2
-          err = sprintf(nil "expected 2 top-level forms, got %d"
-                          length(forms)))
-        (cadr(forms) != 'ACL_synEOF__
-          err = "EOF sentinel missing (unterminated string or paren?)")
-        (or(null(listp(car(forms))) car(car(forms)) != 'progn)
-          err = "wrapper not preserved (stray `)` in content?)"))
+    let(((err ACL_skillSyntaxCheckCode(content)))
       when(err
         sprintf(nil "*error* syntax check failed for %s: %s" path err)))))
 
@@ -1440,29 +2559,6 @@ procedure(ACL_mcpScanMaxSeq(dir)
 ; 7. Stream Event Processing
 ; ============================================================
 
-procedure(ACL_claudeDataHandler(id data)
-  let((pos line)
-    when(ACL_enableRawLog
-      let(((fp outfile(strcat(ACL_homeDir "raw.log") "a")))
-        when(fp fprintf(fp "%s" data) close(fp))))
-    ACL_lineBuf = strcat(ACL_lineBuf data)
-    pos = nindex(ACL_lineBuf "\n")
-    while(pos
-      line = substring(ACL_lineBuf 1 (pos - 1))
-      ACL_lineBuf = or(substring(ACL_lineBuf (pos + 1)) "")
-      when(and(line strlen(line) > 0)
-        unless(errset(ACL_processStreamLine(line))
-          ACL_streamErrorCount++
-          printf("*Warning* ACL: stream error: %L\n" errset.errset)
-          axlFlushDisplay()))
-      pos = nindex(ACL_lineBuf "\n"))
-    ; A trigger from ACL_fallbackTriggers armed this flag during line
-    ; processing; relaunch with the fallback model now that we're back
-    ; at the top of the handler (no nested dataHandler frames to
-    ; deadlock on stopClaude).
-    when(ACL_fallbackRetryPending
-      ACL_fallbackRetry())))
-
 procedure(ACL_processStreamLine(line)
   prog((parsed etype subtype sid event evtype delta text cblock)
     parsed = ACL_jParse(line)
@@ -1470,42 +2566,32 @@ procedure(ACL_processStreamLine(line)
     parsed = car(parsed)
     etype = ACL_jGet(parsed "type")
     subtype = ACL_jGet(parsed "subtype")
-    ; Capture the session id from the `system/init` event. Other
-    ; events either don't carry a sid (stream events) or carry a
-    ; transient per-hook id (SessionStart hook events) that would
-    ; trip the new-session branch below spuriously.
+    ; Only system/init carries the authoritative session id; other
+    ; events either lack one or carry transient hook ids.
     sid = when(and(etype == "system" subtype == "init")
       ACL_jGet(parsed "session_id"))
     when(sid
       ; New sid (fresh session or fork) -- set up the log dir, copying
-      ; parent files for forks. Same sid (resume) -- nothing to do
-      ; here, the dir already exists.
+      ; parent files for forks. Same sid (resume) skips this branch
+      ; and just re-stamps the tag / re-seeds cmd seq below.
       when(sid != ACL_sessionId
         let(((newDir strcat(ACL_logDir sid "/"))
              (oldDir when(ACL_sessionId strcat(ACL_logDir ACL_sessionId "/"))))
           ACL_sessionId = sid
           createDir(ACL_logDir)
           createDir(newDir)
-          ; Fork (--fork-session): claude assigns a fresh sid distinct
-          ; from the parent. Copy parent log files into the fork's dir
-          ; so the new session inherits the readable history. The
-          ; parent's sessions.json entry is left alone; the fork
-          ; registers itself on its first text response under the
-          ; CURRENT board (handleForkSession reset ACL_sessionSaved).
+          ; --fork-session: copy parent logs into the new dir. The
+          ; parent's sessions.json entry stays; the fork registers
+          ; itself on first text under the CURRENT board.
           when(and(ACL_resumeIsFork oldDir isDir(oldDir))
             ACL_copyDirFiles(oldDir newDir))
           ACL_sessionLogDir = newDir
-          ; Drain any pre-init log buffer now that we know where to
-          ; persist (passing "" is a no-op text-wise but flushes
-          ; ACL_logUnflushed).
+          ; Drain any pre-init log buffer now that sessionLogDir is real.
           ACL_logFileAppend("")
           ACL_refreshLogButtons()))
-      ; Stamp the tag into the session dir so MCP can locate us.
       ACL_writeSessionTag()
-      ; Always seed cmd seq from existing files: critical for resume
-      ; (sid didn't change so the block above is a no-op) and harmless
-      ; for fresh sessions (dir is empty). Forks land here too after
-      ; the parent files were copied.
+      ; Seed cmd seq every init: critical for resume (sid unchanged
+      ; so the block above is a no-op); harmless on fresh sessions.
       ACL_mcpCmdSeq = ACL_mcpScanMaxSeq(ACL_sessionLogDir))
     cond(
       ; System events (init, api_retry, etc.)
@@ -1514,7 +2600,7 @@ procedure(ACL_processStreamLine(line)
           (subtype == "init"
             ACL_setStatus("Connected"))
           (subtype == "status"
-            ACL_claudeBusy = t
+            ACL_busy = t
             ACL_setStatus("Thinking..."))))
       ; Stream events (text deltas, tool use, etc.)
       (etype == "stream_event"
@@ -1528,44 +2614,20 @@ procedure(ACL_processStreamLine(line)
                 ACL_streamingMsgId = msgId
                 when(and(msgId null(assoc(msgId ACL_streamedMsgLen)))
                   ACL_streamedMsgLen = cons(list(msgId 0) ACL_streamedMsgLen)))
-              ACL_claudeBusy = t
+              ACL_busy = t
               ACL_setStatus("Responding..."))
             (evtype == "content_block_delta"
               delta = ACL_jGet(event "delta")
               when(and(delta ACL_jGet(delta "type") == "text_delta")
                 text = ACL_jGet(delta "text")
                 when(text
-                  ; Track streamed text length per message
                   when(ACL_streamingMsgId
                     let(((entry assoc(ACL_streamingMsgId ACL_streamedMsgLen)))
                       when(entry
                         rplaca(cdr(entry) (cadr(entry) + strlen(text))))))
                   ACL_responseBuf = strcat(ACL_responseBuf text)
                   ACL_streamToDisplay(text)
-                  ; Save session on first text. Forks inherit the
-                  ; parent's name via ACL_pendingForkName.
-                  when(and(null(ACL_sessionSaved) ACL_sessionId
-                           axlGetDrawingName())
-                    letseq(((base list(
-                              list("board" ACL_normPath(axlGetDrawingName()))
-                              list("time" sprintf(nil "%d"
-                                stringToTime(getCurrentTime())))))
-                            (info if(ACL_pendingForkName
-                                     append(base list(list("name"
-                                       ACL_pendingForkName)))
-                                     base)))
-                      ACL_addSession(ACL_sessionId info))
-                    ACL_pendingForkName = nil
-                    ACL_sessionSaved = t
-                    ; Refresh the picker if it's open so the new session appears
-                    when(ACL_sessionPickerForm
-                      ACL_renderSessionPicker(?selectIdx ACL_sessionPickerSelIdx))
-                    ; Tell claude where its prior commands live so it
-                    ; can grep them instead of re-running discovery.
-                    ACL_sendMessage(sprintf(nil
-                      "[Session log dir: %s -- holds your prior cmd_<n>.il/.out (allegro_execute code/output) from this session (reference them as appropriate), and is your scratch space for any reports, generated scripts, or working files the user might want to inspect via the Files... button.]"
-                      ACL_sessionLogDir)
-                      ?isSynthetic t ?noQuery t)))))
+                  ACL_maybeSaveSession())))
             (evtype == "content_block_start"
               cblock = ACL_jGet(event "content_block")
               cond(
@@ -1575,25 +2637,22 @@ procedure(ACL_processStreamLine(line)
                     pcreReplace(ACL_mcpToolPrefixRe
                       or(ACL_jGet(cblock "name") "tool") "" 0))))
                 (and(cblock ACL_jGet(cblock "type") == "text")
-                  ; Blank line before text that follows other content
-                  ; (prior turn, tool, prior text block).
+                  ; Blank line before text that follows prior content.
                   when(ACL_logContent ACL_logWrite("\n\n"))
                   ACL_hadToolUse = nil)))
             (evtype == "content_block_stop"
               ACL_setStatus("Thinking...")))))
-      ; Assistant message (complete, non-streaming). Skip text already
-      ; received via streaming; only display new content beyond what
-      ; was streamed for this message ID.
+      ; Assistant message (complete, non-streaming). Dedup vs deltas
+      ; by tracking streamedMsgLen per msgId.
       (etype == "assistant"
         let((msg content block msgId entry seenLen fullText newText u tot)
           msg = ACL_jGet(parsed "message")
           msgId = when(msg ACL_jGet(msg "id"))
           entry = when(msgId assoc(msgId ACL_streamedMsgLen))
           content = when(msg ACL_jGet(msg "content"))
-          ; Per-turn context numbers live on each assistant message
-          ; (message.usage). Result events report the SUM across all
-          ; internal turns in an exchange, so they're misleading for
-          ; "how full is the window" -- prefer this source instead.
+          ; message.usage carries per-turn context; result events
+          ; report the cumulative sum across internal turns, which is
+          ; misleading for "how full is the window".
           u = when(msg ACL_jGet(msg "usage"))
           tot = or(ACL_jGet(u "input_tokens") 0)
               + or(ACL_jGet(u "cache_read_input_tokens") 0)
@@ -1605,18 +2664,13 @@ procedure(ACL_processStreamLine(line)
               when(and(block ACL_jGet(block "type") == "text")
                 text = ACL_jGet(block "text")
                 when(text fullText = strcat(fullText text)))
-              ; Tool calls for our allegro_* MCP tools: extract the
-              ; arguments from the stream and execute locally.
               when(and(block ACL_jGet(block "type") == "tool_use"
                        pcreMatchp(ACL_mcpAllegroToolRe
                          or(ACL_jGet(block "name") "")))
                 ACL_handleToolCall(block)))
-            ; If we have a tracked entry for this msg, use it as the
-            ; high-water mark. Otherwise (no message_start was seen --
-            ; e.g. resume mid-turn, or partial stream capture), assume
-            ; the entire fullText was already delivered via deltas:
-            ; printing it again would duplicate; missing the unstreamed
-            ; prefix is the lesser evil.
+            ; entry == nil means we missed message_start (resume
+            ; mid-turn or partial capture); assume the whole text was
+            ; already delivered via deltas to avoid duplicates.
             seenLen = if(entry cadr(entry) strlen(fullText))
             when(strlen(fullText) > seenLen
               newText = substring(fullText (seenLen + 1))
@@ -1625,9 +2679,9 @@ procedure(ACL_processStreamLine(line)
                 ACL_streamToDisplay(newText))
               when(entry
                 rplaca(cdr(entry) strlen(fullText)))))))
-      ; Result (response complete). Claude Code emits spurious empty
-      ; result events (num_turns=0, stop_reason=null) on resume/init;
-      ; only the real turn-end carries a stop_reason.
+      ; Result (response complete). Claude emits spurious empty
+      ; result events on resume/init; only ones with a stop_reason
+      ; or is_error are real turn ends.
       (etype == "result"
         let(((cost ACL_jGet(parsed "total_cost_usd"))
              (isErr ACL_jGet(parsed "is_error"))
@@ -1635,21 +2689,18 @@ procedure(ACL_processStreamLine(line)
              (errReason ACL_jGet(parsed "terminal_reason"))
              (stopReason ACL_jGet(parsed "stop_reason"))
              (resText ACL_jGet(parsed "result")))
-          ; total_cost_usd is session-cumulative within a claude run
           when(numberp(cost) ACL_sessionCostUsd = cost)
-          ; modelUsage is an object keyed by model id; first entry's
-          ; contextWindow is what we need to compute % used.
+          ; modelUsage is keyed by model id; first entry's
+          ; contextWindow drives the % ctx display.
           ACL_lastContextWindow =
             or(ACL_jGet(cadr(car(ACL_jGet(parsed "modelUsage"))) "contextWindow")
                ACL_lastContextWindow)
-          ; Auto-fallback on a recognized model-specific API error.
-          ; Only retries while we're still on the primary; if the
-          ; fallback itself errors, we surface it normally below.
+          ; Auto-fallback first: a matching trigger swaps the model
+          ; and relaunches before the error reaches chat.
           let(((trigger when(isErr ACL_findFallbackTrigger(errStatus resText))))
-            if(and(trigger ACL_activeModel == ACL_primaryModel)
+            if(and(trigger ACL_fallbackEntry())
               ACL_scheduleFallbackRetry(trigger)
               progn(
-                ; Surface API/terminal errors
                 when(isErr
                   ACL_appendChat(sprintf(nil "\n[Error%s%s%s]\n"
                     if(errStatus sprintf(nil " %L" errStatus) "")
@@ -1658,9 +2709,9 @@ procedure(ACL_processStreamLine(line)
                       sprintf(nil ": %s" resText) ""))))
                 when(or(stopReason isErr)
                   ACL_onResponseComplete()))))))
-      ; User events carrying tool_result are how claude reports tool
-      ; completion back to itself. Flush queued user msgs here so they
-      ; land before claude's next assistant message.
+      ; tool_result inside a user event = claude finished a tool
+      ; call. Flush queued user msgs so they land before claude's
+      ; next assistant message.
       (etype == "user"
         letseq(((msg ACL_jGet(parsed "message"))
                 (content when(msg ACL_jGet(msg "content"))))
@@ -1686,6 +2737,11 @@ procedure(ACL_execBlock(code)
   prog((result errInfo errMsg output port warnings shellMsgs jfile)
     when(or(null(code) strlen(code) == 0)
       return("(empty block)"))
+    ; Reader-only structural check. Catches stray parens, unterminated
+    ; strings, etc. before errsetstring runs and leaves partial state.
+    let(((synErr ACL_skillSyntaxCheckCode(code)))
+      when(synErr
+        return(sprintf(nil "*error* syntax check failed: %s" synErr))))
     ; Check if axl* functions used are defined
     let(((docError ACL_checkFuncDocs(code)))
       when(docError
@@ -1779,23 +2835,61 @@ procedure(ACL_checkFuncDocs(code)
 ; 10. Response Complete Handler
 ; ============================================================
 
+procedure(ACL_weightedTokens(breakdown)
+  ; Codex reports only raw token counts -- no $-cost. Roll the
+  ; breakdown into a single comparable figure using output-tier
+  ; pricing as the unit: output (and reasoning, billed at output
+  ; rate) at 1x, fresh input at 1/8x, cache-hit input at 1/80x.
+  ; Returns a float so successive turns can accumulate cleanly.
+  letseq(((inp  or(ACL_jGet(breakdown "inputTokens") 0))
+          (cin  or(ACL_jGet(breakdown "cachedInputTokens") 0))
+          (out  or(ACL_jGet(breakdown "outputTokens") 0))
+          (reas or(ACL_jGet(breakdown "reasoningOutputTokens") 0)))
+    out + reas + (inp / 8.0) + (cin / 80.0)))
+
+procedure(ACL_formatTokenCount(n)
+  ; Render a token-equivalent count for the status bar in millions
+  ; ("1.23Mt") regardless of magnitude, so the bar reads consistently
+  ; across early-session and long-session usage.
+  sprintf(nil "%.2fMt" (n / 1000000.0)))
+
 procedure(ACL_readyStatus()
-  ; "Ready" decorated with cumulative cost and live context % when we
-  ; have any data yet. Bare "Ready" before the first result event.
-  if(plusp(ACL_sessionCostUsd)
-    sprintf(nil "Ready  -  $%.2f%s"
-      ACL_sessionCostUsd
-      if(and(ACL_lastContextWindow plusp(ACL_lastContextWindow))
-        sprintf(nil "  -  %d%% ctx"
-          round(100.0 * ACL_lastContextTokens / ACL_lastContextWindow))
-        ""))
-    "Ready"))
+  ; "Ready" decorated with cumulative cost (when known) and live context
+  ; % (when we have window+tokens). Falls back to a weighted-token total
+  ; when no $-cost is available (codex). Bare "Ready" if neither lands.
+  let(((hasCost plusp(ACL_sessionCostUsd))
+       (hasWtok plusp(ACL_sessionWeightedTokens))
+       (hasCtx and(ACL_lastContextWindow plusp(ACL_lastContextWindow)))
+       (use ""))
+    use = cond(
+      (hasCost sprintf(nil "$%.2f" ACL_sessionCostUsd))
+      (hasWtok ACL_formatTokenCount(ACL_sessionWeightedTokens))
+      (t nil))
+    cond(
+      (and(use hasCtx)
+        sprintf(nil "Ready  -  %s  -  %d%% ctx"
+          use round(100.0 * ACL_lastContextTokens / ACL_lastContextWindow)))
+      (use sprintf(nil "Ready  -  %s" use))
+      (hasCtx
+        sprintf(nil "Ready  -  %d%% ctx"
+          round(100.0 * ACL_lastContextTokens / ACL_lastContextWindow)))
+      (t "Ready"))))
 
 procedure(ACL_onResponseComplete()
   ACL_responseBuf = ""
-  ACL_claudeBusy = nil
-  ; Claude eats one queued msg per turn end (rest stay queued).
-  ACL_flushPendingChat(?one t)
+  ACL_busy = nil
+  ; Display queue drains in lockstep with what the transport
+  ; delivered. Codex: successful steers bank entries to flush at the
+  ; next item/started (so the user sees "You: ..." land alongside the
+  ; model's reaction); turn/completed sweeps the remainder (steered
+  ; text on a tool-less turn that never produced another item).
+  ; Claude takes one queued user msg per turn end, leaving the rest
+  ; visible as "Queued:".
+  when(ACL_activeDriver() == "codex"
+    ACL_codexFlushSteeredQueue())
+  if(ACL_activeDriver() == "codex"
+    ACL_flushPendingChat()
+    ACL_flushPendingChat(?one t))
   ACL_setStatus(ACL_readyStatus()))
 
 ; ============================================================
@@ -1858,7 +2952,11 @@ procedure(ACL_doSend(form)
 procedure(ACL_handleUserMessage(text)
   ACL_setStatus("Thinking...")
   ACL_responseBuf = ""
-  ACL_claudeBusy = t
+  ACL_busy = t
+  ; Record that the user has now provided real input; ACL_maybeSaveSession
+  ; gates on this so the synthetic boot-up turn alone doesn't persist
+  ; an empty session entry.
+  ACL_sessionUserMsgSeen = t
   let(((elapsed stringToTime(getCurrentTime()) - ACL_lastCmdTime))
     when(and(ACL_lastCmdTime elapsed > 60)
       ACL_sendMessage(
@@ -1920,6 +3018,8 @@ procedure(ACL_handleReject(@optional (extra ""))
 procedure(ACL_handleJournal(contents)
   ACL_setStatus("Analyzing...")
   ACL_responseBuf = ""
+  ; Recordings are a user-driven action -- count as real input.
+  ACL_sessionUserMsgSeen = t
   ACL_sendMessage(strcat(
     "The user recorded this Allegro macro/journal:\n\n```\n"
     contents "\n```\n\n"
@@ -1947,7 +3047,9 @@ procedure(ACL_handleSessionPick()
 
 procedure(ACL_renderSessionPicker(@key (selectIdx 0))
   ; Rebuild the listbox from sessions.json. selectIdx is clamped to the
-  ; new row count.
+  ; new row count. The model dropdown is populated from the live
+  ; registry and preselects whatever the last-used model was for new
+  ; sessions.
   letseq(((form ACL_sessionPickerForm)
           (sessions when(form ACL_sortSessionsByTime(ACL_loadSessions())))
           (rows mapcar(lambda((entry)
@@ -1955,12 +3057,22 @@ procedure(ACL_renderSessionPicker(@key (selectIdx 0))
                                          ?currentSid ACL_sessionId))
                        sessions))
           (allRows cons("+ New session" rows))
-          (clamped min(selectIdx (length(allRows) - 1))))
+          (clamped min(selectIdx (length(allRows) - 1)))
+          (registry ACL_models())
+          (modelLabels mapcar('ACL_entryLabel registry))
+          (activeIds mapcar('car registry))
+          (activeTail member(ACL_activeId() activeIds))
+          (activeIdx if(activeTail (length(activeIds) - length(activeTail)) 0))
+          (preselect or(nth(activeIdx modelLabels) car(modelLabels))))
     when(form
       ACL_sessionPickerSids = cons(nil mapcar('car sessions))
+      ACL_sessionPickerModelIds = mapcar('car registry)
       ACL_sessionPickerSelIdx = clamped
       axlFormListDeleteAll(form "sessionlist")
       axlFormListAddItem(form "sessionlist" allRows nil)
+      axlFormListDeleteAll(form "modelchoice")
+      axlFormListAddItem(form "modelchoice" modelLabels nil)
+      axlFormListSelect(form "modelchoice" preselect)
       ; SetActiveField on a LIST resets the cursor; do it before select.
       axlFormSetActiveField(form "sessionlist")
       axlFormListSelect(form "sessionlist" nth(clamped allRows))
@@ -1978,13 +3090,17 @@ procedure(ACL_updateSessionPickerButtons()
   ; row. "+ New session" and the current-session row both target the
   ; running session, so they share the "current session" label and the
   ; "no current session yet" disabled state. Any other row targets
-  ; whichever entry is highlighted.
+  ; whichever entry is highlighted. The model dropdown is only
+  ; meaningful for the "+ New session" row -- existing sessions lock
+  ; to the model they were started with.
   letseq(((form ACL_sessionPickerForm)
           (selSid ACL_selectedSessionSid())
-          (targetsCurrent or(ACL_selectedIsNewSession()
+          (newRow ACL_selectedIsNewSession())
+          (targetsCurrent or(newRow
                              and(selSid selSid == ACL_sessionId)))
           (currentInfo when(ACL_sessionId ACL_getSession(ACL_sessionId)))
-          (haveCurrent and(ACL_sessionId currentInfo)))
+          (haveCurrent and(ACL_sessionId currentInfo))
+          (selInfo when(and(selSid null(newRow)) ACL_getSession(selSid))))
     when(form
       if(targetsCurrent then
         axlFormSetField(form "rename" "Rename current session")
@@ -1997,10 +3113,17 @@ procedure(ACL_updateSessionPickerButtons()
         axlFormSetFieldEditable(form "rename" t)
         axlFormSetFieldEditable(form "delete" t))
       axlFormSetField(form "restore"
-        if(ACL_selectedIsNewSession() "Create" "Open")))))
+        if(newRow "Create" "Open"))
+      ; Highlight the locked-in model when an existing session is
+      ; selected; otherwise leave whatever the user picked.
+      letseq(((sessId when(selInfo ACL_sessionModel(selInfo)))
+              (entry when(sessId ACL_modelById(sessId))))
+        when(entry
+          axlFormListSelect(form "modelchoice" ACL_entryLabel(entry))))
+      axlFormSetFieldEditable(form "modelchoice" newRow))))
 
 procedure(ACL_sessionPickerCB(form)
-  prog((field)
+  prog((field val)
     when(form->doneState != 0
       ; Window-manager dismiss: clear refs so no later code touches a
       ; dead form.
@@ -2009,12 +3132,21 @@ procedure(ACL_sessionPickerCB(form)
       ACL_sessionPickerSelIdx = 0
       return(t))
     field = form->curField
+    val = form->curValue
     cond(
       (field == "sessionlist"
         ; Cache the index; button clicks fire as their own field events
         ; and won't see the list's curValueInt.
         ACL_sessionPickerSelIdx = or(form->curValueInt 0)
         ACL_updateSessionPickerButtons())
+      (field == "modelchoice"
+        ; For "New session" the dropdown drives the active entry that
+        ; ACL_handlePickerRestore will commit. Existing rows ignore it.
+        ; Map the listbox index back to the id we recorded at render
+        ; time -- the displayed value is the label, not the id.
+        when(ACL_selectedIsNewSession()
+          let(((id nth(or(form->curValueInt 0) ACL_sessionPickerModelIds)))
+            when(id ACL_activeEntry = ACL_resolveModel(id)))))
       (field == "rename" ACL_handlePickerRename())
       (field == "delete" ACL_handlePickerDelete())
       (field == "restore" ACL_handlePickerRestore()))))
@@ -2066,10 +3198,14 @@ procedure(ACL_handlePickerDelete()
 procedure(ACL_handlePickerRestore()
   ; Open the selected session: New, Restore-on-same-board, or
   ; Fork-from-another-board. Closes the picker before handing off.
+  ; ACL_activeEntry was already updated by the modelchoice callback
+  ; when the user picked a model; persist it for new sessions.
   letseq(((newRow ACL_selectedIsNewSession())
           (sid if(newRow nil ACL_selectedSessionSid()))
           (info when(sid ACL_getSession(sid)))
           (board when(info or(ACL_jGet(info "board") ""))))
+    when(newRow
+      ACL_saveSettings(ACL_settingsFile ACL_currentSettings()))
     axlFormClose(ACL_sessionPickerForm)
     ACL_sessionPickerForm = nil
     cond(
@@ -2110,23 +3246,40 @@ procedure(ACL_findOrPlanDocs()
             when(isFile(path) found = path)))))
     or(found strcat(ACL_notesDir exactName))))
 
+procedure(ACL_lockSessionModel(info)
+  ; Pin ACL_activeEntry to the model the session was started with.
+  ; Returns t on success, nil if the recorded model is no longer in
+  ; the registry. Caller must abort the restore/fork on nil -- we
+  ; can't silently fall back because a session is bound to its driver
+  ; (claude can't pick up a codex thread id and vice versa).
+  letseq(((want ACL_sessionModel(info))
+          (entry and(ACL_nonEmpty(want) ACL_modelById(want))))
+    when(entry
+      ACL_activeEntry = entry
+      t)))
+
 procedure(ACL_handleNewSession()
   ACL_sessionId = nil
   ; Drop the previous session's dir so logFileAppend buffers into
   ; logUnflushed until the init handler assigns the new sid's dir.
   ; Otherwise the "Starting new session..." line and any warnings
-  ; here land in the OLD session's log.txt while claude is launching.
+  ; here land in the OLD session's log.txt while the agent is launching.
   ACL_sessionLogDir = ACL_logDir
   ACL_sessionSaved = nil
+  ACL_sessionUserMsgSeen = nil
   ACL_pendingForkName = nil
   ACL_logReset()
-  ACL_startClaude()
+  ACL_startAgent()
   ACL_appendChat("Starting new session...")
   ACL_setStatus("Starting...")
   ; Documentation handling: the cached doc (if it exists) is loaded
-  ; into the system prompt by ACL_startClaude via --append-system-prompt-file,
-  ; so we don't need to ask claude to read it at runtime. If no cache
-  ; exists, point the user at the external builder.
+  ; into the system prompt by ACL_startAgent via --append-system-prompt-file,
+  ; so we don't need to ask the agent to read it at runtime. If no cache
+  ; exists, point the user at the external builder. Skip this hint when
+  ; the active model can't host the cache anyway -- the warning would
+  ; just be noise. (The cache is useful even on small-context models
+  ; as an MCP-readable grep target, so we hint as long as fast mode
+  ; is off.)
   unless(ACL_fast let((doc installRoot)
     doc = ACL_findOrPlanDocs()
     unless(isFile(doc)
@@ -2151,36 +3304,51 @@ procedure(ACL_handleNewSession()
     ?isSynthetic t))
 
 procedure(ACL_handleRestoreSession(sid)
-  let(((info ACL_getSession(sid)))
-    if(null(info) then
-      ; Session not in our sessions.json -- nothing to restore.
-      ACL_handleNewSession()
-    else
-      ACL_sessionId = sid
-      ACL_sessionLogDir = strcat(ACL_logDir ACL_sessionId "/")
-      ACL_sessionSaved = t
-      ACL_logReset()
-      ACL_logLoadFromFile()
-      ACL_refreshLogButtons()
-      ACL_applySettings(or(
-        ACL_loadSettings(strcat(ACL_sessionLogDir "settings.json"))
-        ACL_loadSettings(ACL_settingsFile)
-        nil))
-      ACL_startClaude(sid)
-      ; If claude rejected the --resume id, the stderr handler has
-      ; already cleared ACL_sessionId. Recover into a fresh session
-      ; instead of leaving the user staring at a blank dialog.
-      if(null(ACL_sessionId) then
-        ACL_handleNewSession()
-      else
-        letseq(((name ACL_sessionName(info))
-                (label if(name strcat("\"" name "\" (" sid ")") sid)))
-          ACL_appendChat(strcat(
-            "\n\nRestored session: " label "\n"
+  letseq(((info ACL_getSession(sid))
+          (modelOk and(info ACL_lockSessionModel(info))))
+    cond(
+      (null(info)
+        ; Session not in our sessions.json -- nothing to restore.
+        ACL_handleNewSession())
+      (null(modelOk)
+        ; Session was started with a model the current registry no
+        ; longer knows about. We can't safely substitute -- the
+        ; underlying driver might not be a match. Refuse and start
+        ; fresh, surfacing why so the user can fix their config.
+        letseq(((want or(ACL_sessionModel(info) "?")))
+          ACL_handleNewSession()
+          ACL_appendChat(sprintf(nil
+            "\n[Session was started with model %L, which is not in the current registry. Started a new session instead. Restore the model in ACL_extraModels (see plans/site-model-overrides.md) if you want to keep using it.]\n"
+            want))))
+      (t
+        ACL_sessionId = sid
+        ACL_sessionLogDir = strcat(ACL_logDir ACL_sessionId "/")
+        ACL_sessionSaved = t
+        ACL_sessionUserMsgSeen = t
+        ACL_logReset()
+        ACL_logLoadFromFile()
+        ACL_refreshLogButtons()
+        ACL_applySettings(or(
+          ACL_loadSettings(strcat(ACL_sessionLogDir "settings.json"))
+          ACL_loadSettings(ACL_settingsFile)
+          nil))
+        ; Re-lock the model in case applySettings stomped on it.
+        ACL_lockSessionModel(info)
+        ACL_startAgent(sid)
+        ; If the agent rejected the resume id, the stderr handler has
+        ; already cleared ACL_sessionId. Recover into a fresh session
+        ; instead of leaving the user staring at a blank dialog.
+        if(null(ACL_sessionId) then
+          ACL_handleNewSession()
+        else
+          letseq(((name ACL_sessionName(info))
+                  (label if(name strcat("\"" name "\" (" sid ")") sid)))
+            ACL_appendChat(strcat(
+              "\n\nRestored session: " label "\n"
             "Continuing the conversation from where you left off on this board.\n"
             "If you want to start fresh, use the Session... button and choose 'New session'.")
             ?toFile nil))
-        ACL_setStatus(ACL_readyStatus())))))
+        ACL_setStatus(ACL_readyStatus()))))))
 
 procedure(ACL_handleForkSession(sid)
   prog((info oldBoard)
@@ -2188,6 +3356,16 @@ procedure(ACL_handleForkSession(sid)
     unless(info
       ACL_appendChat(sprintf(nil "Session not found: %s" sid))
       return(nil))
+    ; Fork requires the parent's model to still be in the registry --
+    ; a codex thread can't be forked from claude (and vice versa).
+    ; Refuse and start fresh, surfacing why.
+    unless(ACL_lockSessionModel(info)
+      letseq(((want or(ACL_sessionModel(info) "?")))
+        ACL_handleNewSession()
+        ACL_appendChat(sprintf(nil
+          "\n[Cannot fork: source session uses model %L, which is not in the current registry. Started a new session instead. Restore the model in ACL_extraModels (see plans/site-model-overrides.md) if you want to keep using it.]\n"
+          want))
+        return(nil)))
     oldBoard = or(ACL_jGet(info "board") "unknown")
     ; Seed sessionId with the parent so init can find the parent log
     ; dir to copy. Cleared sessionSaved makes the fork register under
@@ -2198,9 +3376,15 @@ procedure(ACL_handleForkSession(sid)
     ACL_sessionId = sid
     ACL_sessionLogDir = ACL_logDir
     ACL_sessionSaved = nil
+    ; A fork is user-initiated on the new board; the target-board
+    ; sendMessage below counts as the real-input trigger so the fork's
+    ; sessions.json entry can land on first reply.
+    ACL_sessionUserMsgSeen = t
+    ; Parent's model already locked above; ACL_lockSessionModel is
+    ; idempotent so no need to re-call.
     ACL_logReset()
-    ACL_startClaude(sid t)
-    ; Stderr handler clears sessionId if claude rejected --resume.
+    ACL_startAgent(sid t)
+    ; Stderr handler clears sessionId if the agent rejected the resume.
     if(null(ACL_sessionId) then
       ACL_handleNewSession()
     else
@@ -2243,19 +3427,19 @@ procedure(ACL_openPanel(@rest args)
       axlFormDisplay(ACL_form)
       axlFormSetActiveField(ACL_form "userinput")
       if(ACL_sessionId then
-        ACL_ensureClaude()
+        ACL_ensureAgent()
         ; Redisplay existing log and status after window reopen
         when(ACL_logContent
           axlFormSetField(ACL_form "chatlog"
             ACL_logTail(ACL_logLineLimit)))
-        ACL_setStatus(if(and(ACL_claude ipcIsAliveProcess(ACL_claude))
+        ACL_setStatus(if(and(ACL_proc ipcIsAliveProcess(ACL_proc))
           ACL_readyStatus() "Starting..."))
       else
         letseq(((board axlGetDrawingName())
                 (sessions when(board ACL_getBoardSessions(board))))
           ; Auto-resume the most recent session for this board, if any.
           ; If the session id is stale, the stderr handler clears it and
-          ; the next user action starts fresh via ACL_ensureClaude.
+          ; the next user action starts fresh via ACL_ensureAgent.
           if(sessions then
             ACL_handleRestoreSession(car(car(ACL_sortSessionsByTime(sessions))))
           else
@@ -2266,1167 +3450,5 @@ procedure(ACL_openPanel(@rest args)
         ACL_doSend(ACL_form)))))
 
 axlCmdRegister("claude" 'ACL_openPanel ?cmdType "general")
-regExitBefore('ACL_stopClaude)
+regExitBefore('ACL_stopAgent)
 
-; ============================================================
-; 15. Tests  --  run with:  ACL_runTests()
-; ============================================================
-
-defvar(ACL_testPass 0)
-defvar(ACL_testFail 0)
-
-procedure(ACL_check(name got expected)
-  if(equal(got expected) then
-    ACL_testPass++
-    printf("  PASS: %s\n" name)
-  else
-    ACL_testFail++
-    printf("  FAIL: %s\n    got:      %L\n    expected: %L\n" name got expected)))
-
-procedure(ACL_checkTrue(name got)
-  ; Like ACL_check but coerces got to a boolean -- avoids the noisy
-  ; `ACL_check("...", and(x t), t)` idiom.
-  ACL_check(name and(got t) t))
-
-procedure(ACL_runTests()
-  ACL_testPass = 0
-  ACL_testFail = 0
-
-  printf("\n--- JSON Parser ---\n")
-  ; Primitives
-  ACL_check("string"       car(ACL_jParse("\"hello\""))        "hello")
-  ACL_check("string pos"   cadr(ACL_jParse("\"hello\""))        8)
-  ACL_check("empty string" car(ACL_jParse("\"\""))             "")
-  ACL_check("escaped str"  car(ACL_jParse("\"a\\nb\\tc\""))    "a\nb\tc")
-  ACL_check("escaped quote" car(ACL_jParse("\"say \\\"hi\\\"\"")) "say \"hi\"")
-  ACL_check("escaped backslash" car(ACL_jParse("\"a\\\\b\""))  "a\\b")
-  ; Pathological: literal "\\n" (backslash + n) must NOT decode to a
-  ; newline -- exercises the sentinel-swap in jUnescape.
-  ACL_check("escaped backslash-n"
-    car(ACL_jParse("\"a\\\\nb\""))  "a\\nb")
-  ACL_check("escaped slash"
-    car(ACL_jParse("\"a\\/b\""))    "a/b")
-  ACL_check("integer"      car(ACL_jParse("42"))               42)
-  ACL_check("negative"     car(ACL_jParse("-7"))               -7)
-  ACL_check("float"        car(ACL_jParse("3.14"))             3.14)
-  ACL_check("true"         car(ACL_jParse("true"))             t)
-  ACL_check("false"        car(ACL_jParse("false"))            nil)
-  ACL_check("null"         car(ACL_jParse("null"))             nil)
-  ACL_check("whitespace"   car(ACL_jParse("  42  "))           42)
-
-  ; Objects
-  ACL_check("empty obj"    car(ACL_jParse("{}"))               nil)
-  ACL_check("simple obj"   ACL_jGet(car(ACL_jParse("{\"a\":1}")) "a")  1)
-  let(((o car(ACL_jParse("{\"x\":10,\"y\":20}"))))
-    ACL_check("multi obj"  list(ACL_jGet(o "x") ACL_jGet(o "y"))  list(10 20)))
-  ACL_check("nested obj"
-    ACL_jGet(ACL_jGet(car(ACL_jParse("{\"a\":{\"b\":99}}")) "a") "b")
-    99)
-
-  ; Arrays
-  ACL_check("empty arr"    car(ACL_jParse("[]"))               nil)
-  ACL_check("simple arr"   car(ACL_jParse("[1,2,3]"))          '(1 2 3))
-  ACL_check("string arr"   car(ACL_jParse("[\"a\",\"b\"]"))    '("a" "b"))
-  ACL_check("nested arr"   car(ACL_jParse("[[1],[2]]"))        '((1) (2)))
-
-  ; Edge cases
-  ACL_check("end of str"   ACL_jParse("")                      nil)
-  ACL_check("just ws"      ACL_jParse("   ")                   nil)
-
-  printf("\n--- JSON Writer ---\n")
-  ACL_check("esc str"      ACL_jsonEscStr("hello")             "\"hello\"")
-  ACL_check("esc newline"  ACL_jsonEscStr("a\nb")              "\"a\\nb\"")
-  ACL_check("esc quote"    ACL_jsonEscStr("say \"hi\"")        "\"say \\\"hi\\\"\"")
-  ACL_check("val string"   ACL_jsonVal("hi")                   "\"hi\"")
-  ACL_check("val int"      ACL_jsonVal(42)                     "42")
-  ACL_check("val true"     ACL_jsonVal(t)                      "true")
-  ACL_check("val nil"      ACL_jsonVal(nil)                    "null")
-  ACL_check("val array"    ACL_jsonVal('(1 2 3))               "[1,2,3]")
-  ; List-of-lists with non-string keys must serialize as a nested
-  ; array, not as an object with weird non-string keys.
-  ACL_check("val nested arr"  ACL_jsonVal('((1 2) 3))           "[[1,2],3]")
-  ACL_check("val list of arr" ACL_jsonVal(list(list(1) list(2))) "[[1],[2]]")
-  ACL_check("jsonObj"
-    ACL_jsonObj(list("type" "msg") list("n" 1))
-    "{\"type\":\"msg\",\"n\":1}")
-
-  printf("\n--- JSON Roundtrip ---\n")
-  letseq(((orig ACL_jsonObj(list("type" "user_message")
-                            list("content" "hello\nworld")))
-          (parsed car(ACL_jParse(orig))))
-    ACL_check("rt type"    ACL_jGet(parsed "type")     "user_message")
-    ACL_check("rt content" ACL_jGet(parsed "content")  "hello\nworld"))
-
-  printf("\n--- SKILL Execution ---\n")
-  let(((savedForm ACL_form))
-    ACL_form = nil
-    ACL_check("exec simple"
-      ACL_execBlock("(plus 40 2)")
-      "Result: 42")
-    ACL_check("checkFuncDocs all bound"
-      ACL_checkFuncDocs("axlMsgPut(\"hi\") axlGetVariable(\"foo\")")
-      nil)
-    ACL_checkTrue("checkFuncDocs flags missing"
-      ACL_checkFuncDocs("axlMsgPut(x) axlBogusNotARealFunction()"))
-    ACL_check("exec empty"
-      ACL_execBlock("")
-      "(empty block)")
-    ACL_check("exec with output"
-      ACL_execBlock("printf(\"hello\\n\") 99")
-      "Output:\nhello\n\nResult: 99")
-    let(((errResult ACL_execBlock("(undefined_function_xyz)")))
-      ACL_checkTrue("exec error" nindex(errResult "*Error*")))
-    ; Allegro shell errors should be captured via the journal
-    let(((shellResult ACL_execBlock("axlShell(\"zoom bogus\")")))
-      ACL_checkTrue("exec captures shell error"
-        nindex(shellResult "Command not found")))
-    ; SKILL error() message text should survive
-    let(((errResult ACL_execBlock("error(\"my custom error\")")))
-      ACL_checkTrue("exec preserves error msg"
-        nindex(errResult "my custom error")))
-    ; axlMsgPut output should be captured (journal)
-    let(((msgResult ACL_execBlock("axlMsgPut(\"a logged note\")")))
-      ACL_checkTrue("exec captures axlMsgPut"
-        nindex(msgResult "a logged note")))
-    ; Multi-statement blocks should all evaluate; result is the last
-    ; expression's value. (Without the progn wrapper, errsetstring
-    ; would only run the first form.)
-    ACL_check("exec multi-statement"
-      ACL_execBlock("x = 7\ny = 5\nx + y")
-      "Result: 12")
-    ACL_check("exec multi-statement side effects"
-      ACL_execBlock("acc = 0\nfor(i 1 4 acc = acc + i)\nacc")
-      "Result: 10")
-    ; A trailing line comment must not eat the closing paren we add.
-    ACL_check("exec trailing comment"
-      ACL_execBlock("(plus 1 2) ; comment with no trailing newline")
-      "Result: 3")
-    ACL_form = savedForm)
-
-  printf("\n--- Display Streaming ---\n")
-  let(((savedForm ACL_form) (savedLog ACL_logContent))
-    ACL_form = nil
-    ; plain text goes straight to log
-    ACL_logContent = nil
-    ACL_streamToDisplay("hello world")
-    ACL_check("plain flush"    ACL_logString() "hello world")
-    ; partial line continuation via rplaca
-    ACL_logContent = nil
-    ACL_logWrite("hel")
-    ACL_logWrite("lo\nwor")
-    ACL_logWrite("ld")
-    ACL_check("partial lines" ACL_logString() "hello\nworld")
-    ; logTail with partial line
-    ACL_check("tail partial" ACL_logTail(50) "hello\nworld")
-    ; logTail truncation
-    ACL_logContent = nil
-    ACL_logWrite("a\nb\nc\nd\ne\n")
-    ACL_check("tail trunc" ACL_logTail(3) "...\nc\nd\ne\n")
-    ACL_form = savedForm
-    ACL_logContent = savedLog)
-
-  printf("\n--- MCP File IPC ---\n")
-  let(((savedForm ACL_form) (savedSessionDir ACL_sessionLogDir)
-       (savedSeq ACL_mcpCmdSeq) (savedPending ACL_mcpPending))
-    ACL_form = nil
-    ACL_sessionLogDir = strcat(ACL_homeDir "mcp_test/")
-    ACL_mcpCmdSeq = 0
-    ACL_mcpPending = nil
-    createDir(ACL_sessionLogDir)
-    ; Simulate a tool_use block arriving from claude. ACL_handleToolCall
-    ; queues + arms a one-shot timer; we drain manually.
-    ACL_handleToolCall(list(list("id" "toolu_test_42")
-                            list("name" "mcp__allegro__allegro_execute")
-                            list("input" list(list("code" "(plus 40 2)")))))
-    ACL_check("queued one"
-      length(ACL_mcpPending) 1)
-    ACL_mcpDrainPending()
-    ACL_check("pending cleared" ACL_mcpPending nil)
-    ACL_check("seq advanced" ACL_mcpCmdSeq 1)
-    ACL_checkTrue("cmd il written"
-      isFile(strcat(ACL_sessionLogDir "cmd_1.il")))
-    ACL_checkTrue("cmd out written"
-      isFile(strcat(ACL_sessionLogDir "cmd_1.out")))
-    ACL_checkTrue("ipc out written"
-      isFile(strcat(ACL_sessionLogDir "tool_toolu_test_42.out")))
-    ACL_check("cmd il content"
-      ACL_readFile(strcat(ACL_sessionLogDir "cmd_1.il")) "(plus 40 2)")
-    ACL_check("ipc out content"
-      ACL_readFile(strcat(ACL_sessionLogDir "tool_toolu_test_42.out"))
-      "Result: 42")
-    ; Multiple queued at once should all execute on one drain
-    ACL_handleToolCall(list(list("id" "toolu_a") list("name" "mcp__allegro__allegro_execute")
-                            list("input" list(list("code" "(plus 1 1)")))))
-    ACL_handleToolCall(list(list("id" "toolu_b") list("name" "mcp__allegro__allegro_execute")
-                            list("input" list(list("code" "(plus 2 2)")))))
-    ACL_check("queued two" length(ACL_mcpPending) 2)
-    ACL_mcpDrainPending()
-    ACL_check("seq advanced again" ACL_mcpCmdSeq 3)
-    ACL_check("ipc a" ACL_readFile(strcat(ACL_sessionLogDir "tool_toolu_a.out"))
-      "Result: 2")
-    ACL_check("ipc b" ACL_readFile(strcat(ACL_sessionLogDir "tool_toolu_b.out"))
-      "Result: 4")
-    ; Block missing required fields is ignored
-    ACL_handleToolCall(list(list("name" "mcp__allegro__allegro_execute")
-                            list("input" list(list("code" "(plus 9 9)")))))
-    ACL_check("missing id ignored" ACL_mcpPending nil)
-    ; ACL_mcpScanMaxSeq finds the highest existing N
-    ACL_check("scan max seq sees existing"
-      ACL_mcpScanMaxSeq(ACL_sessionLogDir) 3)
-    ; Empty dir -> 0
-    let(((emptyDir strcat(ACL_homeDir "mcp_test_empty/")))
-      createDir(emptyDir)
-      ACL_check("scan max seq empty dir"
-        ACL_mcpScanMaxSeq(emptyDir) 0)
-      errset(deleteDir(emptyDir)))
-    ; Nonexistent dir -> 0 (errset swallows)
-    ACL_check("scan max seq nonexistent dir"
-      ACL_mcpScanMaxSeq(strcat(ACL_homeDir "no_such_dir_42")) 0)
-
-    ; --- Manual mode: tool calls are HELD until approve/reject ---
-    let(((savedMode ACL_mode))
-      ACL_mode = "manual"
-      ACL_mcpPending = nil
-      ACL_handleToolCall(list(list("id" "toolu_manual_1")
-                              list("name" "mcp__allegro__allegro_execute")
-                              list("input" list(list("code" "(plus 5 5)")))))
-      ACL_check("manual: queued" length(ACL_mcpPending) 1)
-      ACL_check("manual: timer NOT armed" ACL_mcpExecTimer nil)
-      ; Approve schedules a deferred drain; in tests, run it inline.
-      ACL_handleApprove()
-      ACL_checkTrue("manual: approve scheduled" ACL_mcpExecTimer)
-      ACL_mcpDrainPending()
-      ACL_check("manual: approve drained" ACL_mcpPending nil)
-      ACL_checkTrue("manual: approve wrote .out"
-        isFile(strcat(ACL_sessionLogDir "tool_toolu_manual_1.out")))
-
-      ; Reject writes a rejection .out for each pending so the MCP
-      ; server doesn't hang polling.
-      ACL_handleToolCall(list(list("id" "toolu_manual_2")
-                              list("name" "mcp__allegro__allegro_execute")
-                              list("input" list(list("code" "(plus 7 7)")))))
-      ACL_check("manual: queued again" length(ACL_mcpPending) 1)
-      ACL_handleReject()
-      ACL_check("manual: reject cleared" ACL_mcpPending nil)
-      ACL_checkTrue("manual: reject wrote .out"
-        isFile(strcat(ACL_sessionLogDir "tool_toolu_manual_2.out")))
-      ACL_check("manual: reject .out content"
-        ACL_readFile(strcat(ACL_sessionLogDir "tool_toolu_manual_2.out"))
-        "*rejected by user in manual mode* -- do not retry. Ask the user what they would like instead.")
-
-      ; Reject WITH extra prompting -- chat shows the user's text and
-      ; the .out passes their words through to claude.
-      ACL_handleToolCall(list(list("id" "toolu_manual_3")
-                              list("name" "mcp__allegro__allegro_execute")
-                              list("input" list(list("code" "(plus 9 9)")))))
-      ACL_handleReject("but use snap_grid first")
-      ACL_check("manual: reject extra .out content"
-        ACL_readFile(strcat(ACL_sessionLogDir "tool_toolu_manual_3.out"))
-        "*rejected by user in manual mode* -- do not retry. The user said:\n\"but use snap_grid first\"\n. Respond accordingly.")
-
-      ; approve/reject regexes accept variants and pass extras
-      ACL_check("approveRe bare" pcreMatchp(ACL_approveRe "approve") t)
-      ACL_check("approveRe ed+text"
-        and(pcreMatchp(ACL_approveRe "approved. good job")
-            pcreSubstitute(ACL_approveRe "\\1")) "good job")
-      ACL_check("rejectRe ed+text"
-        and(pcreMatchp(ACL_rejectRe "rejected, but try this instead")
-            pcreSubstitute(ACL_rejectRe "\\1")) "but try this instead")
-      ACL_check("approveRe doesn't match unrelated"
-        pcreMatchp(ACL_approveRe "what does approve do?") nil)
-
-      ACL_mode = savedMode)
-
-    ; Clean up
-    foreach(f ACL_listDirFiles(ACL_sessionLogDir)
-      errset(deleteFile(strcat(ACL_sessionLogDir f))))
-    errset(deleteDir(ACL_sessionLogDir))
-    ACL_sessionLogDir = savedSessionDir
-    ACL_mcpCmdSeq = savedSeq
-    ACL_mcpPending = savedPending
-    ACL_form = savedForm)
-
-  printf("\n--- SKILL syntax check ---\n")
-  ; Reader-only check: must accept well-formed content, reject
-  ; structural problems, and crucially MUST NOT execute content
-  ; (no eval -- code injection attempts read as extra forms and
-  ; are rejected).
-  let((dummy)
-    ; Non-.il paths: skipped, returns nil
-    ACL_check("syn skip non-.il"
-      ACL_skillSyntaxCheck("foo.txt" "anything goes ;;) ((") nil)
-    ; Well-formed
-    ACL_check("syn accept simple"
-      ACL_skillSyntaxCheck("a.il" "(plus 1 2)") nil)
-    ACL_check("syn accept multi-form"
-      ACL_skillSyntaxCheck("a.il" "(plus 1 2)\n(times 3 4)") nil)
-    ACL_check("syn accept empty"
-      ACL_skillSyntaxCheck("a.il" "") nil)
-    ACL_check("syn accept whitespace only"
-      ACL_skillSyntaxCheck("a.il" "\n\n  \n") nil)
-    ACL_check("syn accept procedure def"
-      ACL_skillSyntaxCheck("a.il"
-        "procedure(foo(x) plus(x 1))\n") nil)
-    ACL_check("syn accept comments"
-      ACL_skillSyntaxCheck("a.il" "; just a comment\n(plus 1 2)") nil)
-    ACL_check("syn accept literal nil form"
-      ACL_skillSyntaxCheck("a.il" "nil") nil)
-    ; Malformed
-    ACL_checkTrue("syn reject extra close"
-      ACL_skillSyntaxCheck("a.il" "(plus 1 2)))"))
-    ACL_checkTrue("syn reject missing close"
-      ACL_skillSyntaxCheck("a.il" "(plus 1 2"))
-    ACL_checkTrue("syn reject unterm string"
-      ACL_skillSyntaxCheck("a.il" "(setq x \"open"))
-    ; Safety: payloads designed to escape the wrapper. The probe
-    ; that matters is that the global ACL_synProbeFlag stays nil --
-    ; reader-only check must NOT execute the payload.
-    ACL_synProbeFlag = nil
-    ACL_checkTrue("syn reject escape-progn payload"
-      ACL_skillSyntaxCheck("a.il"
-        ") (setq ACL_synProbeFlag 'PWNED) progn("))
-    ACL_check("syn payload did not run"
-      ACL_synProbeFlag nil)
-    ; Trailing junk after a balanced form: extra top-level form,
-    ; reader sees 3 forms (progn body, junk, EOF), rejected.
-    ACL_synProbeFlag = nil
-    ACL_checkTrue("syn reject trailing junk after balance"
-      ACL_skillSyntaxCheck("a.il"
-        "(setq x 1)\n) (setq ACL_synProbeFlag 'PWNED) progn("))
-    ACL_check("syn trailing-junk payload did not run"
-      ACL_synProbeFlag nil))
-
-  let(((tmpDir strcat(ACL_homeDir "filetool_test/")))
-    ACL_createDirP(tmpDir)
-    ; read_file: missing file
-    ACL_check("read_file missing"
-      ACL_runTool("mcp__allegro__allegro_read_file"
-        list(list("path" strcat(tmpDir "nope.txt"))))
-      sprintf(nil "*error* read_file: not a file: %snope.txt" tmpDir))
-    ; write_file plain text
-    let(((p strcat(tmpDir "hello.txt")))
-      ACL_runTool("mcp__allegro__allegro_write_file"
-        list(list("path" p) list("content" "hi there\n")))
-      ACL_check("write_file content"
-        ACL_runTool("mcp__allegro__allegro_read_file" list(list("path" p)))
-        "hi there\n"))
-    ; write_file SKILL with valid syntax
-    let(((p strcat(tmpDir "good.il")))
-      ACL_runTool("mcp__allegro__allegro_write_file"
-        list(list("path" p)
-             list("content" "(plus 1 2)\n(times 3 4)\n")))
-      ACL_check("write_file .il valid round-trip"
-        ACL_runTool("mcp__allegro__allegro_read_file" list(list("path" p)))
-        "(plus 1 2)\n(times 3 4)\n"))
-    ; write_file SKILL with bad syntax: rejected, file untouched
-    let(((p strcat(tmpDir "bad.il")))
-      ACL_runTool("mcp__allegro__allegro_write_file"
-        list(list("path" p) list("content" "(plus 1 2)))\n")))
-      ACL_check("write_file .il bad: file not created"
-        isFile(p) nil)
-      ACL_checkTrue("write_file .il bad: returns error"
-        pcreMatchp(pcreCompile("syntax check failed")
-          ACL_runTool("mcp__allegro__allegro_write_file"
-            list(list("path" p) list("content" "unbalanced \"string"))))))
-    ; edit_file: unique replace
-    let(((p strcat(tmpDir "edit.txt")))
-      ACL_runTool("mcp__allegro__allegro_write_file"
-        list(list("path" p) list("content" "alpha\nbeta\ngamma\n")))
-      ACL_runTool("mcp__allegro__allegro_edit_file"
-        list(list("path" p) list("old_string" "beta")
-             list("new_string" "BETA")))
-      ACL_check("edit_file unique replace"
-        ACL_runTool("mcp__allegro__allegro_read_file" list(list("path" p)))
-        "alpha\nBETA\ngamma\n"))
-    ; edit_file: not found
-    let(((p strcat(tmpDir "edit.txt")))
-      ACL_checkTrue("edit_file not found"
-        pcreMatchp(pcreCompile("not found")
-          ACL_runTool("mcp__allegro__allegro_edit_file"
-            list(list("path" p) list("old_string" "no_such_text")
-                 list("new_string" "x"))))))
-    ; edit_file: ambiguous
-    let(((p strcat(tmpDir "ambig.txt")))
-      ACL_runTool("mcp__allegro__allegro_write_file"
-        list(list("path" p) list("content" "x\nx\n")))
-      ACL_checkTrue("edit_file not unique"
-        pcreMatchp(pcreCompile("not unique")
-          ACL_runTool("mcp__allegro__allegro_edit_file"
-            list(list("path" p) list("old_string" "x")
-                 list("new_string" "y"))))))
-    ; edit_file: .il syntax check on result.
-    let(((p strcat(tmpDir "edit.il")))
-      ACL_runTool("mcp__allegro__allegro_write_file"
-        list(list("path" p) list("content" "(plus 1 2)\n")))
-      ACL_checkTrue("edit_file .il bad result rejected"
-        pcreMatchp(pcreCompile("syntax check failed")
-          ACL_runTool("mcp__allegro__allegro_edit_file"
-            list(list("path" p) list("old_string" "(plus 1 2)")
-                 list("new_string" "1 2)))")))))
-      ACL_check("edit_file .il bad: file unchanged"
-        ACL_runTool("mcp__allegro__allegro_read_file" list(list("path" p)))
-        "(plus 1 2)\n"))
-    ; multi_edit_file: sequential edits, each unique at its turn.
-    let(((p strcat(tmpDir "multi.txt")))
-      ACL_runTool("mcp__allegro__allegro_write_file"
-        list(list("path" p) list("content" "alpha\nbeta\ngamma\n")))
-      ACL_runTool("mcp__allegro__allegro_multi_edit_file"
-        list(list("path" p)
-             list("edits" list(
-               list(list("old_string" "alpha") list("new_string" "ALPHA"))
-               list(list("old_string" "gamma") list("new_string" "GAMMA"))))))
-      ACL_check("multi_edit_file applies all"
-        ACL_runTool("mcp__allegro__allegro_read_file" list(list("path" p)))
-        "ALPHA\nbeta\nGAMMA\n"))
-    ; multi_edit_file: any failure aborts atomically (file unchanged).
-    let(((p strcat(tmpDir "multi_atomic.txt")))
-      ACL_runTool("mcp__allegro__allegro_write_file"
-        list(list("path" p) list("content" "one\ntwo\n")))
-      ACL_checkTrue("multi_edit_file atomic on failure"
-        pcreMatchp(pcreCompile("not found")
-          ACL_runTool("mcp__allegro__allegro_multi_edit_file"
-            list(list("path" p)
-                 list("edits" list(
-                   list(list("old_string" "one") list("new_string" "ONE"))
-                   list(list("old_string" "missing") list("new_string" "X"))))))))
-      ACL_check("multi_edit_file unchanged after failure"
-        ACL_runTool("mcp__allegro__allegro_read_file" list(list("path" p)))
-        "one\ntwo\n"))
-    ; Cleanup
-    foreach(f ACL_listDirFiles(tmpDir)
-      errset(deleteFile(strcat(tmpDir f))))
-    errset(deleteDir(tmpDir)))
-
-  printf("\n--- Extra prompt files ---\n")
-  let(((tmpDir strcat(ACL_homeDir "extraprompt_test/"))
-       (savedExtra ACL_extraPromptFiles)
-       p1 p2 fp basePrompt withExtras)
-    ACL_createDirP(tmpDir)
-    p1 = strcat(tmpDir "policy.md")
-    p2 = strcat(tmpDir "library.md")
-    fp = outfile(p1) when(fp fprintf(fp "SITE_POLICY_MARKER") close(fp))
-    fp = outfile(p2) when(fp fprintf(fp "LIBRARY_CONVENTIONS_MARKER") close(fp))
-    basePrompt = ACL_buildSystemPrompt()
-    ACL_check("extra prompt: marker absent by default"
-      pcreMatchp(pcreCompile("SITE_POLICY_MARKER") basePrompt) nil)
-    ACL_extraPromptFiles = list(p1 p2)
-    withExtras = ACL_buildSystemPrompt()
-    ACL_checkTrue("extra prompt: first file appended"
-      pcreMatchp(pcreCompile("SITE_POLICY_MARKER") withExtras))
-    ACL_checkTrue("extra prompt: second file appended"
-      pcreMatchp(pcreCompile("LIBRARY_CONVENTIONS_MARKER") withExtras))
-    ; Missing files are silently skipped (don't fail the build).
-    ACL_extraPromptFiles = list(p1 strcat(tmpDir "nope.md") p2)
-    let(((p ACL_buildSystemPrompt()))
-      ACL_checkTrue("extra prompt: missing skipped, others kept"
-        and(pcreMatchp(pcreCompile("SITE_POLICY_MARKER") p)
-            pcreMatchp(pcreCompile("LIBRARY_CONVENTIONS_MARKER") p))))
-    ; Non-string entries are skipped, not errored.
-    ACL_extraPromptFiles = list(p1 nil 42 p2)
-    let(((p ACL_buildSystemPrompt()))
-      ACL_checkTrue("extra prompt: non-strings skipped"
-        and(pcreMatchp(pcreCompile("SITE_POLICY_MARKER") p)
-            pcreMatchp(pcreCompile("LIBRARY_CONVENTIONS_MARKER") p))))
-    ; Cleanup
-    ACL_extraPromptFiles = savedExtra
-    foreach(f ACL_listDirFiles(tmpDir)
-      errset(deleteFile(strcat(tmpDir f))))
-    errset(deleteDir(tmpDir)))
-
-  printf("\n--- Form File ---\n")
-  letseq(((formPath strcat(ACL_scriptDir "allegro_claude.form"))
-          (formHandle axlFormCreate('ACL_testForm formPath nil nil nil)))
-    ACL_checkTrue("form parse" formHandle)
-    when(formHandle axlFormClose(formHandle)))
-
-  printf("\n--- Doc Lookup ---\n")
-  let(((savedNotes ACL_notesDir) (savedScript ACL_scriptDir)
-       (savedSite axlGetVariable("allegro_site"))
-       (savedPcb axlGetVariable("allegro_pcbenv"))
-       doc exactName baseName notesDir pcbDir siteDir scriptDir)
-    notesDir = strcat(ACL_homeDir "doc_test_notes/")
-    pcbDir = strcat(ACL_homeDir "doc_test_pcbenv/")
-    siteDir = strcat(ACL_homeDir "doc_test_site/")
-    scriptDir = strcat(ACL_homeDir "doc_test_script/")
-    foreach(d list(notesDir pcbDir siteDir scriptDir) createDir(d))
-    ACL_notesDir = notesDir
-    ACL_scriptDir = scriptDir
-    axlSetVariable("allegro_pcbenv" pcbDir)
-    axlSetVariable("allegro_site" siteDir)
-    exactName = strcat("SPB"
-      pcreReplace(ACL_versionSanitizeRe axlVersion('fullVersion) "_" 0) ".md")
-    baseName = pcreReplace(ACL_hotfixStripRe
-      exactName ".md" 0)
-    let((fp p)
-      ; ---- 1. No files anywhere -> default to notesDir/exactName
-      doc = ACL_findOrPlanDocs()
-      ACL_check("doc default to notesDir"
-        doc strcat(notesDir exactName))
-
-      ; ---- 2. Exact in scriptDir wins (alone)
-      p = strcat(scriptDir exactName)
-      fp = outfile(p) when(fp fprintf(fp "x") close(fp))
-      ACL_check("doc exact in scriptDir" ACL_findOrPlanDocs() p)
-      deleteFile(p)
-
-      ; ---- 3. Exact in siteDir wins (alone)
-      p = strcat(siteDir exactName)
-      fp = outfile(p) when(fp fprintf(fp "x") close(fp))
-      ACL_check("doc exact in siteDir" ACL_findOrPlanDocs() p)
-      deleteFile(p)
-
-      ; ---- 4. Exact in pcbDir wins (alone)
-      p = strcat(pcbDir exactName)
-      fp = outfile(p) when(fp fprintf(fp "x") close(fp))
-      ACL_check("doc exact in pcbDir" ACL_findOrPlanDocs() p)
-      deleteFile(p)
-
-      ; ---- 5. Exact in notesDir wins (alone)
-      p = strcat(notesDir exactName)
-      fp = outfile(p) when(fp fprintf(fp "x") close(fp))
-      ACL_check("doc exact in notesDir" ACL_findOrPlanDocs() p)
-      deleteFile(p)
-
-      ; ---- 6. Dir priority: notesDir > pcbenv when both have exact
-      letseq(((pNotes strcat(notesDir exactName))
-              (pPcb   strcat(pcbDir exactName)))
-        fp = outfile(pNotes) when(fp fprintf(fp "n") close(fp))
-        fp = outfile(pPcb) when(fp fprintf(fp "p") close(fp))
-        ACL_check("doc notesDir beats pcbenv" ACL_findOrPlanDocs() pNotes)
-        deleteFile(pNotes) deleteFile(pPcb))
-
-      ; ---- 7. Dir priority: pcbenv > site
-      letseq(((pPcb  strcat(pcbDir exactName))
-              (pSite strcat(siteDir exactName)))
-        fp = outfile(pPcb) when(fp fprintf(fp "p") close(fp))
-        fp = outfile(pSite) when(fp fprintf(fp "s") close(fp))
-        ACL_check("doc pcbenv beats site" ACL_findOrPlanDocs() pPcb)
-        deleteFile(pPcb) deleteFile(pSite))
-
-      ; ---- 8. Dir priority: site > scriptDir
-      letseq(((pSite   strcat(siteDir exactName))
-              (pScript strcat(scriptDir exactName)))
-        fp = outfile(pSite) when(fp fprintf(fp "s") close(fp))
-        fp = outfile(pScript) when(fp fprintf(fp "x") close(fp))
-        ACL_check("doc site beats scriptDir" ACL_findOrPlanDocs() pSite)
-        deleteFile(pSite) deleteFile(pScript))
-
-      ; ---- 9. Exact in scriptDir beats base in notesDir
-      letseq(((pExact strcat(scriptDir exactName))
-              (pBase  strcat(notesDir baseName)))
-        fp = outfile(pExact) when(fp fprintf(fp "e") close(fp))
-        fp = outfile(pBase) when(fp fprintf(fp "b") close(fp))
-        ACL_check("doc exact anywhere beats base in notes"
-          ACL_findOrPlanDocs() pExact)
-        deleteFile(pExact) deleteFile(pBase))
-
-      ; ---- 10. Base name found in notesDir when no exact exists
-      p = strcat(notesDir baseName)
-      fp = outfile(p) when(fp fprintf(fp "x") close(fp))
-      ACL_check("doc base in notesDir" ACL_findOrPlanDocs() p)
-      deleteFile(p)
-
-      ; ---- 11. Base name found in scriptDir when nothing else
-      p = strcat(scriptDir baseName)
-      fp = outfile(p) when(fp fprintf(fp "x") close(fp))
-      ACL_check("doc base in scriptDir" ACL_findOrPlanDocs() p)
-      deleteFile(p)
-
-      ; ---- 12. Base in notesDir beats base in pcbenv (priority within base)
-      letseq(((pNotes strcat(notesDir baseName))
-              (pPcb   strcat(pcbDir baseName)))
-        fp = outfile(pNotes) when(fp fprintf(fp "n") close(fp))
-        fp = outfile(pPcb) when(fp fprintf(fp "p") close(fp))
-        ACL_check("doc base priority" ACL_findOrPlanDocs() pNotes)
-        deleteFile(pNotes) deleteFile(pPcb)))
-    axlSetVariable("allegro_site" savedSite)
-    axlSetVariable("allegro_pcbenv" savedPcb)
-    ACL_scriptDir = savedScript
-    ACL_notesDir = savedNotes
-    ; Best-effort cleanup (no-op if dirs aren't empty).
-    foreach(d list(notesDir pcbDir siteDir scriptDir)
-      errset(deleteDir(d))))
-
-  printf("\n--- Settings ---\n")
-  let((tmpFile settings loaded
-       (savedMode ACL_mode) (savedFast ACL_fast)
-       (savedClaudeArgs ACL_claudeArgs))
-    tmpFile = strcat(ACL_sessionLogDir "test_settings.json")
-    ; Round-trip save/load
-    settings = list(list("mode" "verbose"))
-    ACL_saveSettings(tmpFile settings)
-    loaded = ACL_loadSettings(tmpFile)
-    ACL_check("settings roundtrip" loaded settings)
-    ACL_check("settings get mode" ACL_jGet(loaded "mode") "verbose")
-    ; currentSettings reflects the live globals -- pin them to known
-    ; values, otherwise the test depends on whatever settings.json
-    ; was applied at load time.
-    ACL_mode = "quiet"
-    ACL_fast = nil
-    ACL_claudeArgs = ""
-    ACL_check("currentSettings" ACL_currentSettings()
-      list(list("mode" "quiet") list("fast" 'false) list("claudeArgs" "")))
-    ; applySettings updates ACL_mode
-    ACL_applySettings(list(list("mode" "manual")))
-    ACL_check("applySettings" ACL_mode "manual")
-    ; claudeArgs round-trips
-    ACL_applySettings(list(list("claudeArgs" "--debug api,hooks")))
-    ACL_check("applySettings claudeArgs" ACL_claudeArgs "--debug api,hooks")
-    ; Load nonexistent file returns nil
-    ACL_check("load missing" ACL_loadSettings("/tmp/nonexistent_acl_test.json") nil)
-    ; Cleanup
-    deleteFile(tmpFile)
-    ACL_claudeArgs = savedClaudeArgs
-    ACL_fast = savedFast
-    ACL_mode = savedMode)
-
-  printf("\n--- Sessions ---\n")
-  let(((savedFile ACL_sessionsFile) (savedSid ACL_sessionId) sample stale sorted)
-    ACL_sessionsFile = strcat(ACL_homeDir "sessions_test.json")
-    sample = list(
-      list("aaaa-aaaa" list(list("board" "/tmp/foo.brd") list("time" "100")))
-      list("bbbb-bbbb" list(list("board" "/tmp/bar.brd") list("time" "300")))
-      list("cccc-cccc" list(list("board" "/tmp/baz.brd") list("time" "200"))))
-    ACL_saveSessions(sample)
-    ACL_check("session preload" length(ACL_loadSessions()) 3)
-    ; Sort by time, newest first
-    sorted = ACL_sortSessionsByTime(ACL_loadSessions())
-    ACL_check("sort newest first" car(car(sorted)) "bbbb-bbbb")
-    ACL_check("sort middle" car(cadr(sorted)) "cccc-cccc")
-    ACL_check("sort oldest last" car(caddr(sorted)) "aaaa-aaaa")
-    ; Detect a stale-session line and ensure removeSession works
-    stale = "claude: No conversation found with session ID: bbbb-bbbb"
-    ACL_check("noSessionRe matches" pcreMatchp(ACL_noSessionRe stale) t)
-    ; Stale handler also clears ACL_sessionId if it matches
-    ACL_sessionId = "bbbb-bbbb"
-    ACL_handleStaleSession(stale)
-    ACL_check("stale removed" length(ACL_loadSessions()) 2)
-    ACL_check("right one removed" assoc("bbbb-bbbb" ACL_loadSessions()) nil)
-    ACL_check("sessionId cleared" ACL_sessionId nil)
-    ACL_check("others kept" and(assoc("aaaa-aaaa" ACL_loadSessions())
-                                assoc("cccc-cccc" ACL_loadSessions()) t) t)
-    ; Idempotent: removing a non-existent id is a no-op
-    ACL_handleStaleSession(stale)
-    ACL_check("idempotent" length(ACL_loadSessions()) 2)
-    ; sessionId NOT cleared when the stale id doesn't match the current one
-    ACL_sessionId = "different-id"
-    ACL_handleStaleSession(stale)
-    ACL_check("preserves unrelated sessionId" ACL_sessionId "different-id")
-    ACL_sessionId = savedSid
-    deleteFile(ACL_sessionsFile)
-    ACL_sessionsFile = savedFile)
-
-  printf("\n--- Session names ---\n")
-  let(((savedFile ACL_sessionsFile) (savedLogDir ACL_logDir)
-       (savedSid ACL_sessionId)
-       tmpDir lbl1 lbl2 lbl3 sample dir)
-    ACL_sessionsFile = strcat(ACL_homeDir "sessions_name_test.json")
-    tmpDir = strcat(ACL_homeDir "logs_name_test/")
-    ACL_createDirP(tmpDir)
-    ACL_logDir = tmpDir
-    sample = list(
-      list("named-sid" list(list("board" "/tmp/x.brd") list("time" "100")
-                            list("name" "my favourite")))
-      list("plain-sid" list(list("board" "/tmp/y.brd") list("time" "200"))))
-    ACL_saveSessions(sample)
-    ACL_check("name field read back"
-      ACL_sessionName(ACL_getSession("named-sid")) "my favourite")
-    ACL_check("name absent -> nil"
-      ACL_sessionName(ACL_getSession("plain-sid")) nil)
-    ACL_setSessionName("plain-sid" "renamed")
-    ACL_check("setSessionName persists"
-      ACL_sessionName(ACL_getSession("plain-sid")) "renamed")
-    ACL_setSessionName("plain-sid" "")
-    ACL_check("blank clears name"
-      ACL_sessionName(ACL_getSession("plain-sid")) nil)
-    ACL_setSessionName("no-such-sid" "ignored")
-    ACL_check("no entry created for missing sid"
-      assoc("no-such-sid" ACL_loadSessions()) nil)
-    lbl1 = ACL_sessionLabel("named-sid" ACL_getSession("named-sid"))
-    ACL_checkTrue("label uses name when set"
-      nindex(lbl1 "my favourite"))
-    lbl2 = ACL_sessionLabel("plain-sid" ACL_getSession("plain-sid"))
-    ACL_checkTrue("label falls back to uuid prefix"
-      nindex(lbl2 "plain-si"))
-    lbl3 = ACL_sessionLabel("named-sid" ACL_getSession("named-sid")
-                             ?currentSid "named-sid")
-    ACL_checkTrue("label marks current"
-      nindex(lbl3 "(current)"))
-    dir = strcat(ACL_logDir "named-sid/")
-    ACL_createDirP(dir)
-    ACL_writeFile(strcat(dir "log.txt") "old log\n")
-    ACL_writeFile(strcat(dir "cmd_1.il") "(plus 1 1)")
-    ACL_deleteSessionFiles("named-sid")
-    ACL_check("deleteSessionFiles removes dir" isDir(dir) nil)
-    ACL_deleteSessionFiles("no-dir-sid")
-    ACL_check("deleteSessionFiles no-op on missing dir" t t)
-    deleteFile(ACL_sessionsFile)
-    when(isDir(tmpDir) deleteDir(tmpDir))
-    ACL_sessionsFile = savedFile
-    ACL_logDir = savedLogDir
-    ACL_sessionId = savedSid)
-
-  printf("\n--- Session fork ---\n")
-  ; Drive ACL_processStreamLine with a synthetic init event and check
-  ; the fork path: parent log dir + sessions.json entry preserved,
-  ; parent files copied into the fork dir, fork's own sessions.json
-  ; entry deferred to its first-text save (so it gets the right board).
-  let(((savedFile ACL_sessionsFile) (savedSid ACL_sessionId)
-       (savedLogDir ACL_sessionLogDir) (savedFork ACL_resumeIsFork)
-       (savedSeq ACL_mcpCmdSeq) parentDir newDir)
-    ACL_sessionsFile = strcat(ACL_homeDir "sessions_rekey_test.json")
-    ACL_sessionId = "rekey-old-2"
-    parentDir = strcat(ACL_logDir "rekey-old-2/")
-    ACL_createDirP(parentDir)
-    let(((fp outfile(strcat(parentDir "/cmd_3.il"))))
-      when(fp fprintf(fp "(plus 2 2)") close(fp))
-      fp = outfile(strcat(parentDir "/cmd_3.out"))
-      when(fp fprintf(fp "Result: 4") close(fp)))
-    ACL_addSession("rekey-old-2" list(list("board" "/tmp/y.brd") list("time" "200")))
-    ACL_resumeIsFork = t
-    ACL_processStreamLine("{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"rekey-new-2\"}")
-    newDir = strcat(ACL_logDir "rekey-new-2/")
-    ACL_check("fork: id updated" ACL_sessionId "rekey-new-2")
-    ACL_check("fork: parent dir preserved" isDir(parentDir) t)
-    ACL_checkTrue("fork: parent cmd preserved"
-      isFile(strcat(parentDir "/cmd_3.il")))
-    ACL_check("fork: new dir present" isDir(newDir) t)
-    ACL_checkTrue("fork: cmd file copied to new"
-      isFile(strcat(newDir "/cmd_3.il")))
-    ACL_check("fork: copied content matches"
-      ACL_readFile(strcat(newDir "/cmd_3.il")) "(plus 2 2)")
-    ACL_check("fork: seq seeded from copied files" ACL_mcpCmdSeq 3)
-    ACL_checkTrue("fork: parent kept in sessions"
-      assoc("rekey-old-2" ACL_loadSessions()))
-    ; Fork should NOT pre-add the new sid: the first-text save path
-    ; registers it with the current board (not the parent's).
-    ACL_check("fork: new id NOT pre-added to sessions"
-      assoc("rekey-new-2" ACL_loadSessions()) nil)
-    ; cleanup
-    foreach(d list(parentDir newDir)
-      foreach(f ACL_listDirFiles(d)
-        errset(deleteFile(strcat(d "/" f))))
-      errset(deleteDir(d)))
-
-    ACL_resumeIsFork = savedFork
-    ACL_mcpCmdSeq = savedSeq
-    ACL_sessionLogDir = savedLogDir
-    ACL_sessionId = savedSid
-    deleteFile(ACL_sessionsFile)
-    ACL_sessionsFile = savedFile)
-
-  printf("\n--- Resume seq seeding ---\n")
-  ; On resume claude returns the SAME sid, so processStreamLine's
-  ; new-sid branch never fires. The seq must still be seeded from
-  ; existing cmd_<N>.il files on every system/init event, otherwise
-  ; tool_use numbering restarts at 1 and overwrites prior turns.
-  let(((savedSid ACL_sessionId) (savedLogDir ACL_sessionLogDir)
-       (savedSeq ACL_mcpCmdSeq) sid logDir fp)
-    sid = "resume-seed-test"
-    logDir = strcat(ACL_logDir sid "/")
-    ACL_createDirP(logDir)
-    fp = outfile(strcat(logDir "/cmd_7.il"))
-    when(fp fprintf(fp "(plus 1 1)") close(fp))
-    ACL_sessionId = sid
-    ACL_sessionLogDir = logDir
-    ACL_mcpCmdSeq = 0
-    ACL_processStreamLine(sprintf(nil
-      "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"%s\"}" sid))
-    ACL_check("resume: seq seeded from existing files" ACL_mcpCmdSeq 7)
-    errset(deleteFile(strcat(logDir "/cmd_7.il")))
-    errset(deleteDir(logDir))
-    ACL_mcpCmdSeq = savedSeq
-    ACL_sessionLogDir = savedLogDir
-    ACL_sessionId = savedSid)
-
-  printf("\n--- Session tag handshake ---\n")
-  let(((savedSid ACL_sessionId) (savedLogDir ACL_sessionLogDir)
-       (savedTag ACL_sessionTag) (savedWritten ACL_sessionTagWritten)
-       sid logDir tagPath)
-    sid = "tag-handshake-test"
-    logDir = strcat(ACL_logDir sid "/")
-    tagPath = strcat(logDir "acl_tag")
-    errset(deleteFile(tagPath))
-    errset(deleteDir(logDir))
-    let(((t1 ACL_makeSessionTag()))
-      ACL_checkTrue("tag: nonempty" and(stringp(t1) strlen(t1) > 0)))
-    ; Init lands the tag in the per-session dir.
-    ACL_sessionTag = "acl-test-tag-handshake"
-    ACL_sessionTagWritten = nil
-    ACL_sessionId = nil
-    ACL_sessionLogDir = ACL_logDir
-    ACL_processStreamLine(sprintf(nil
-      "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"%s\"}" sid))
-    ACL_check("tag: file written" isFile(tagPath) t)
-    ACL_check("tag: file contents match" ACL_readFile(tagPath) ACL_sessionTag)
-    ACL_check("tag: written flag set" ACL_sessionTagWritten t)
-    ; Second init (resume) is a no-op -- writeSessionTag short-circuits.
-    ACL_writeFile(tagPath "")
-    ACL_processStreamLine(sprintf(nil
-      "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"%s\"}" sid))
-    ACL_check("tag: idempotent on second init" ACL_readFile(tagPath) "")
-    errset(deleteFile(tagPath))
-    errset(deleteDir(logDir))
-    ACL_sessionTagWritten = savedWritten
-    ACL_sessionTag = savedTag
-    ACL_sessionLogDir = savedLogDir
-    ACL_sessionId = savedSid)
-
-  printf("\n--- Model fallback on error ---\n")
-  let(((savedActive ACL_activeModel)
-       (savedPending ACL_fallbackRetryPending)
-       (savedLastSent ACL_lastSent)
-       (savedLogDir ACL_sessionLogDir)
-       (savedTriggers ACL_fallbackTriggers)
-       (errBody "API Error: 422 {\"detail\":[{\"type\":\"enum\",\"loc\":[\"body\",\"messages\",1,\"role\"],\"msg\":\"Input should be 'user' or 'assistant'\",\"input\":\"system\"}]}")
-       errEvent err500Event)
-    ; Surface-normal branches call appendChat; mute it so we don't
-    ; pollute a real session log.
-    ACL_sessionLogDir = nil
-    errEvent = strcat(
-      "{\"type\":\"result\",\"is_error\":true,\"api_error_status\":422,"
-      "\"terminal_reason\":\"completed\","
-      "\"result\":" ACL_jsonEscStr(errBody) "}")
-    err500Event = strcat(
-      "{\"type\":\"result\",\"is_error\":true,\"api_error_status\":500,"
-      "\"terminal_reason\":\"completed\",\"result\":\"oops\"}")
-    ; Detector: only the role+system 422 shape triggers fallback.
-    ACL_check("detect: 422 role/system" ACL_is422RoleSystemError(422 errBody) t)
-    ACL_check("detect: 422 unrelated body" ACL_is422RoleSystemError(422 "other 422") nil)
-    ACL_check("detect: 500 ignored" ACL_is422RoleSystemError(500 errBody) nil)
-    ACL_check("detect: nil status ignored" ACL_is422RoleSystemError(nil errBody) nil)
-    ACL_check("detect: nil body ignored" ACL_is422RoleSystemError(422 nil) nil)
-    ; findFallbackTrigger returns the trigger label or nil.
-    ACL_checkTrue("trigger lookup: hit"
-      ACL_findFallbackTrigger(422 errBody))
-    ACL_check("trigger lookup: miss" ACL_findFallbackTrigger(500 errBody) nil)
-    ; Stream event with the 422 arms the retry-pending flag (storing
-    ; the trigger label) and does NOT surface the error to chat.
-    ACL_activeModel = ACL_primaryModel
-    ACL_fallbackRetryPending = nil
-    ACL_processStreamLine(errEvent)
-    ACL_checkTrue("trigger: retry pending" ACL_fallbackRetryPending)
-    ACL_check("trigger: pending holds label"
-      stringp(ACL_fallbackRetryPending) t)
-    ACL_fallbackRetryPending = nil
-    ; If already on fallback, another error must NOT loop -- surface normally.
-    ACL_activeModel = ACL_fallbackModel
-    ACL_processStreamLine(errEvent)
-    ACL_check("no retry when already on fallback"
-      ACL_fallbackRetryPending nil)
-    ; An error not matching any trigger stays on the normal surface path.
-    ACL_activeModel = ACL_primaryModel
-    ACL_processStreamLine(err500Event)
-    ACL_check("no retry on untriggered error" ACL_fallbackRetryPending nil)
-    ; Custom trigger gets picked up just by mutating ACL_fallbackTriggers.
-    ACL_fallbackTriggers = list(list("custom-500-oops"
-      lambda((s r) and(equal(s 500) stringp(r) nindex(r "oops") t))))
-    ACL_activeModel = ACL_primaryModel
-    ACL_fallbackRetryPending = nil
-    ACL_processStreamLine(err500Event)
-    ACL_check("custom trigger: pending label"
-      ACL_fallbackRetryPending "custom-500-oops")
-    ACL_lastSent = savedLastSent
-    ACL_fallbackRetryPending = savedPending
-    ACL_activeModel = savedActive
-    ACL_sessionLogDir = savedLogDir
-    ACL_fallbackTriggers = savedTriggers
-    ; Drop anything appendChat buffered while sessionLogDir was nil so
-    ; it doesn't leak into the next real session's log.txt.
-    ACL_logUnflushed = "")
-
-  printf("\n--- sendMessage snapshots replay payload ---\n")
-  ; sendMessage records the last (text, isSynthetic, noQuery) so the
-  ; fallback retry can replay it after relaunching with the new model.
-  let(((savedLastSent ACL_lastSent)
-       (savedClaude ACL_claude)
-       (proc ipcBeginProcess(if(ACL_isWindows "cmd /c more" "cat") "")))
-    when(proc
-      ACL_claude = proc
-      ACL_lastSent = nil
-      ACL_sendMessage("hello world")
-      ACL_check("snapshot: text" car(ACL_lastSent) "hello world")
-      ACL_check("snapshot: not synthetic" cadr(ACL_lastSent) nil)
-      ACL_check("snapshot: not noQuery" caddr(ACL_lastSent) nil)
-      ACL_sendMessage("ambient" ?isSynthetic t ?noQuery t)
-      ACL_check("snapshot: synthetic" cadr(ACL_lastSent) t)
-      ACL_check("snapshot: noQuery" caddr(ACL_lastSent) t)
-      ipcKillProcess(proc))
-    ACL_claude = savedClaude
-    ACL_lastSent = savedLastSent)
-
-  printf("\n--- Hook session_id ignored ---\n")
-  ; SessionStart:resume hook events carry transient session_ids that
-  ; must not be mistaken for a real sid change. Only system/init is
-  ; authoritative.
-  let(((savedSid ACL_sessionId) (savedLogDir ACL_sessionLogDir))
-    ACL_sessionId = "real-sid"
-    ACL_sessionLogDir = strcat(ACL_logDir "real-sid/")
-    ACL_processStreamLine(strcat(
-      "{\"type\":\"system\",\"subtype\":\"hook_started\","
-      "\"hook_name\":\"SessionStart:resume\","
-      "\"session_id\":\"transient-bogus-id\"}"))
-    ACL_check("hook event ignored" ACL_sessionId "real-sid")
-    ACL_processStreamLine(strcat(
-      "{\"type\":\"system\",\"subtype\":\"hook_response\","
-      "\"hook_name\":\"SessionStart:resume\","
-      "\"session_id\":\"another-transient-bogus\"}"))
-    ACL_check("hook response ignored" ACL_sessionId "real-sid")
-    ACL_sessionLogDir = savedLogDir
-    ACL_sessionId = savedSid)
-
-  printf("\n--- CP-1252 recode ---\n")
-  let(((savedWin ACL_isWindows))
-    ACL_isWindows = t
-    ; Lossless table mapping: high CP-1252 byte stays in place.
-    ACL_check("lossless single byte"
-      ACL_recode(strcat("don" ACL_bytes(0xe2 0x80 0x99) "t"))
-      strcat("don" ACL_byte(0x92) "t"))
-    ; Lossy table mapping: ASCII fallback string.
-    ACL_check("lossy ascii"
-      ACL_recode(strcat("a" ACL_bytes(0xe2 0x94 0x82) "b")) "a|b")
-    ; Catch-all collapses unmapped UTF-8 to a single ?, even when
-    ; multiple unmapped sequences are adjacent.
-    ACL_check("catchall mixed"
-      ACL_recode(strcat("a" ACL_bytes(0xf0 0x9f 0x98 0x80 0xf0 0x9f 0x98 0x81) "b"))
-      "a?b")
-    ; Catch-all must NOT eat the high CP-1252 bytes the table emitted.
-    ACL_check("catchall preserves recoded"
-      ACL_recode(ACL_bytes(0xe2 0x80 0x99 0xe2 0x80 0x99))
-      strcat(ACL_byte(0x92) ACL_byte(0x92)))
-    ACL_check("ascii passthrough"
-      ACL_recode("hello world") "hello world")
-    ACL_isWindows = nil
-    ACL_check("linux passthrough"
-      ACL_recode(strcat("don" ACL_bytes(0xe2 0x80 0x99) "t"))
-      strcat("don" ACL_bytes(0xe2 0x80 0x99) "t"))
-    ACL_isWindows = t
-    ACL_check("nil passthrough" ACL_recode(nil) nil)
-    ACL_isWindows = savedWin)
-
-  printf("\n--- recode integration via stream ---\n")
-  let(((savedBuf ACL_responseBuf) (savedLog ACL_logContent)
-       (savedId ACL_streamingMsgId) (savedLen ACL_streamedMsgLen)
-       (savedForm ACL_form) (savedWin ACL_isWindows))
-    ACL_form = nil ACL_logContent = nil ACL_responseBuf = ""
-    ACL_streamingMsgId = nil ACL_streamedMsgLen = nil
-    ACL_isWindows = t
-    ACL_processStreamLine(strcat(
-      "{\"type\":\"stream_event\",\"event\":{\"type\":\"message_start\","
-      "\"message\":{\"id\":\"msg_recode\"}}}"))
-    ACL_processStreamLine(strcat(
-      "{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\","
-      "\"index\":0,\"delta\":{\"type\":\"text_delta\","
-      "\"text\":\"X" ACL_bytes(0xe2 0x94 0x82) "Y\"}}}"))
-    ACL_check("stream-time recode"
-      ACL_logString() "X|Y")
-    ACL_isWindows = savedWin
-    ACL_form = savedForm
-    ACL_streamedMsgLen = savedLen
-    ACL_streamingMsgId = savedId
-    ACL_logContent = savedLog
-    ACL_responseBuf = savedBuf)
-
-  printf("\n--- Assistant dedup fallback ---\n")
-  ; If the stream skipped message_start (resume mid-turn or partial
-  ; capture), the assistant event must NOT print the full text on top
-  ; of whatever was already streamed via deltas. Verify by feeding a
-  ; mid-stream delta + assistant pair with no message_start.
-  let(((savedBuf ACL_responseBuf) (savedLog ACL_logContent)
-       (savedId ACL_streamingMsgId) (savedLen ACL_streamedMsgLen)
-       (savedForm ACL_form))
-    ACL_form = nil ACL_logContent = nil ACL_responseBuf = ""
-    ACL_streamingMsgId = nil ACL_streamedMsgLen = nil
-    ACL_processStreamLine(strcat(
-      "{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\","
-      "\"index\":0,\"delta\":{\"type\":\"text_delta\","
-      "\"text\":\" world!\"}}}"))
-    ACL_processStreamLine(strcat(
-      "{\"type\":\"assistant\",\"message\":{\"id\":\"msg_no_start\","
-      "\"content\":[{\"type\":\"text\",\"text\":\"Hello world!\"}]}}"))
-    ACL_check("dedup fallback: only streamed text shown"
-      ACL_logString() " world!")
-    ; Now the normal path: message_start + deltas + assistant. The
-    ; assistant copy must not duplicate anything.
-    ACL_logContent = nil ACL_responseBuf = ""
-    ACL_streamingMsgId = nil ACL_streamedMsgLen = nil
-    ACL_processStreamLine(strcat(
-      "{\"type\":\"stream_event\",\"event\":{\"type\":\"message_start\","
-      "\"message\":{\"id\":\"msg_full\"}}}"))
-    ACL_processStreamLine(strcat(
-      "{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\","
-      "\"index\":0,\"delta\":{\"type\":\"text_delta\","
-      "\"text\":\"Hello world!\"}}}"))
-    ACL_processStreamLine(strcat(
-      "{\"type\":\"assistant\",\"message\":{\"id\":\"msg_full\","
-      "\"content\":[{\"type\":\"text\",\"text\":\"Hello world!\"}]}}"))
-    ACL_check("dedup full stream: text shown once"
-      ACL_logString() "Hello world!")
-    ACL_form = savedForm
-    ACL_streamedMsgLen = savedLen
-    ACL_streamingMsgId = savedId
-    ACL_logContent = savedLog
-    ACL_responseBuf = savedBuf)
-
-  printf("\n--- Busy-time chat queue ---\n")
-  let(((savedQueue ACL_pendingChatQueue) (savedLog ACL_logContent)
-       (savedUnflushed ACL_logUnflushed) (savedBusy ACL_claudeBusy)
-       (savedForm ACL_form))
-    ACL_form = nil
-    ACL_logContent = nil
-    ACL_logUnflushed = ""
-    ACL_pendingChatQueue = nil
-    ; Idle: enqueue auto-flushes straight to log.
-    ACL_claudeBusy = nil
-    ACL_enqueueChatLine("idle msg")
-    ACL_check("queue: idle auto-flushed" ACL_pendingChatQueue nil)
-    ACL_check("queue: idle wrote You:"
-      ACL_logString() "\nYou: idle msg\n")
-    ; Busy: enqueue holds in queue, log unchanged.
-    ACL_logContent = nil
-    ACL_logUnflushed = ""
-    ACL_claudeBusy = t
-    ACL_enqueueChatLine("first queued")
-    ACL_enqueueChatLine("second queued")
-    ACL_enqueueChatLine("third queued")
-    ACL_check("queue: busy logContent empty" ACL_logContent nil)
-    ACL_check("queue: busy tail shows queued"
-      ACL_logTail(50) "\n\nQueued: first queued\nQueued: second queued\nQueued: third queued\n")
-    ; ?one flushes the oldest only.
-    ACL_flushPendingChat(?one t)
-    ACL_check("queue: one leaves remainder"
-      ACL_pendingChatQueue '("second queued" "third queued"))
-    ACL_check("queue: one wrote first"
-      ACL_logString() "\nYou: first queued\n")
-    ; Plain flush drains everything.
-    ACL_flushPendingChat()
-    ACL_check("queue: cleared after flush" ACL_pendingChatQueue nil)
-    ACL_check("queue: flushed as You:"
-      ACL_logString() "\nYou: first queued\n\nYou: second queued\n\nYou: third queued\n")
-    ; Drop discards without writing.
-    ACL_logContent = nil
-    ACL_logUnflushed = ""
-    ACL_enqueueChatLine("discard me")
-    ACL_dropPendingChat()
-    ACL_check("queue: drop clears" ACL_pendingChatQueue nil)
-    ACL_check("queue: drop wrote nothing" ACL_logContent nil)
-    ACL_form = savedForm
-    ACL_claudeBusy = savedBusy
-    ACL_logUnflushed = savedUnflushed
-    ACL_logContent = savedLog
-    ACL_pendingChatQueue = savedQueue)
-
-  printf("\n--- IPC ---\n")
-  let((proc buf ready)
-    buf = ""
-    ready = nil
-    ; Spawn a simple echo process to verify IPC round-trip. `cat`
-    ; doesn't exist on Windows; `more` reads stdin and writes
-    ; everything to stdout when stdin isn't a terminal.
-    proc = ipcBeginProcess(
-      if(ACL_isWindows "cmd /c more" "cat")
-      ""
-      lambda((id data) buf = strcat(buf data)  ready = t)
-      lambda((id data) printf("ipc err: %s\n" data)))
-    ipcWaitForProcess(proc)
-    ACL_checkTrue("ipc spawn" and(proc ipcIsAliveProcess(proc)))
-    ; Write and read back
-    ipcWriteProcess(proc "hello\n")
-    ; Give dataHandler time to fire (may need a brief pause)
-    for(i 1 10 unless(ready ipcSleep(1)))
-    ACL_checkTrue("ipc echo"
-      ; cmd /c more on Windows tacks a CR on; cat doesn't.
-      or(buf == "hello\n" buf == "hello\r\n"))
-    ipcKillProcess(proc))
-
-  printf("\n--- Claude Process ---\n")
-  let(((claudeExists errset(system(
-          if(ACL_isWindows "where claude >NUL 2>&1"
-            "env -u LD_LIBRARY_PATH which claude > /dev/null 2>&1"))))
-       (savedFast ACL_fast)
-       (savedClaudeArgs ACL_claudeArgs)
-       (savedActiveModel ACL_activeModel))
-    if(and(claudeExists car(claudeExists) == 0) then
-      ; Force fast mode so the test doesn't pull in/generate the doc cache
-      ACL_fast = t
-      ; Keep test runs out of the on-disk session history.
-      ACL_claudeArgs = strcat(
-        if(ACL_nonEmpty(ACL_claudeArgs) strcat(ACL_claudeArgs " ") "")
-        "--no-session-persistence")
-      ; Pin to fallback so the test never exercises the auto-retry
-      ; path: --no-session-persistence breaks --resume, which
-      ; ACL_fallbackRetry uses for continuity. The retry logic itself
-      ; is unit-tested in the "Model fallback on error" section.
-      ACL_activeModel = ACL_fallbackModel
-      ACL_streamErrorCount = 0
-      ACL_startClaude()
-      ACL_checkTrue("claude start" and(ACL_claude ipcIsAliveProcess(ACL_claude)))
-      ; End-to-end: send message and wait for response via ipcSleep
-      ; ipcSleep processes handlers while waiting
-      printf("  Sending hello to Claude...\n")
-      ACL_responseBuf = ""
-      ACL_sendMessage("Say exactly: HELLO_TEST_OK")
-      ; Wait for response (ipcSleep processes handlers)
-      ACL_gotText = nil
-      for(i 1 120
-        unless(ACL_gotText ipcSleep(1)))
-      ACL_check("claude response" ACL_gotText t)
-      ; SKILL execution round-trip test: stream tool_use -> handler
-      ; -> deferred drain -> .out file -> MCP server -> claude.
-      printf("  Testing SKILL execution round-trip...\n")
-      ACL_responseBuf = ""
-      ACL_gotText = nil
-      ACL_sendMessage("Execute this SKILL expression using the allegro_execute tool and report the result: (plus 40 2)")
-      for(i 1 180
-        unless(ACL_gotText
-          ACL_mcpDrainPending()
-          ipcSleep(1)))
-      ACL_check("skill exec response" ACL_gotText t)
-      ; Inspect actual artifacts: each cmd_<N>.il should have a
-      ; matching cmd_<N>.out containing "42".
-      let(((outContent "")
-           (foundExec nil))
-        for(i 1 30
-          unless(foundExec
-            foreach(f ACL_listDirFiles(ACL_sessionLogDir)
-              when(pcreMatchp(ACL_cmdSeqFileRe f)
-                let(((outPath strcat(ACL_sessionLogDir
-                                     substring(f 1 (strlen(f) - 2)) "out")))
-                  when(isFile(outPath)
-                    foundExec = t
-                    outContent = strcat(outContent ACL_readFile(outPath))))))
-            unless(foundExec ipcSleep(1))))
-        unless(foundExec
-          printf("    sessionLogDir=%L isDir=%L files=%L\n"
-            ACL_sessionLogDir
-            isDir(ACL_sessionLogDir)
-            ACL_listDirFiles(ACL_sessionLogDir)))
-        ACL_check("mcp tool was called" foundExec t)
-        ACL_checkTrue("mcp result contains 42"
-          nindex(outContent "42")))
-      ACL_stopClaude()
-      ACL_check("claude stop" ACL_claude nil)
-      ACL_check("no stream errors" ACL_streamErrorCount 0)
-    else
-      printf("  SKIP: claude not in PATH\n"))
-    ACL_fast = savedFast
-    ACL_claudeArgs = savedClaudeArgs
-    ACL_activeModel = savedActiveModel)
-
-  printf("\n=== Results: %d passed, %d failed ===\n\n" ACL_testPass ACL_testFail))
-
-procedure(ACL_checkTestResponse()
-  ; Call this after ACL_runTests() to verify Claude responded.
-  ; The dataHandler needs time to process the response.
-  printf("\n--- Claude Response Check ---\n")
-  printf("  Session ID: %L\n" ACL_sessionId)
-  printf("  Response buffer length: %d\n" strlen(ACL_responseBuf))
-  printf("  Claude alive: %L\n"
-    and(ACL_claude ipcIsAliveProcess(ACL_claude)))
-  when(strlen(ACL_responseBuf) > 0
-    printf("  Response: %s\n"
-      if(strlen(ACL_responseBuf) > 500
-        strcat(substring(ACL_responseBuf 1 500) "...")
-        ACL_responseBuf)))
-  printf("  %s\n"
-    if(strlen(ACL_responseBuf) > 0 "PASS" "FAIL (no response yet)")))

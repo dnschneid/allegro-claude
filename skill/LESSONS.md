@@ -102,7 +102,7 @@ Or if you don't need transaction semantics, don't open one — direct `axlDBCrea
 
 # SKILL Pitfalls
 
-Common mistakes when writing SKILL code are included here. **Review these before calling `allegro_execute`.**
+Common mistakes when writing SKILL code are included here. **Review these before calling `$MCP_execute`.**
 
 Your own notes are in `$ALLEGRO_CLAUDE_NOTES/LESSONS.md` and are copied below. Update the file without prompting as you learn new unituitive behaviors about SKILL and Allegro.
 

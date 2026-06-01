@@ -39,6 +39,9 @@ A few SKILL variables can be set *before* loading `allegro_claude.il` to customi
 
 - `ACL_extraPromptFiles` -- list of absolute paths whose contents are appended to Claude's system prompt. Use this to add site-specific policies, coding standards, library conventions, or any other instructions every session should see. Files are read fresh on each session start; missing or non-string entries are skipped.
 - `ACL_claudeArgs` -- extra command-line flags appended to the `claude` CLI invocation.
+- `ACL_codexArgs` -- extra command-line flags appended to the `codex` CLI invocation.
+- `ACL_extraModels` -- JSON object of additional models to expose in the session picker. See [Registering additional models](#registering-additional-models) below.
+- `ACL_useBuiltinModels` -- `'last` (default, user entries first), `t` (built-ins first), or `nil` (built-ins hidden entirely).
 - `ACL_fast` -- skip preloading the Allegro documentation cache (faster startup, less context).
 
 Example site `ilinit`:
@@ -49,6 +52,37 @@ ACL_extraPromptFiles = list(
   strcat(getShellEnvVar("ALLEGRO_SITE") "library_conventions.md"))
 load("/path/to/allegro-claude/skill/allegro_claude.il")
 ```
+
+### Registering additional models
+
+`ACL_extraModels` is a JSON object keyed by short slug id (stable across versions; persisted in `settings.json` and per-session `sessions.json`). Each value is the field object for that entry. The parser accepts `'` in place of `"` so the embedded SKILL string literal stays readable.
+
+Per-entry fields:
+
+- `label` -- free-form display name shown in the picker dropdown.
+- `driver` -- `'claude'` or `'codex'`.
+- `model` -- driver-specific model identifier passed to the CLI.
+- `context` -- context window in tokens; gates whether the ~1.5MB doc cache is inlined.
+- `effort` -- (optional) reasoning effort. For `claude`, mapped to `--effort <value>`. For `codex`, mapped to `-c model_reasoning_effort=<value>` (typical codex values: `minimal`, `low`, `medium`, `high`, `xhigh`).
+- `fallback` -- (optional) id of another registered entry to swap to on a matching `ACL_fallbackTriggers` error.
+- `args` -- (optional) extra CLI args appended only when this entry is selected. Use for wrapper flags such as `--with-proxy <url>`.
+
+Example -- adding a custom codex model and a wrapper-routed variant:
+
+```skill
+ACL_extraModels = "{
+  'gpt-5-5-high': {'label':'Codex GPT-5.5 (high effort)',
+                   'driver':'codex', 'model':'gpt-5.5',
+                   'context':256000, 'effort':'high'},
+  'gpt-5-5-internal': {'label':'Codex GPT-5.5 (internal proxy)',
+                       'driver':'codex', 'model':'gpt-5.5',
+                       'context':256000, 'effort':'xhigh',
+                       'args':'--with-proxy http://example.internal/passthrough/v1'}
+}"
+load("/path/to/allegro-claude/skill/allegro_claude.il")
+```
+
+A user entry whose id matches a built-in fully replaces the built-in. See `plans/site-model-overrides.md` for additional examples (replacing a shipped entry, hiding built-ins, etc.).
 
 ## Files
 
@@ -80,7 +114,7 @@ You should always test the script after making edits, and add tests as you disco
 
 Claude runs in a sandbox and cannot launch Allegro or use the Claude CLI, so follow this section carefully to run tests.
 
- * In general, robust tests should be added to `ACL_runTests()` so that they can be run as a regression suite.
+ * In general, robust tests should be added to `skill/allegro_claude_tests.il` so that they can be run as a regression suite. The file is a flat sequence of `ACL_check(...)` / `ACL_checkTrue(...)` calls grouped under `printf("\n--- Section name ---\n")` headers; loading the file IS the test run.
  * Sometimes you'll need to run test code, in which case you can optionally update `test/test.s` with some additional code to run. Remember that this file is an Allegro script (not SKILL), so you'll need to wrap SKILL code with a `skill` command.
  * The test harness has a hardcoded timeout of 5 minutes. This is far longer than should be necessary -- most Claude operations take 10-20 seconds at most, so if you think you need to increase the timeout, it's much more likely that something is deadlocked.
  * Remember that `ipcSleep()` is in seconds. In your tests, never sleep more than 1 second at a time.
