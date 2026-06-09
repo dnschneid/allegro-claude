@@ -65,7 +65,7 @@ Per-entry fields:
 - `context` -- context window in tokens; gates whether the ~1.5MB doc cache is inlined.
 - `effort` -- (optional) reasoning effort. For `claude`, mapped to `--effort <value>`. For `codex`, mapped to `-c model_reasoning_effort=<value>` (typical codex values: `minimal`, `low`, `medium`, `high`, `xhigh`).
 - `fallback` -- (optional) id of another registered entry to swap to on a matching `ACL_fallbackTriggers` error.
-- `args` -- (optional) extra CLI args appended only when this entry is selected. Use for wrapper flags such as `--with-proxy <url>`.
+- `args` -- (optional) extra CLI args appended only when this entry is selected.
 
 Example -- adding a custom codex model and a wrapper-routed variant:
 
@@ -77,12 +77,97 @@ ACL_extraModels = "{
   'gpt-5-5-internal': {'label':'Codex GPT-5.5 (internal proxy)',
                        'driver':'codex', 'model':'gpt-5.5',
                        'context':256000, 'effort':'xhigh',
-                       'args':'--with-proxy http://example.internal/passthrough/v1'}
+                       'args':'--proxy http://example.internal/model_proxy'}
 }"
 load("/path/to/allegro-claude/skill/allegro_claude.il")
 ```
 
-A user entry whose id matches a built-in fully replaces the built-in. See `plans/site-model-overrides.md` for additional examples (replacing a shipped entry, hiding built-ins, etc.).
+A user entry whose id matches a built-in fully replaces the built-in. For example, to point the built-in `opus-1m` slug at a different model:
+
+```skill
+ACL_extraModels = "{
+  'opus-1m': {'label':'Claude Opus (1M, custom)',
+              'driver':'claude', 'model':'my-internal-opus',
+              'context':1000000, 'effort':'max'}
+}"
+```
+
+Users keep selecting the familiar slug and their saved settings remain compatible; only the underlying `model` changes.
+
+To expose only your own entries and hide all built-ins, set `ACL_useBuiltinModels = nil` before loading:
+
+```skill
+ACL_useBuiltinModels = nil
+ACL_extraModels = "{
+  'my-opus':  {'label':'Opus (custom)',  'driver':'claude',
+               'model':'my-opus',  'context':200000, 'effort':'max'},
+  'my-codex': {'label':'Codex (custom)', 'driver':'codex',
+               'model':'my-gpt-5', 'context':256000}
+}"
+load("/path/to/allegro-claude/skill/allegro_claude.il")
+```
+
+### Custom codex models and the model catalog
+
+When using a codex model whose name is not in the codex built-in catalog, codex will print a "Model metadata not found" warning and fall back to a generic stub. Under the stub, features such as reasoning effort and plan mode silently degrade.
+
+To fix this, create a JSON file containing an entry whose `slug` and `display_name` exactly match the model name you use:
+
+```json
+{
+  "models": [
+    {
+      "slug": "my-custom-model",
+      "display_name": "my-custom-model",
+      "description": "My custom model",
+      "default_reasoning_level": "high",
+      "supported_reasoning_levels": [
+        {"effort": "low",    "description": "Fast"},
+        {"effort": "medium", "description": "Balanced"},
+        {"effort": "high",   "description": "Deep"},
+        {"effort": "xhigh",  "description": "Maximum reasoning"}
+      ],
+      "shell_type": "shell_command",
+      "visibility": "list",
+      "supported_in_api": true,
+      "priority": 0,
+      "context_window": 128000,
+      "effective_context_window_percent": 95,
+      "experimental_supported_tools": [],
+      "input_modalities": ["text"],
+      "apply_patch_tool_type": "freeform",
+      "supports_reasoning_summaries": true,
+      "default_reasoning_summary": "none",
+      "support_verbosity": true,
+      "default_verbosity": "low",
+      "supports_parallel_tool_calls": true,
+      "supports_image_detail_original": false,
+      "prefer_websockets": false,
+      "truncation_policy": null,
+      "model_messages": null,
+      "base_instructions": null,
+      "availability_nux": null,
+      "upgrade": null
+    }
+  ]
+}
+```
+
+Then reference it via `-c model_catalog_json=...` in the entry's `args` field:
+
+```skill
+ACL_extraModels = "{
+  'my-custom-model': {
+    'label':   'My Custom Model',
+    'driver':  'codex',
+    'model':   'my-custom-model',
+    'context': 128000,
+    'args':    '-c model_catalog_json=\"/path/to/my-catalog.json\"'
+  }
+}"
+```
+
+See `codex/codex-rs/core/models.json` in the codex source tree for additional catalog field examples. If you are in an organization, place the catalog file in a shared location (such as `ALLEGRO_SITE`) so all users benefit from it.
 
 ## Files
 
