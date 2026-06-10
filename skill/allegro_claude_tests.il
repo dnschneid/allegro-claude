@@ -2517,16 +2517,28 @@ let(((savedFast ACL_fast)
               "Call the allegro_execute tool with the argument "
               "{\"code\": \"42\"} and then reply with the exact word "
               "DONE. If the tool is not available, reply MISSING."))
-            letseq(((availDeadline 120)
-                    (availGrace 6)
+            ; Wait for BOTH the tool call to land AND text streamed
+            ; after it -- some models emit preamble before invoking
+            ; the tool, so an "exit N seconds after first text" gate
+            ; can race the actual DONE reply.
+            letseq(((availDeadline 180)
+                    (graceAfterText 12)
+                    (availBaseSeq ACL_mcpScanMaxSeq(ACL_sessionLogDir))
+                    (availExec nil)
+                    (availExecAt nil)
                     (textAt nil)
                     (availDone nil))
               for(i 1 availDeadline
                 unless(availDone
                   ACL_mcpDrainPending()
+                  when(null(availExec)
+                    when(ACL_mcpScanMaxSeq(ACL_sessionLogDir) > availBaseSeq
+                      availExec = t
+                      availExecAt = i))
                   when(and(ACL_gotText null(textAt))
                     textAt = i)
-                  when(and(textAt (i - textAt) > availGrace)
+                  when(and(availExec textAt availExecAt
+                           (i - max(textAt availExecAt)) > graceAfterText)
                     availDone = t)
                   ipcSleep(1))))
             let(((reply or(substring(ACL_logString() logBefore + 1) ""))
