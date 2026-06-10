@@ -782,6 +782,110 @@ let(((savedActive ACL_activeEntry) (savedFast ACL_fast)
   ACL_fast = savedFast
   ACL_activeEntry = savedActive)
 
+printf("\n--- Doc cache truncation (byte budget + section backoff) ---\n")
+let((sample bigEnough)
+  ; Cache shaped like a reordered output: leading preamble, tier
+  ; markers between chapter groups, chapters of `# header` + `### `
+  ; entries. Use small chapters and a tight budget so we can predict
+  ; which cut wins.
+  sample = strcat(
+    "<!-- generator preamble -->\n\n"
+    "<!-- ACL_TIER_BOUNDARY tier=1 -->\n\n"
+    "# chap_one\n"
+    "### entry_a `() => t`\nFirst entry body.\n\n"
+    "### entry_b `() => t`\nSecond entry body.\n\n"
+    "<!-- ACL_TIER_BOUNDARY tier=2 -->\n\n"
+    "# chap_two\n"
+    "### entry_c `() => t`\nThird entry body.\n\n"
+    "<!-- ACL_TIER_BOUNDARY tier=end -->\n")
+
+  ; nil budget -> no cap, return content unchanged + no meta.
+  let(((r ACL_truncateDocContent(sample nil)))
+    ACL_check("trunc nil-budget: full content"
+      car(r) sample)
+    ACL_check("trunc nil-budget: no meta"
+      cadr(r) nil))
+
+  ; Budget bigger than content -> no truncation.
+  let(((r ACL_truncateDocContent(sample 10000)))
+    ACL_check("trunc oversize: full content"
+      car(r) sample)
+    ACL_check("trunc oversize: no meta" cadr(r) nil))
+
+  ; Budget below the first chapter header -> falls back to a chapter
+  ; cut at the only `# ` line, dropping the body but keeping the
+  ; preamble + chapter header.
+  bigEnough = strcat(
+    "<!-- preamble line one -->\n"
+    "<!-- preamble line two -->\n\n"
+    "# chap_solo\n"
+    "### entry `() => t`\nA body.\n\n"
+    "### entry2 `() => t`\nAnother body.\n")
+  let(((budget nindex(bigEnough "### entry2") - 1))
+    let(((r ACL_truncateDocContent(bigEnough budget)))
+      ACL_checkTrue("trunc chapter: meta present" cadr(r))
+      ACL_check("trunc chapter: cutAt is chapter"
+        cadr(assoc('cutAt cadr(r))) "chapter")
+      ACL_check("trunc chapter: head ends before entry2"
+        nindex(car(r) "entry2") nil)))
+
+  ; No chapter header at all; only section markers within prose.
+  ; Section cut must win.
+  let(((noChap strcat(
+          "Just some prose\n"
+          "### entry_x `() => t`\nbody x\n"
+          "### entry_y `() => t`\nbody y\n"
+          "### entry_z `() => t`\nbody z\n"))
+       budget r)
+    budget = nindex(noChap "entry_y") - 1
+    r = ACL_truncateDocContent(noChap budget)
+    ACL_checkTrue("trunc section: meta present" cadr(r))
+    ACL_check("trunc section: cutAt is section"
+      cadr(assoc('cutAt cadr(r))) "section")
+    ACL_check("trunc section: head ends before entry_y"
+      nindex(car(r) "entry_y") nil))
+
+  ; Note generator wraps the cut location with file size info.
+  let(((meta list(list('cutBytes 12345)
+                   list('cutLine 678)
+                   list('totalBytes 99999)
+                   list('totalLines 1234)
+                   list('cutAt "chapter"))))
+    let(((note ACL_docTruncationNote("/path/to/cache.md" meta)))
+      ACL_checkTrue("trunc note: contains path"
+        nindex(note "/path/to/cache.md"))
+      ACL_checkTrue("trunc note: contains cut bytes"
+        nindex(note "12345"))
+      ACL_checkTrue("trunc note: contains cut line"
+        nindex(note "678"))
+      ACL_checkTrue("trunc note: contains total bytes"
+        nindex(note "99999"))
+      ACL_checkTrue("trunc note: names the boundary"
+        nindex(note "chapter"))))
+)
+
+printf("\n--- Doc cache budget derivation ---\n")
+let(((savedActive ACL_activeEntry) (savedRatio ACL_docCacheRatio))
+  ACL_docCacheRatio = 1.8
+  ; Active model carries a context; budget = ratio * context (bytes).
+  ACL_activeEntry = list("e" list(list("driver" "claude")
+                                   list("model" "x")
+                                   list("context" 200000)))
+  ACL_check("budget: small ctx -> capped"
+    ACL_docCacheBudget() 360000)
+  ACL_activeEntry = list("e" list(list("driver" "claude")
+                                   list("model" "x")
+                                   list("context" 1000000)))
+  ACL_check("budget: big ctx -> generous"
+    ACL_docCacheBudget() 1800000)
+  ; Missing context -> nil budget (treat as no cap).
+  ACL_activeEntry = list("e" list(list("driver" "claude")
+                                   list("model" "x")))
+  ACL_check("budget: unknown -> nil"
+    ACL_docCacheBudget() nil)
+  ACL_docCacheRatio = savedRatio
+  ACL_activeEntry = savedActive)
+
 printf("\n--- Shell quoting (ipcBeginProcess two-pass safe) ---\n")
 ; ACL_shellQuote must round-trip arbitrary text through ipcBeginProcess
 ; on Linux, where pass-1 interprets \X and "..." regions BEFORE handing

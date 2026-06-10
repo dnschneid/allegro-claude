@@ -436,6 +436,61 @@ procedure(ACL_docCacheFits(@optional (entry ACL_activeEntry)
     or(null(ctx) null(sz)
        (sz / float(ctx)) <= ACL_docCacheRatio)))
 
+procedure(ACL_docCacheBudget(@optional (entry ACL_activeEntry))
+  ; Byte budget for inlined doc content on the active model. Same
+  ; ratio as ACL_docCacheFits, applied as a cap rather than a gate so
+  ; the loader can keep a leading slice on small-context models.
+  ; Returns nil when the model has no declared context (treat as no
+  ; cap; inline everything).
+  let(((ctx ACL_entryField(or(entry ACL_defaultModelEntry()) "context")))
+    when(ctx fix(ctx * ACL_docCacheRatio))))
+
+procedure(ACL_findCutPoint(content needle budget)
+  ; Byte length of the prefix that ends at the LAST `needle`
+  ; occurrence at or before `budget`, or nil if none fits. `needle`
+  ; must begin with "\n"; the prefix keeps that newline so the
+  ; following line becomes the first dropped byte.
+  prog((scanStart bestEnd absStart)
+    scanStart = 1
+    while(scanStart <= strlen(content)
+      let(((rel nindex(substring(content scanStart) needle)))
+        unless(rel return(bestEnd))
+        absStart = scanStart + rel - 1
+        when(absStart > budget return(bestEnd))
+        bestEnd = absStart
+        scanStart = absStart + strlen(needle)))
+    return(bestEnd)))
+
+procedure(ACL_truncateDocContent(content budget)
+  ; Truncate `content` to fit `budget` bytes, backing off to the most
+  ; recent chapter (`# `) or section (`### `) boundary so the model
+  ; never sees a half-documented entry. Returns (truncatedContent
+  ; meta) where meta is an assoc list of cutBytes / cutLine /
+  ; totalBytes / totalLines / cutAt. nil meta means no truncation.
+  letseq(((totalBytes strlen(content))
+          (totalLines length(parseString(content "\n"))))
+    if(or(null(budget) totalBytes <= budget)
+      list(content nil)
+      letseq((cutBytes cutKind head meta)
+        cutBytes = ACL_findCutPoint(content "\n# " budget)
+        cutKind = "chapter"
+        unless(cutBytes
+          cutBytes = ACL_findCutPoint(content "\n### " budget)
+          cutKind = "section")
+        unless(cutBytes
+          ; Nothing safe under budget -- caller wanted a smaller cap
+          ; than any boundary can satisfy. Skip truncation; let the
+          ; model see whatever the host wants to inline.
+          return(list(content nil)))
+        head = substring(content 1 cutBytes)
+        meta = list(
+          list('cutBytes cutBytes)
+          list('cutLine length(parseString(head "\n")))
+          list('totalBytes totalBytes)
+          list('totalLines totalLines)
+          list('cutAt cutKind))
+        list(head meta)))))
+
 ; Each entry: (label predicate(errStatus resText) -> t/nil). First match wins.
 defvar(ACL_fallbackTriggers
   list(
@@ -1192,11 +1247,11 @@ procedure(ACL_writeMcpConfig()
     mcpConfigFile))
 
 procedure(ACL_shouldLoadDocCache()
-  ; Inline the full cache only when fast mode is off AND the cache
-  ; fits the active model's window. If it doesn't fit, the system
-  ; prompt instead carries a pointer to the cache file -- see
-  ; ACL_docCacheReference.
-  and(null(ACL_fast) ACL_docCacheFits()))
+  ; Always inline the cache when fast mode is off. The truncation
+  ; loader handles small-context models by cutting at the largest
+  ; safe boundary that fits the model's budget and appending a
+  ; truncation note that tells the model how to reach the rest.
+  null(ACL_fast))
 
 procedure(ACL_docCacheReference()
   ; System-prompt snippet inserted when the doc cache exists but
@@ -1222,16 +1277,56 @@ procedure(ACL_writeSystemPromptFile(@key (appendDocs t))
   ; Write the assembled system prompt (optionally with the doc cache
   ; inlined) to a per-launch file; return its absolute path. The cache
   ; gate lives in ACL_shouldLoadDocCache; this just respects the flag.
+  ; When the cache is too large for the active model's context, the
+  ; loader truncates to the active-model byte budget and stops at the
+  ; nearest tier / chapter / section boundary so no entry is left
+  ; half-documented; in that case a trailing note tells the model
+  ; where to grep on disk for the rest.
   letseq(((promptFile ACL_normPath(strcat(ACL_homeDir "PROMPT.md")))
           (fp outfile(promptFile)))
     when(fp
       fprintf(fp "%s" ACL_buildSystemPrompt())
       when(appendDocs
-        let(((doc ACL_findOrPlanDocs()))
-          when(and(doc isFile(doc))
-            fprintf(fp "\n\n%s" ACL_replacePaths(ACL_readFile(doc))))))
+        let(((block ACL_renderDocCacheBlock()))
+          when(block fprintf(fp "\n\n%s" block))))
       close(fp))
     promptFile))
+
+procedure(ACL_renderDocCacheBlock()
+  ; Returns the cache content (already path-substituted) optionally
+  ; followed by a truncation note, or nil if no cache file is on
+  ; disk. Truncates first so path substitution only runs on the kept
+  ; prefix, and cut meta refers to byte/line positions in the file
+  ; the model would grep on disk.
+  let(((doc ACL_findOrPlanDocs()))
+    when(and(doc isFile(doc))
+      letseq(((loaded ACL_truncateDocContent(ACL_readFile(doc) ACL_docCacheBudget()))
+              (body ACL_replacePaths(car(loaded)))
+              (meta cadr(loaded)))
+        if(meta
+          strcat(body "\n\n" ACL_docTruncationNote(doc meta))
+          body)))))
+
+procedure(ACL_docTruncationNote(path meta)
+  ; Single-paragraph note appended to the system prompt when the doc
+  ; cache was truncated. Tells the model the path, where the cut
+  ; happened, and how to retrieve anything past it.
+  letseq(((cutBytes  cadr(assoc('cutBytes meta)))
+          (cutLine   cadr(assoc('cutLine meta)))
+          (totBytes  cadr(assoc('totalBytes meta)))
+          (totLines  cadr(assoc('totalLines meta)))
+          (cutAt     cadr(assoc('cutAt meta))))
+    sprintf(nil
+      strcat(
+        "## Documentation cache truncated\n\n"
+        "The cache above is the leading slice of a larger reference "
+        "file on disk:\n  %s (%d bytes, %d lines)\n"
+        "It was truncated at byte %d / line %d (boundary: %s) to fit "
+        "this model's context. For anything not shown above, grep or "
+        "read the file directly with your built-in file/shell tools "
+        "before guessing -- the omitted portion holds lower-priority "
+        "but still authoritative reference material.\n")
+      path totBytes totLines cutBytes cutLine cutAt)))
 
 procedure(ACL_resetAgentState()
   ACL_mcpPending = nil
@@ -1574,10 +1669,9 @@ procedure(ACL_codexBuildThreadParams()
             simplifyFilename(or(axlGetDrawingName() ACL_homeDir)) "" 0)))
           (devInstr ACL_buildSystemPrompt()))
     when(ACL_shouldLoadDocCache()
-      let(((doc ACL_findOrPlanDocs()))
-        when(and(doc isFile(doc))
-          devInstr = strcat(devInstr "\n\n"
-                              ACL_replacePaths(ACL_readFile(doc))))))
+      let(((block ACL_renderDocCacheBlock()))
+        when(block
+          devInstr = strcat(devInstr "\n\n" block))))
     list(
       list("model" ACL_activeModelId())
       list("developerInstructions" devInstr)
