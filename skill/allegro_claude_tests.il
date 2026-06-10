@@ -624,11 +624,11 @@ let(((savedExtra ACL_extraModels) (savedBuiltins ACL_useBuiltinModels))
   ACL_extraModels = ""
   ACL_useBuiltinModels = t
   ACL_checkTrue("registry: parsed built-ins"
-    and(ACL_modelById("opus-1m") ACL_modelById("gpt-5-codex")))
+    and(ACL_modelById("opus-1m") ACL_modelById("gpt-5-5")))
   ACL_check("registry: no surprise built-ins"
     ACL_modelById("does-not-exist") nil)
   ACL_check("registry: built-in has expected label"
-    ACL_entryLabel(ACL_modelById("gpt-5-codex")) "Codex GPT-5")
+    ACL_entryLabel(ACL_modelById("gpt-5-5")) "Codex GPT-5.5")
   ; Site can append new entries via ACL_extraModels.
   ACL_extraModels = "{'site-local':{'label':'Site Local','driver':'claude',
                                     'model':'x','context':1000}}"
@@ -636,10 +636,10 @@ let(((savedExtra ACL_extraModels) (savedBuiltins ACL_useBuiltinModels))
     ACL_modelById("site-local"))
   ; A site entry whose id matches a built-in replaces it (and a
   ; bare lookup by id finds the override's fields, not the builtin's).
-  ACL_extraModels = "{'gpt-5-codex':{'label':'Codex Override','driver':'codex',
+  ACL_extraModels = "{'gpt-5-5':{'label':'Codex Override','driver':'codex',
                                      'model':'override','context':42,
                                      'args':'--with-proxy http://override.example/'}}"
-  let(((e ACL_modelById("gpt-5-codex")))
+  let(((e ACL_modelById("gpt-5-5")))
     ACL_check("registry: override model"
       ACL_entryField(e "model") "override")
     ACL_check("registry: override context"
@@ -1378,7 +1378,7 @@ let(((savedSid ACL_sessionId) (savedFile ACL_sessionsFile)
     ACL_sessionsFile = strcat(ACL_homeDir "codex_stale_test.json")
     errset(deleteFile(ACL_sessionsFile))
     ACL_addSession(sid list(list("board" "/tmp/x.brd") list("time" "1")
-                            list("model" "gpt-5-codex")))
+                            list("model" "gpt-5-5")))
     ACL_sessionId = sid
     ACL_codexResumeId = sid
     ACL_codexResumeIsFork = nil
@@ -2451,7 +2451,7 @@ let((proc buf ready)
 
 printf("\n--- Agent Process (per-driver) ---\n")
 ; End-to-end smoke for every driver on PATH; missing tools just skip.
-; Codex tests can flake because gpt-5-codex sometimes invents non-
+; Codex tests can flake because gpt-5-5 sometimes invents non-
 ; existent MCP methods (resources/*, update_plan) before our tool.
 let(((savedFast ACL_fast)
      (savedClaudeArgs ACL_claudeArgs)
@@ -2465,7 +2465,7 @@ let(((savedFast ACL_fast)
         list("claude" "opus-4-7-1m"
              if(ACL_isWindows "where claude >NUL 2>&1"
                "env -u LD_LIBRARY_PATH which claude > /dev/null 2>&1"))
-        list("codex"  "gpt-5-codex"
+        list("codex"  "gpt-5-5"
              if(ACL_isWindows "where codex >NUL 2>&1"
                "env -u LD_LIBRARY_PATH which codex > /dev/null 2>&1")))
       ACL_extraTestSpecs)
