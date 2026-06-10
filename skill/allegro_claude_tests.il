@@ -343,6 +343,34 @@ let(((savedForm ACL_form) (savedSessionDir ACL_sessionLogDir)
 
     ACL_mode = savedMode)
 
+  ; Manual mode: syntax-broken allegro_execute must NOT enter the
+  ; approval queue -- it fails the same way regardless, so reject it
+  ; up front and skip the user's approval cost.
+  let(((savedMode ACL_mode))
+    ACL_mode = "manual"
+    ACL_mcpPending = nil
+    ACL_mcpExecTimer = nil
+    ACL_handleToolCall(list(list("id" "toolu_manual_synbad")
+                            list("name" "mcp__allegro__allegro_execute")
+                            list("input" list(list("code" "(plus 1 2")))))
+    ACL_check("manual syn: not queued" ACL_mcpPending nil)
+    ACL_check("manual syn: no timer armed" ACL_mcpExecTimer nil)
+    ACL_checkTrue("manual syn: .out written immediately"
+      isFile(strcat(ACL_sessionLogDir "tool_toolu_manual_synbad.out")))
+    ACL_checkTrue("manual syn: .err sidecar present"
+      isFile(strcat(ACL_sessionLogDir "tool_toolu_manual_synbad.err")))
+    ACL_checkTrue("manual syn: .out has syntax-error text"
+      pcreMatchp("syntax check failed"
+        ACL_readFile(strcat(ACL_sessionLogDir "tool_toolu_manual_synbad.out"))))
+    ; Valid syntax still queues for approval -- guard against the
+    ; bypass over-applying.
+    ACL_handleToolCall(list(list("id" "toolu_manual_synok")
+                            list("name" "mcp__allegro__allegro_execute")
+                            list("input" list(list("code" "(plus 1 2)")))))
+    ACL_check("manual syn: valid still queued" length(ACL_mcpPending) 1)
+    ACL_mcpPending = nil
+    ACL_mode = savedMode)
+
   ; Clean up
   foreach(f ACL_listDirFiles(ACL_sessionLogDir)
     errset(deleteFile(strcat(ACL_sessionLogDir f))))
