@@ -20,6 +20,8 @@ import logging
 import re
 from pathlib import Path
 
+from . import reorder
+
 LOG = logging.getLogger(__name__)
 
 BLANK_RUN_RE = re.compile(r"\n{3,}")
@@ -50,7 +52,8 @@ ARG_NAME_RE = re.compile(r"-?([a-z_][\w]*)")
 SUBTLE_RE = re.compile(
     r"\b(warning|deprecated|obsolete|important|side effect|caveat|"
     r"gotcha|note|crash|error|fail|undefined|race)\b",
-    re.IGNORECASE)
+    re.IGNORECASE,
+)
 
 
 def _compact(text: str) -> str:
@@ -98,9 +101,9 @@ def _split_into_blocks(text: str) -> list[tuple[str, str, str]]:
     return blocks
 
 
-def _drop_empty_entries_and_dedup(text: str,
-                                   known_idents: set[str] | None = None
-                                   ) -> str:
+def _drop_empty_entries_and_dedup(
+    text: str, known_idents: set[str] | None = None
+) -> str:
     """Drop `### name` entries whose header has no inline body and no body
     content before the next header, dedup truly redundant identifier-headed
     entries, and collapse duplicate chapter headings that arise from slices
@@ -143,8 +146,7 @@ def _drop_empty_entries_and_dedup(text: str,
         (angle-bracket command syntax), or 'unknown'. Inspects the header
         line and the first few lines of the body, since slice agents
         sometimes put the signature on the line after the header."""
-        sample = item["header"] + "\n" + "\n".join(
-            item["body"].split("\n", 3)[:3])
+        sample = item["header"] + "\n" + "\n".join(item["body"].split("\n", 3)[:3])
         if SIG_FN_RE.search(sample):
             return "fn"
         if SIG_CMD_RE.search(sample):
@@ -156,8 +158,7 @@ def _drop_empty_entries_and_dedup(text: str,
         Used to verify two same-name entries are documenting the same call:
         two entries with no arg-name overlap are different functions that
         happen to share a spelling."""
-        sample = item["header"] + "\n" + "\n".join(
-            item["body"].split("\n", 3)[:3])
+        sample = item["header"] + "\n" + "\n".join(item["body"].split("\n", 3)[:3])
         m = SIG_ARGS_RE.search(sample)
         if not m:
             return set()
@@ -176,8 +177,12 @@ def _drop_empty_entries_and_dedup(text: str,
         or empty. Trivial entries can be deduped without losing information.
         """
         body = re.sub(r"`[^`]+`", "", item["body"])
-        body = re.sub(r"\b(Args?|Returns?|Behavior|Example|Usage|API|Use|"
-                      r"Pitfall|State|Gotcha):\s*", "", body)
+        body = re.sub(
+            r"\b(Args?|Returns?|Behavior|Example|Usage|API|Use|"
+            r"Pitfall|State|Gotcha):\s*",
+            "",
+            body,
+        )
         words = re.findall(r"\b[a-zA-Z]\w+\b", body)
         return len(words) <= 8
 
@@ -186,8 +191,7 @@ def _drop_empty_entries_and_dedup(text: str,
         blocks and short stopwords-ish tokens. Used to detect when two
         entries are saying substantially the same thing."""
         body = re.sub(r"`[^`]+`", "", item["body"])
-        return set(w.lower() for w in re.findall(r"\b[a-z][a-z]{2,}\b",
-                                                  body.lower()))
+        return set(w.lower() for w in re.findall(r"\b[a-z][a-z]{2,}\b", body.lower()))
 
     def can_dedup(cands: list[dict]) -> bool:
         """Decide whether a cluster of same-name entries is safe to collapse.
@@ -212,6 +216,7 @@ def _drop_empty_entries_and_dedup(text: str,
             if union and len(inter) / len(union) >= 0.5:
                 return True
         return False
+
     # Parse into (kind, header, body, chapter) tuples in source order.
     # kind in {chapter, section, entry, prose}.
     lines = text.split("\n")
@@ -222,32 +227,39 @@ def _drop_empty_entries_and_dedup(text: str,
         line = lines[i]
         if line.startswith("# ") and not line.startswith(("## ", "### ")):
             cur_chapter = line[2:].strip()
-            items.append({"kind": "chapter", "header": line, "body": "",
-                          "chapter": cur_chapter, "ident": None})
+            items.append(
+                {
+                    "kind": "chapter",
+                    "header": line,
+                    "body": "",
+                    "chapter": cur_chapter,
+                    "ident": None,
+                }
+            )
             i += 1
             continue
         if line.startswith("## ") and not line.startswith("### "):
             j = i + 1
             body_lines: list[str] = []
-            while j < len(lines) and not lines[j].startswith(
-                    ("### ", "## ", "# ")):
+            while j < len(lines) and not lines[j].startswith(("### ", "## ", "# ")):
                 body_lines.append(lines[j])
                 j += 1
-            items.append({
-                "kind": "section",
-                "header": line,
-                "body": "\n".join(body_lines).rstrip(),
-                "chapter": cur_chapter,
-                "ident": None,
-            })
+            items.append(
+                {
+                    "kind": "section",
+                    "header": line,
+                    "body": "\n".join(body_lines).rstrip(),
+                    "chapter": cur_chapter,
+                    "ident": None,
+                }
+            )
             i = j
             continue
         if line.startswith("### "):
             header = line
             j = i + 1
             body_lines = []
-            while j < len(lines) and not lines[j].startswith(
-                    ("### ", "## ", "# ")):
+            while j < len(lines) and not lines[j].startswith(("### ", "## ", "# ")):
                 body_lines.append(lines[j])
                 j += 1
             body = "\n".join(body_lines).rstrip()
@@ -256,17 +268,26 @@ def _drop_empty_entries_and_dedup(text: str,
             m = ENTRY_IDENT_RE.match(rest)
             if m:
                 ident = m.group(1)
-            items.append({
-                "kind": "entry",
-                "header": header,
-                "body": body,
-                "chapter": cur_chapter,
-                "ident": ident,
-            })
+            items.append(
+                {
+                    "kind": "entry",
+                    "header": header,
+                    "body": body,
+                    "chapter": cur_chapter,
+                    "ident": ident,
+                }
+            )
             i = j
             continue
-        items.append({"kind": "prose", "header": "", "body": line,
-                      "chapter": cur_chapter, "ident": None})
+        items.append(
+            {
+                "kind": "prose",
+                "header": "",
+                "body": line,
+                "chapter": cur_chapter,
+                "ident": None,
+            }
+        )
         i += 1
 
     drop: set[int] = set()
@@ -280,7 +301,7 @@ def _drop_empty_entries_and_dedup(text: str,
         if item["kind"] != "entry" or item["ident"] is None:
             continue
         rest = item["header"][4:].lstrip()
-        rest_after_ident = rest[len(item["ident"]):].strip()
+        rest_after_ident = rest[len(item["ident"]) :].strip()
         if not rest_after_ident and not item["body"].strip():
             drop.add(idx)
 
@@ -308,7 +329,7 @@ def _drop_empty_entries_and_dedup(text: str,
             args = first_args(item)
             attached = False
             for key in list(by_key.keys()):
-                if key[:len(scope)] != scope:
+                if key[: len(scope)] != scope:
                     continue
                 if len(key) <= len(scope) or key[len(scope)] != "fn":
                     continue
@@ -330,8 +351,8 @@ def _drop_empty_entries_and_dedup(text: str,
         if not can_dedup(cands):
             continue
         keep_idx = max(
-            idx_list,
-            key=lambda i: len(items[i]["header"]) + len(items[i]["body"]))
+            idx_list, key=lambda i: len(items[i]["header"]) + len(items[i]["body"])
+        )
         keeper = items[keep_idx]
         if "`" not in keeper["header"]:
             for i in idx_list:
@@ -342,7 +363,7 @@ def _drop_empty_entries_and_dedup(text: str,
                     ident = keeper["ident"]
                     rest = keeper["header"][4:].lstrip()
                     new_h = f"### {ident} {sig_match.group(0)}"
-                    rest_after_ident = rest[len(ident):].lstrip()
+                    rest_after_ident = rest[len(ident) :].lstrip()
                     if rest_after_ident:
                         new_h += " " + rest_after_ident
                     keeper["header"] = new_h
@@ -379,10 +400,11 @@ def _drop_empty_entries_and_dedup(text: str,
     return "\n".join(out_lines)
 
 
-def _annotate_gap_markers(text: str,
-                           gap_count_by_chapter: dict[str, int],
-                           gap_sample_by_chapter: dict[str, list[str]],
-                           ) -> str:
+def _annotate_gap_markers(
+    text: str,
+    gap_count_by_chapter: dict[str, int],
+    gap_sample_by_chapter: dict[str, list[str]],
+) -> str:
     """Append a self-explanatory `<!--omitted: N (e.g. a, b, c)-->` marker
     to each chapter heading whose slice(s) finished iteration with
     unresolved gaps. Including up to 3 sample identifiers gives the reader
@@ -406,8 +428,9 @@ def _annotate_gap_markers(text: str,
                 # ordering, which itself reflects source-order from prepass.
                 if samples:
                     sample_str = ", ".join(samples)
-                    out.append(f"{line} <!--omitted: {n} {noun}; "
-                               f"e.g. {sample_str}-->")
+                    out.append(
+                        f"{line} <!--omitted: {n} {noun}; " f"e.g. {sample_str}-->"
+                    )
                 else:
                     out.append(f"{line} <!--omitted: {n} {noun}-->")
                 continue
@@ -423,7 +446,8 @@ def _strip_orphan_micro_headers(body: str) -> str:
     i = 0
     micro_re = re.compile(
         r"^(Behavior|Example|Args?|Returns?|Gotcha|Use|State|Pitfall|API)\s*:\s*$",
-        re.IGNORECASE)
+        re.IGNORECASE,
+    )
     while i < len(lines):
         line = lines[i]
         if micro_re.match(line.strip()):
@@ -478,8 +502,9 @@ def _strip_dead_section_headers(text: str) -> str:
     return "\n\n".join(result_parts)
 
 
-def _trim_entry_body(body: str, max_lines: int, subtle: bool,
-                     max_line_chars: int = 200) -> str:
+def _trim_entry_body(
+    body: str, max_lines: int, subtle: bool, max_line_chars: int = 200
+) -> str:
     """Trim an entry body to ~max_lines (subtle entries get +3).
 
     Lines longer than max_line_chars are DROPPED rather than ellipsis-truncated
@@ -498,10 +523,13 @@ def _trim_entry_body(body: str, max_lines: int, subtle: bool,
     return "\n".join(out).strip()
 
 
-def _trim_section_body(body: str, max_paragraphs: int,
-                       max_sentences_per_para: int,
-                       drop_code: bool = False,
-                       drop_bullets: bool = False) -> str:
+def _trim_section_body(
+    body: str,
+    max_paragraphs: int,
+    max_sentences_per_para: int,
+    drop_code: bool = False,
+    drop_bullets: bool = False,
+) -> str:
     """Trim a section body: keep code/bullets fully; trim prose paragraphs.
 
     With drop_code/drop_bullets, those structural blocks are also removed.
@@ -553,8 +581,7 @@ def _trim_section_body(body: str, max_paragraphs: int,
     return "\n\n".join(out_paragraphs)
 
 
-def _apply_tiered_compaction(text: str, target_bytes: int,
-                             hard_cap: int) -> str:
+def _apply_tiered_compaction(text: str, target_bytes: int, hard_cap: int) -> str:
     """Iteratively trim until under target_bytes or all tiers exhausted.
 
     Stops as soon as size <= target_bytes. If a tier crosses below hard_cap
@@ -565,30 +592,90 @@ def _apply_tiered_compaction(text: str, target_bytes: int,
     """
     tiers = [
         # gentle prose trim
-        dict(entry_lines=8, sec_paras=5, sec_sents=3,
-             drop_code=False, drop_bullets=False, drop_entries=False),
-        dict(entry_lines=6, sec_paras=4, sec_sents=2,
-             drop_code=False, drop_bullets=False, drop_entries=False),
-        dict(entry_lines=4, sec_paras=3, sec_sents=2,
-             drop_code=False, drop_bullets=False, drop_entries=False),
-        dict(entry_lines=3, sec_paras=2, sec_sents=2,
-             drop_code=False, drop_bullets=False, drop_entries=False),
-        dict(entry_lines=2, sec_paras=1, sec_sents=2,
-             drop_code=False, drop_bullets=False, drop_entries=False),
+        dict(
+            entry_lines=8,
+            sec_paras=5,
+            sec_sents=3,
+            drop_code=False,
+            drop_bullets=False,
+            drop_entries=False,
+        ),
+        dict(
+            entry_lines=6,
+            sec_paras=4,
+            sec_sents=2,
+            drop_code=False,
+            drop_bullets=False,
+            drop_entries=False,
+        ),
+        dict(
+            entry_lines=4,
+            sec_paras=3,
+            sec_sents=2,
+            drop_code=False,
+            drop_bullets=False,
+            drop_entries=False,
+        ),
+        dict(
+            entry_lines=3,
+            sec_paras=2,
+            sec_sents=2,
+            drop_code=False,
+            drop_bullets=False,
+            drop_entries=False,
+        ),
+        dict(
+            entry_lines=2,
+            sec_paras=1,
+            sec_sents=2,
+            drop_code=False,
+            drop_bullets=False,
+            drop_entries=False,
+        ),
         # drop code/bullets in concept sections
-        dict(entry_lines=2, sec_paras=1, sec_sents=1,
-             drop_code=True, drop_bullets=False, drop_entries=False),
+        dict(
+            entry_lines=2,
+            sec_paras=1,
+            sec_sents=1,
+            drop_code=True,
+            drop_bullets=False,
+            drop_entries=False,
+        ),
         # drop bullets too
-        dict(entry_lines=2, sec_paras=1, sec_sents=1,
-             drop_code=True, drop_bullets=True, drop_entries=False),
-        dict(entry_lines=1, sec_paras=1, sec_sents=1,
-             drop_code=True, drop_bullets=True, drop_entries=False),
+        dict(
+            entry_lines=2,
+            sec_paras=1,
+            sec_sents=1,
+            drop_code=True,
+            drop_bullets=True,
+            drop_entries=False,
+        ),
+        dict(
+            entry_lines=1,
+            sec_paras=1,
+            sec_sents=1,
+            drop_code=True,
+            drop_bullets=True,
+            drop_entries=False,
+        ),
         # entries keep sigs; section headers preserved but bodies emptied
-        dict(entry_lines=1, sec_paras=0, sec_sents=0,
-             drop_code=True, drop_bullets=True, drop_entries=False),
+        dict(
+            entry_lines=1,
+            sec_paras=0,
+            sec_sents=0,
+            drop_code=True,
+            drop_bullets=True,
+            drop_entries=False,
+        ),
         # ultra: entries become headers only, sections too
-        dict(entry_lines=0, sec_paras=0, sec_sents=0,
-             drop_code=True, drop_bullets=True, drop_entries=True),
+        dict(
+            entry_lines=0,
+            sec_paras=0,
+            sec_sents=0,
+            drop_code=True,
+            drop_bullets=True,
+            drop_entries=True,
+        ),
     ]
     blocks = _split_into_blocks(text)
     candidate = text
@@ -605,8 +692,12 @@ def _apply_tiered_compaction(text: str, target_bytes: int,
                     out.append(header + ("\n" + trimmed if trimmed else ""))
             elif kind == "section":
                 trimmed = _trim_section_body(
-                    body, t["sec_paras"], t["sec_sents"],
-                    drop_code=t["drop_code"], drop_bullets=t["drop_bullets"])
+                    body,
+                    t["sec_paras"],
+                    t["sec_sents"],
+                    drop_code=t["drop_code"],
+                    drop_bullets=t["drop_bullets"],
+                )
                 out.append(header + ("\n\n" + trimmed if trimmed else ""))
             elif kind == "chapter":
                 out.append(header + ("\n\n" + body.strip() if body.strip() else ""))
@@ -615,16 +706,28 @@ def _apply_tiered_compaction(text: str, target_bytes: int,
                     out.append(body.strip())
         next_candidate = _compact("\n\n".join(out))
         sz = len(next_candidate.encode("utf-8"))
-        LOG.info("compact tier (entry<=%d, sec<=%dpara/<=%dsent, drop_code=%s, "
-                 "drop_bullets=%s, drop_entries=%s): %d bytes",
-                 t["entry_lines"], t["sec_paras"], t["sec_sents"],
-                 t["drop_code"], t["drop_bullets"], t["drop_entries"], sz)
+        LOG.info(
+            "compact tier (entry<=%d, sec<=%dpara/<=%dsent, drop_code=%s, "
+            "drop_bullets=%s, drop_entries=%s): %d bytes",
+            t["entry_lines"],
+            t["sec_paras"],
+            t["sec_sents"],
+            t["drop_code"],
+            t["drop_bullets"],
+            t["drop_entries"],
+            sz,
+        )
         # Reject this tier if it cuts more than 30% AND we're already under
         # the hard cap -- the loss isn't worth it.
         prev_under_cap = prev_size <= hard_cap
         if prev_under_cap and sz < prev_size * 0.7:
-            LOG.info("compact: keeping previous tier; next would drop too much "
-                     "(%d -> %d, %.0f%%)", prev_size, sz, 100*(1 - sz/prev_size))
+            LOG.info(
+                "compact: keeping previous tier; next would drop too much "
+                "(%d -> %d, %.0f%%)",
+                prev_size,
+                sz,
+                100 * (1 - sz / prev_size),
+            )
             return candidate
         candidate = next_candidate
         prev_size = sz
@@ -639,8 +742,7 @@ def _strip_report_lines(text: str) -> str:
     not cache content."""
     # Anchor on the line start, allow leading whitespace, and tolerate the
     # form `REPORT:in=...` (no space after colon) the agents sometimes use.
-    return re.sub(r"^\s*REPORT:\s*in\s*=\s*\d+.*$\n?", "",
-                  text, flags=re.MULTILINE)
+    return re.sub(r"^\s*REPORT:\s*in\s*=\s*\d+.*$\n?", "", text, flags=re.MULTILINE)
 
 
 def _strip_chapter_mode_suffix(text: str) -> str:
@@ -650,7 +752,10 @@ def _strip_chapter_mode_suffix(text: str) -> str:
     keep the legacy format from earlier prompt versions."""
     return re.sub(
         r"^(# [^\n]+?)\s+\((?:reference|concept|verbatim|survey|catalog|mode)\)\s*$",
-        r"\1", text, flags=re.MULTILINE)
+        r"\1",
+        text,
+        flags=re.MULTILINE,
+    )
 
 
 def _strip_more_lines(text: str) -> str:
@@ -679,7 +784,8 @@ def _cleanup(text: str, known_idents: set[str] | None = None) -> str:
         cleaned.append((kind, header, body))
     text = "\n\n".join(
         h + ("\n" + b if b.strip() else "") if k != "prose" else b
-        for k, h, b in cleaned)
+        for k, h, b in cleaned
+    )
     text = _strip_dead_section_headers(text)
     return _compact(text)
 
@@ -714,10 +820,12 @@ def run(
     ]
     if audit_report:
         gaps = sum(1 for s in audit_report.get("slices", []) if s.get("has_gaps"))
-        header.append(f"Audit iteration: {audit_report.get('iteration')}; "
-                      f"slices with gaps: {gaps}; "
-                      f"missing signals (cache-wide): "
-                      f"{len(audit_report.get('global_missing_signals', []))}")
+        header.append(
+            f"Audit iteration: {audit_report.get('iteration')}; "
+            f"slices with gaps: {gaps}; "
+            f"missing signals (cache-wide): "
+            f"{len(audit_report.get('global_missing_signals', []))}"
+        )
     header.append("-->")
     header_text = "\n".join(header)
 
@@ -740,7 +848,9 @@ def run(
             missing = s.get("missing_signals") or []
             if not missing:
                 continue
-            gap_count_by_chapter[chap] = gap_count_by_chapter.get(chap, 0) + len(missing)
+            gap_count_by_chapter[chap] = gap_count_by_chapter.get(chap, 0) + len(
+                missing
+            )
             gap_sample_by_chapter.setdefault(chap, []).extend(missing)
 
     body_parts: list[str] = []
@@ -753,29 +863,52 @@ def run(
         body_parts.append(body)
 
     merged_body = _cleanup("\n\n".join(body_parts), known_idents=known_idents)
-    merged_body = _annotate_gap_markers(merged_body, gap_count_by_chapter,
-                                         gap_sample_by_chapter)
+    merged_body = _annotate_gap_markers(
+        merged_body, gap_count_by_chapter, gap_sample_by_chapter
+    )
     raw_size = len(merged_body.encode("utf-8"))
-    LOG.info("merge: cleaned concat %d bytes; target=%d, cap=%d",
-             raw_size, target_bytes, hard_cap)
+    LOG.info(
+        "merge: cleaned concat %d bytes; target=%d, cap=%d",
+        raw_size,
+        target_bytes,
+        hard_cap,
+    )
 
     if raw_size > target_bytes and allow_compaction:
-        LOG.warning("merge: applying tiered compaction (LOSSY -- agents "
-                    "should have stayed under budget)")
-        merged_body = _apply_tiered_compaction(merged_body, target_bytes,
-                                                hard_cap)
+        LOG.warning(
+            "merge: applying tiered compaction (LOSSY -- agents "
+            "should have stayed under budget)"
+        )
+        merged_body = _apply_tiered_compaction(merged_body, target_bytes, hard_cap)
+
+    # Tier-reorder so byte-bounded loaders see the highest-value content
+    # first. Survey-emitted `tier` on each group seeds an override map
+    # keyed by `# <dir>`; chapters without an override fall through to
+    # the content heuristic.
+    tier_overrides: dict[str, int] = {}
+    for grp in plan:
+        tier = grp.get("tier")
+        chap_dir = grp.get("dir")
+        if isinstance(tier, int) and tier in (1, 2, 3, 4) and chap_dir:
+            tier_overrides[f"# {chap_dir}"] = tier
+    merged_body = reorder.reorder(merged_body, tier_overrides=tier_overrides)
 
     final = header_text + "\n\n" + merged_body
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(final)
     sz = out_path.stat().st_size
-    LOG.info("merge: %s (%d bytes; target=%d, cap=%d)",
-             out_path, sz, target_bytes, hard_cap)
+    LOG.info(
+        "merge: %s (%d bytes; target=%d, cap=%d)", out_path, sz, target_bytes, hard_cap
+    )
     if sz > hard_cap:
-        msg = (f"merged cache {sz} bytes exceeds hard cap {hard_cap} "
-               f"({sz / hard_cap:.2f}x).")
+        msg = (
+            f"merged cache {sz} bytes exceeds hard cap {hard_cap} "
+            f"({sz / hard_cap:.2f}x)."
+        )
         if enforce_cap:
-            raise SystemExit(f"error: {msg} Re-run with smaller per-slice "
-                             f"budgets or pass --allow-compaction.")
+            raise SystemExit(
+                f"error: {msg} Re-run with smaller per-slice "
+                f"budgets or pass --allow-compaction."
+            )
         LOG.warning("merge: %s", msg)
     return sz

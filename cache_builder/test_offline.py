@@ -16,7 +16,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from . import audit, merge, prepass
+from . import audit, merge, prepass, reorder
 
 
 def assert_eq(a, b, msg=""):
@@ -51,30 +51,61 @@ def test_build_plan_glob_expansion():
     full_manifest = [
         {"rel_path": "doc/foo/aaa.html", "shadow_path": "shadow/doc/foo/aaa.html.txt"},
         {"rel_path": "doc/foo/bbb.html", "shadow_path": "shadow/doc/foo/bbb.html.txt"},
-        {"rel_path": "doc/foo/Ccc_Dialog.html", "shadow_path": "shadow/doc/foo/Ccc_Dialog.html.txt"},
-        {"rel_path": "doc/foo/fooTOC.html", "shadow_path": "shadow/doc/foo/fooTOC.html.txt"},
+        {
+            "rel_path": "doc/foo/Ccc_Dialog.html",
+            "shadow_path": "shadow/doc/foo/Ccc_Dialog.html.txt",
+        },
+        {
+            "rel_path": "doc/foo/fooTOC.html",
+            "shadow_path": "shadow/doc/foo/fooTOC.html.txt",
+        },
         {"rel_path": "doc/bar/aaa.html", "shadow_path": "shadow/doc/bar/aaa.html.txt"},
         {"rel_path": "doc/bin/img.png", "shadow_path": None},  # excluded
     ]
-    sm = {"groups": [
-        {"id": "foo_lower", "dir": "doc/foo", "mode": "reference",
-         "include": ["[a-z]*.html"], "exclude": ["*TOC.html"],
-         "byte_budget": 10000},
-        {"id": "foo_dialog", "dir": "doc/foo", "mode": "reference",
-         "include": ["[A-Z]*.html"], "exclude": [],
-         "byte_budget": 5000},
-        {"id": "bar", "dir": "doc/bar", "mode": "concept",
-         "include": ["*"], "exclude": [],
-         "byte_budget": 3000},
-        {"id": "skipme", "dir": "doc/bin", "mode": "skip",
-         "include": ["*"], "byte_budget": 0},
-    ]}
+    sm = {
+        "groups": [
+            {
+                "id": "foo_lower",
+                "dir": "doc/foo",
+                "mode": "reference",
+                "include": ["[a-z]*.html"],
+                "exclude": ["*TOC.html"],
+                "byte_budget": 10000,
+            },
+            {
+                "id": "foo_dialog",
+                "dir": "doc/foo",
+                "mode": "reference",
+                "include": ["[A-Z]*.html"],
+                "exclude": [],
+                "byte_budget": 5000,
+            },
+            {
+                "id": "bar",
+                "dir": "doc/bar",
+                "mode": "concept",
+                "include": ["*"],
+                "exclude": [],
+                "byte_budget": 3000,
+            },
+            {
+                "id": "skipme",
+                "dir": "doc/bin",
+                "mode": "skip",
+                "include": ["*"],
+                "byte_budget": 0,
+            },
+        ]
+    }
     parts = Path("/tmp/_test_parts")
     plan = audit.build_plan(sm, parts, full_manifest=full_manifest)
     assert_eq(len(plan), 3, "plan length")
     foo_lower = next(p for p in plan if p["id"] == "foo_lower")
-    assert_eq(sorted(foo_lower["files"]),
-              ["doc/foo/aaa.html", "doc/foo/bbb.html"], "foo_lower files")
+    assert_eq(
+        sorted(foo_lower["files"]),
+        ["doc/foo/aaa.html", "doc/foo/bbb.html"],
+        "foo_lower files",
+    )
     foo_dialog = next(p for p in plan if p["id"] == "foo_dialog")
     assert_eq(foo_dialog["files"], ["doc/foo/Ccc_Dialog.html"], "foo_dialog files")
     bar = next(p for p in plan if p["id"] == "bar")
@@ -84,13 +115,24 @@ def test_build_plan_glob_expansion():
 
 def test_build_plan_chunk_split():
     # One huge group should split into multiple slices.
-    files = [{"rel_path": f"doc/big/f{i:04d}.html",
-              "shadow_path": f"shadow/doc/big/f{i:04d}.html.txt"}
-             for i in range(200)]
-    sm = {"groups": [
-        {"id": "big", "dir": "doc/big", "mode": "reference",
-         "include": ["*"], "byte_budget": 800000}
-    ]}
+    files = [
+        {
+            "rel_path": f"doc/big/f{i:04d}.html",
+            "shadow_path": f"shadow/doc/big/f{i:04d}.html.txt",
+        }
+        for i in range(200)
+    ]
+    sm = {
+        "groups": [
+            {
+                "id": "big",
+                "dir": "doc/big",
+                "mode": "reference",
+                "include": ["*"],
+                "byte_budget": 800000,
+            }
+        ]
+    }
     parts = Path("/tmp/_test_parts")
     plan = audit.build_plan(sm, parts, full_manifest=files)
     # 200 files / MAX_FILES_PER_SLICE
@@ -111,7 +153,8 @@ def test_audit_structural():
     try:
         # A part file with a mix of good entries, ghost, stub, combined-name.
         part = tmp / "slice_a.md"
-        part.write_text("""# doc/foo  (reference)
+        part.write_text(
+            """# doc/foo  (reference)
 
 ### realFn
 `realFn(a, b)` => list
@@ -130,16 +173,23 @@ TOC
 `combined(x)`
 Behavior: documents three names at once with enough body text.
 Example: combined(1)
-""")
-        grp = {"id": "slice_a", "dir": "doc/foo", "mode": "reference",
-               "files": ["x"], "byte_budget": 500,
-               "part_path": str(part)}
+"""
+        )
+        grp = {
+            "id": "slice_a",
+            "dir": "doc/foo",
+            "mode": "reference",
+            "files": ["x"],
+            "byte_budget": 500,
+            "part_path": str(part),
+        }
         a = audit._audit_structural(grp, set())
         assert_eq(a.entries, 4, "entry count")
         assert "ghostFn" in a.ghost_entries, f"ghost: {a.ghost_entries}"
         assert "stubFn" in a.stub_entries, f"stub: {a.stub_entries}"
-        assert "combined, foo, bar" in a.combined_name_entries, \
-               f"combined: {a.combined_name_entries}"
+        assert (
+            "combined, foo, bar" in a.combined_name_entries
+        ), f"combined: {a.combined_name_entries}"
         assert not a.over_budget
         # part is ~600 bytes, budget 500 -> over (>120%)
         # Actually 600/500 = 1.2, exactly the threshold; let's check both ways.
@@ -155,12 +205,24 @@ def test_merge_cap():
         for i in range(3):
             p = tmp / f"slice_{i}.md"
             p.write_text(f"# slice {i}\n\n### entry_{i}\nbody " + ("X " * 50) + "\n")
-            plan.append({"id": f"slice_{i}", "part_path": str(p),
-                         "dir": "x", "mode": "reference",
-                         "byte_budget": 1000, "files": []})
+            plan.append(
+                {
+                    "id": f"slice_{i}",
+                    "part_path": str(p),
+                    "dir": "x",
+                    "mode": "reference",
+                    "byte_budget": 1000,
+                    "files": [],
+                }
+            )
         out = tmp / "out.md"
-        merge.run(plan, out, install_root=Path("/opt/cadence/SPB251"),
-                  hard_cap=10000, target_bytes=8000)
+        merge.run(
+            plan,
+            out,
+            install_root=Path("/opt/cadence/SPB251"),
+            hard_cap=10000,
+            target_bytes=8000,
+        )
         assert out.exists()
         sz = out.stat().st_size
         assert sz < 10000, sz
@@ -173,6 +235,84 @@ def test_merge_cap():
         shutil.rmtree(tmp)
 
 
+def test_reorder_classifier():
+    # Dense API-reference shape: every ### header carries a function-call
+    # signature. Should land in tier 1.
+    api = "\n".join(
+        f"### foo{i} `(a_n) => t/nil`\n" + ("Does a thing. " * 20) + "\n"
+        for i in range(40)
+    )
+    assert_eq(reorder.classify_chapter("# x", api), 1, "API ref -> T1")
+    # Sentence-shaped headers, narrative body. Tier 4.
+    walk = "\n".join(
+        f"### Doing The Thing Number {i}\nA paragraph explaining how to.\n"
+        for i in range(20)
+    )
+    assert_eq(reorder.classify_chapter("# x", walk), 4, "walkthrough -> T4")
+    # Tiny chapter -> T3 or T4 (not tier 1).
+    tiny = "### foo `()=>t`\nA single line.\n"
+    t = reorder.classify_chapter("# x", tiny)
+    assert t in (3, 4), f"tiny got T{t}"
+    # Stub with omitted marker + small body -> T4.
+    stub_head = "# foo <!--omitted: 99 identifiers; e.g. a, b, c-->"
+    stub_body = "### one\nshort.\n"
+    assert_eq(reorder.classify_chapter(stub_head, stub_body), 4, "omitted stub -> T4")
+    # Omitted marker on a LARGE body should NOT downgrade it (the cache
+    # builder trimmed a few entries from an otherwise critical chapter).
+    big_api = "# foo <!--omitted: 5 identifiers; e.g. x, y, z-->"
+    assert_eq(reorder.classify_chapter(big_api, api), 1, "omitted+big API stays T1")
+    print("reorder classifier OK")
+
+
+def test_reorder_ordering():
+    chapters = [
+        (
+            "# chap_walk",
+            "\n".join(
+                f"### Adding Foo {i}\n" + ("Click to add the foo. " * 20) + "\n"
+                for i in range(20)
+            ),
+        ),
+        (
+            "# chap_api",
+            "\n".join(
+                f"### foo{i} `() => t`\n" + ("Returns the result. " * 20) + "\n"
+                for i in range(40)
+            ),
+        ),
+        ("# chap_prose", "An overview paragraph.\nMore prose.\n" * 30),
+    ]
+    text = "<!-- header -->\n\n" + "\n".join(h + "\n" + b for h, b in chapters)
+    out = reorder.reorder(text)
+    # Preamble preserved at top.
+    assert out.startswith("<!-- header -->"), out[:40]
+    # API chapter must appear before the walk chapter in output.
+    api_pos = out.index("# chap_api")
+    walk_pos = out.index("# chap_walk")
+    assert api_pos < walk_pos, "API chapter not promoted ahead of walkthrough"
+    print("reorder ordering OK")
+
+
+def test_reorder_respects_overrides():
+    chapters = [
+        ("# alpha", "### a `()=>t`\nx\n" * 30),  # heuristically T1
+        ("# beta", "prose only\n" * 200),  # heuristically T3
+    ]
+    text = "\n".join(h + "\n" + b for h, b in chapters)
+    # Override pushes the API chapter to T3 and the prose chapter to T1.
+    out = reorder.reorder(text, tier_overrides={"# alpha": 3, "# beta": 1})
+    a_pos = out.index("# alpha")
+    b_pos = out.index("# beta")
+    assert b_pos < a_pos, "override didn't reorder"
+    print("reorder overrides OK")
+
+
+def test_reorder_no_chapters_passthrough():
+    text = "Just prose, no chapter headers.\nSecond line.\n"
+    assert_eq(reorder.reorder(text), text, "no-chapter passthrough")
+    print("reorder no-chapter passthrough OK")
+
+
 def main():
     test_prepass_classify()
     test_toc_detection()
@@ -180,6 +320,10 @@ def main():
     test_build_plan_chunk_split()
     test_audit_structural()
     test_merge_cap()
+    test_reorder_classifier()
+    test_reorder_ordering()
+    test_reorder_respects_overrides()
+    test_reorder_no_chapters_passthrough()
     print("\nALL OFFLINE TESTS PASSED")
     return 0
 

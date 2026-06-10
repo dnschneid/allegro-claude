@@ -63,6 +63,25 @@ Each group represents one downstream extraction agent's workload. Schema:
     "exclude":      list of glob patterns to exclude (e.g. ["*TOC.html",
                     "*_Commands.html"])
     "byte_budget":  integer bytes for this group's part file,
+    "tier":         integer 1-4 ranking how load-bearing this group is for
+                    an LLM driving the tool. The merged cache will be
+                    reordered by tier so small-context models that can only
+                    inline a leading slice still see the high-value content.
+                      1 = required to write any working code (raw API
+                          signatures, core language primitives the model
+                          quotes verbatim).
+                      2 = strongly informs codegen, survivable to grep on
+                          demand (workflow APIs, shell commands, library
+                          conventions, common gotchas).
+                      3 = useful context, mostly narrative (workflow
+                          overviews, conceptual chapters, methodology).
+                      4 = drop-first (UI element catalogs, click-through
+                          walkthroughs, example registries, near-empty
+                          stubs, tangentially related tooling).
+                    Be deliberate: a small-context model will see only
+                    tiers 1-2 (~300-500 KB). Tier 1 should be the API
+                    surface a real session hits repeatedly, NOT everything
+                    that *might* be useful.
     "rationale":    one sentence
   }}
 
@@ -201,19 +220,28 @@ def run_survey(
     for e in full_manifest:
         dir_name = str(Path(e["rel_path"]).parent)
         if e["shadow_path"] is None:
-            d = skipped_summary.setdefault(dir_name, {"binary": 0, "ignored": 0,
-                                                      "bytes": 0})
+            d = skipped_summary.setdefault(
+                dir_name, {"binary": 0, "ignored": 0, "bytes": 0}
+            )
             if "binary" in e["trivial_signals"]:
                 d["binary"] += 1
             else:
                 d["ignored"] += 1
             d["bytes"] += e["bytes"]
             continue
-        bucket = by_dir.setdefault(dir_name, {
-            "files": 0, "bytes": 0, "lines": 0,
-            "ext_counts": {}, "toc_count": 0, "tiny_count": 0,
-            "samples": [], "prefix_counts": {},
-        })
+        bucket = by_dir.setdefault(
+            dir_name,
+            {
+                "files": 0,
+                "bytes": 0,
+                "lines": 0,
+                "ext_counts": {},
+                "toc_count": 0,
+                "tiny_count": 0,
+                "samples": [],
+                "prefix_counts": {},
+            },
+        )
         bucket["files"] += 1
         bucket["bytes"] += e["bytes"]
         bucket["lines"] += e["lines"]
@@ -227,19 +255,26 @@ def run_survey(
                 continue
             cur = bucket["prefix_counts"].setdefault(prefix, set())
             cur.update(idents)
-        if (len(bucket["samples"]) < SAMPLES_PER_DIR
-                and "is_html_toc" not in e["trivial_signals"]
-                and "tiny" not in e["trivial_signals"]):
-            bucket["samples"].append({
-                "rel_path": e["rel_path"],
-                "shadow_path": e["shadow_path"],
-                "bytes": e["bytes"],
-            })
+        if (
+            len(bucket["samples"]) < SAMPLES_PER_DIR
+            and "is_html_toc" not in e["trivial_signals"]
+            and "tiny" not in e["trivial_signals"]
+        ):
+            bucket["samples"].append(
+                {
+                    "rel_path": e["rel_path"],
+                    "shadow_path": e["shadow_path"],
+                    "bytes": e["bytes"],
+                }
+            )
     # Convert prefix sets to counts for json-serializability.
     for bucket in by_dir.values():
-        bucket["prefix_counts"] = {p: len(v) for p, v in
-                                    sorted(bucket["prefix_counts"].items(),
-                                           key=lambda kv: -len(kv[1]))}
+        bucket["prefix_counts"] = {
+            p: len(v)
+            for p, v in sorted(
+                bucket["prefix_counts"].items(), key=lambda kv: -len(kv[1])
+            )
+        }
 
     # Load the prefix index (significant identifier surfaces). Survey is
     # required to provide reference-mode coverage for each.
@@ -252,7 +287,8 @@ def run_survey(
         for prefix, info in prefix_index.get("prefixes", {}).items():
             top_dirs = sorted(
                 ((d, len(v["ids"])) for d, v in info["dirs"].items()),
-                key=lambda kv: -kv[1])[:6]
+                key=lambda kv: -kv[1],
+            )[:6]
             significant_prefixes[prefix] = {
                 "id_count": info["id_count"],
                 "file_count": info["file_count"],
@@ -270,8 +306,12 @@ def run_survey(
         "significant_prefixes": significant_prefixes,
     }
     survey_manifest_path.write_text(json.dumps(survey_view, indent=1))
-    LOG.info("survey: per-dir summary -> %s (%d dirs, %d candidate files)",
-             survey_manifest_path, len(by_dir), survey_view["totals"]["files"])
+    LOG.info(
+        "survey: per-dir summary -> %s (%d dirs, %d candidate files)",
+        survey_manifest_path,
+        len(by_dir),
+        survey_view["totals"]["files"],
+    )
 
     user_prompt = SURVEY_USER_TMPL.format(
         manifest_path=survey_manifest_path,
@@ -305,58 +345,83 @@ def run_survey(
         if res.rc != 0:
             raise SystemExit(
                 f"survey failed (rc={res.rc}, stalled={res.killed_for_inactivity}); "
-                f"check {res.raw_log_path}")
+                f"check {res.raw_log_path}"
+            )
         if not slice_manifest_path.is_file() or not signals_path.is_file():
             if output_retries_remaining <= 0:
                 raise SystemExit(
                     f"survey produced no output files after retries; "
-                    f"check {res.raw_log_path}")
+                    f"check {res.raw_log_path}"
+                )
             output_retries_remaining -= 1
-            LOG.warning("survey: agent finished without writing output files; "
-                        "retrying (%d attempts left)", output_retries_remaining)
-            addendum = ("\n\nRETRY: your previous attempt finished without "
-                        "writing the required output files. You MUST write "
-                        f"BOTH {slice_manifest_path} AND {signals_path} as "
-                        "the final action. Do not preface with intent; just "
-                        "produce the JSON now.")
+            LOG.warning(
+                "survey: agent finished without writing output files; "
+                "retrying (%d attempts left)",
+                output_retries_remaining,
+            )
+            addendum = (
+                "\n\nRETRY: your previous attempt finished without "
+                "writing the required output files. You MUST write "
+                f"BOTH {slice_manifest_path} AND {signals_path} as "
+                "the final action. Do not preface with intent; just "
+                "produce the JSON now."
+            )
             continue
         sm = json.loads(slice_manifest_path.read_text())
         sig = json.loads(signals_path.read_text())
-        LOG.info("survey: %d groups, %d signals",
-                 len(sm.get("groups", [])), len(sig.get("signals", [])))
+        LOG.info(
+            "survey: %d groups, %d signals",
+            len(sm.get("groups", [])),
+            len(sig.get("signals", [])),
+        )
 
-        gaps = _validate_prefix_coverage(
-            sm, significant_prefixes, full_manifest)
+        gaps = _validate_prefix_coverage(sm, significant_prefixes, full_manifest)
         if not gaps:
             LOG.info("survey: prefix coverage OK")
             return
         if coverage_attempt >= coverage_retries:
-            LOG.warning("survey: %d prefixes still uncovered after %d retries; "
-                        "shipping anyway", len(gaps), coverage_retries)
+            LOG.warning(
+                "survey: %d prefixes still uncovered after %d retries; "
+                "shipping anyway",
+                len(gaps),
+                coverage_retries,
+            )
             for prefix, info in list(gaps.items())[:10]:
-                LOG.warning("  uncovered prefix '%s': %d ids in %s",
-                            prefix, info["id_count"],
-                            ", ".join(d for d, _ in info["top_dirs"][:3]))
+                LOG.warning(
+                    "  uncovered prefix '%s': %d ids in %s",
+                    prefix,
+                    info["id_count"],
+                    ", ".join(d for d, _ in info["top_dirs"][:3]),
+                )
             return
         # Build addendum naming the gaps and re-run.
-        gap_lines = ["",
-                     "=== COVERAGE GAP -- you missed significant API prefixes ===",
-                     "Re-emit the slice_manifest.json with these gaps fixed:",
-                     ""]
+        gap_lines = [
+            "",
+            "=== COVERAGE GAP -- you missed significant API prefixes ===",
+            "Re-emit the slice_manifest.json with these gaps fixed:",
+            "",
+        ]
         for prefix, info in gaps.items():
             top = ", ".join(f"{d} ({n})" for d, n in info["top_dirs"][:3])
             gap_lines.append(
                 f"- prefix `{prefix}*` ({info['id_count']} identifiers in "
                 f"{info['file_count']} files): mostly in {top}. "
-                f"Add a reference-mode group covering these files.")
+                f"Add a reference-mode group covering these files."
+            )
         gap_lines.append("")
-        gap_lines.append("Re-run -- write {slice_manifest_path} and "
-                         "{signals_path} again, fully covering these prefixes.")
+        gap_lines.append(
+            "Re-run -- write {slice_manifest_path} and "
+            "{signals_path} again, fully covering these prefixes."
+        )
         addendum = "\n".join(gap_lines).format(
-            slice_manifest_path=slice_manifest_path,
-            signals_path=signals_path)
-        LOG.warning("survey: %d uncovered prefixes; retry %d/%d",
-                    len(gaps), coverage_attempt + 1, coverage_retries)
+            slice_manifest_path=slice_manifest_path, signals_path=signals_path
+        )
+        LOG.warning(
+            "survey: %d uncovered prefixes; retry %d/%d",
+            len(gaps),
+            coverage_attempt + 1,
+            coverage_retries,
+        )
         coverage_attempt += 1
 
 
@@ -390,7 +455,9 @@ def _validate_prefix_coverage(
     for e in full_manifest:
         if e["shadow_path"] is None:
             continue
-        files_by_dir.setdefault(str(Path(e["rel_path"]).parent), []).append(e["rel_path"])
+        files_by_dir.setdefault(str(Path(e["rel_path"]).parent), []).append(
+            e["rel_path"]
+        )
 
     ref_group_files: list[set[str]] = []
     for grp in slice_manifest.get("groups", []):
@@ -656,15 +723,18 @@ Then process files.
 """
 
 
-def build_slice_prompt(group: dict, shadow_root: Path,
-                       gap_addendum: str | None = None) -> tuple[str, str]:
+def build_slice_prompt(
+    group: dict, shadow_root: Path, gap_addendum: str | None = None
+) -> tuple[str, str]:
     """Return (system_prompt, user_prompt) for one slice."""
     mode = group["mode"]
     file_lines = []
     for rel in group["files"]:
-        file_lines.append(f"  - {shadow_root}/{rel}.txt"
-                          if rel.lower().endswith((".html", ".htm"))
-                          else f"  - {shadow_root}/{rel}")
+        file_lines.append(
+            f"  - {shadow_root}/{rel}.txt"
+            if rel.lower().endswith((".html", ".htm"))
+            else f"  - {shadow_root}/{rel}"
+        )
     file_list = "\n".join(file_lines) if file_lines else "  (none)"
     body_tmpl = {
         "reference": SLICE_REFERENCE_BODY,
