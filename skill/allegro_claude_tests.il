@@ -368,6 +368,13 @@ let(((savedForm ACL_form) (savedSessionDir ACL_sessionLogDir)
                             list("name" "mcp__allegro__allegro_execute")
                             list("input" list(list("code" "(plus 1 2)")))))
     ACL_check("manual syn: valid still queued" length(ACL_mcpPending) 1)
+    ; .req must land at queue time so the codex MCP-server's content
+    ; matcher can correlate while the call still sits in the manual
+    ; approval queue (otherwise it would time out before approval).
+    ACL_checkTrue("manual syn: queued .req present at queue time"
+      isFile(strcat(ACL_sessionLogDir "tool_toolu_manual_synok.req")))
+    ACL_check("manual syn: queued .out NOT yet written"
+      isFile(strcat(ACL_sessionLogDir "tool_toolu_manual_synok.out")) nil)
     ACL_mcpPending = nil
     ACL_mode = savedMode)
 

@@ -2215,7 +2215,16 @@ procedure(ACL_handleToolCall(block)
             strcat(substring(preview 1 (ACL_logCodeLimit - 3)) "...")
             preview))))
       when(ACL_sessionLogDir
-        ACL_writeFile(sprintf(nil "%s/cmd_%d.il" ACL_sessionLogDir seq) preview))
+        ACL_writeFile(sprintf(nil "%s/cmd_%d.il" ACL_sessionLogDir seq) preview)
+        ; .req lets the codex MCP server correlate its tools/call
+        ; (which carries no tool_use_id) to this pending execution.
+        ; Write it at queue time so manual-mode approval delays and
+        ; long-running tools don't race the matcher's timeout.
+        ACL_writeFileAtomic(
+          sprintf(nil "%s/tool_%s.req" ACL_sessionLogDir toolId)
+          ACL_jsonObj(
+            list("name" ACL_stripMcpPrefix(toolName))
+            list("arguments" or(input nil)))))
       ; Pre-flight allegro_execute through the reader-only syntax
       ; check. Bad-syntax calls fail the same way whether the user
       ; approves them or not, so short-circuit before reaching the
@@ -2298,20 +2307,15 @@ procedure(ACL_mcpDrainPending(@rest args)
 
 procedure(ACL_finishToolResult(toolId toolName input seq result)
   ; Land the result for a tool call: writes the readable cmd_<seq>.out
-  ; log entry and the three IPC sidecars (.req describes the call so
-  ; codex can match it; .err is an empty marker that promotes the
+  ; log entry, the .err sidecar (empty marker that promotes the
   ; result to a JSON-RPC error -- codex ignores the spec's `isError`
-  ; flag on a successful result and feeds the error text back as a
-  ; normal observation; .out lands last so the MCP server never sees a
-  ; stale match without its result).
+  ; flag and feeds error text back as a normal observation), and the
+  ; .out sidecar with the actual result. The matching .req sidecar
+  ; was written at queue time in ACL_handleToolCall.
   when(ACL_sessionLogDir
     letseq(((ipcOutPath sprintf(nil "%s/tool_%s.out" ACL_sessionLogDir toolId))
-            (ipcErrPath sprintf(nil "%s/tool_%s.err" ACL_sessionLogDir toolId))
-            (ipcReqPath sprintf(nil "%s/tool_%s.req" ACL_sessionLogDir toolId)))
+            (ipcErrPath sprintf(nil "%s/tool_%s.err" ACL_sessionLogDir toolId)))
       ACL_writeFile(sprintf(nil "%s/cmd_%d.out" ACL_sessionLogDir seq) result)
-      ACL_writeFileAtomic(ipcReqPath ACL_jsonObj(
-        list("name" ACL_stripMcpPrefix(toolName))
-        list("arguments" or(input nil))))
       when(ACL_toolResultIsError(result)
         ACL_writeFileAtomic(ipcErrPath ""))
       ACL_writeFileAtomic(ipcOutPath result))))
