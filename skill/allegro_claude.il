@@ -2866,22 +2866,19 @@ procedure(ACL_readyStatus()
   ; "Ready" decorated with cumulative cost (when known) and live context
   ; % (when we have window+tokens). Falls back to a weighted-token total
   ; when no $-cost is available (codex). Bare "Ready" if neither lands.
-  let(((hasCost plusp(ACL_sessionCostUsd))
-       (hasWtok plusp(ACL_sessionWeightedTokens))
-       (hasCtx and(ACL_lastContextWindow plusp(ACL_lastContextWindow)))
-       (use ""))
-    use = cond(
-      (hasCost sprintf(nil "$%.2f" ACL_sessionCostUsd))
-      (hasWtok ACL_formatTokenCount(ACL_sessionWeightedTokens))
-      (t nil))
+  letseq(((hasCost plusp(ACL_sessionCostUsd))
+          (hasWtok plusp(ACL_sessionWeightedTokens))
+          (pct when(and(ACL_lastContextWindow plusp(ACL_lastContextWindow))
+                 round(100.0 * ACL_lastContextTokens / ACL_lastContextWindow)))
+          (showCtx and(pct pct <= 100))
+          (use cond(
+            (hasCost sprintf(nil "$%.2f" ACL_sessionCostUsd))
+            (hasWtok ACL_formatTokenCount(ACL_sessionWeightedTokens))
+            (t nil))))
     cond(
-      (and(use hasCtx)
-        sprintf(nil "Ready  -  %s  -  %d%% ctx"
-          use round(100.0 * ACL_lastContextTokens / ACL_lastContextWindow)))
+      (and(use showCtx) sprintf(nil "Ready  -  %s  -  %d%% ctx" use pct))
       (use sprintf(nil "Ready  -  %s" use))
-      (hasCtx
-        sprintf(nil "Ready  -  %d%% ctx"
-          round(100.0 * ACL_lastContextTokens / ACL_lastContextWindow)))
+      (showCtx sprintf(nil "Ready  -  %d%% ctx" pct))
       (t "Ready"))))
 
 procedure(ACL_onResponseComplete()
