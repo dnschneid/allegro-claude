@@ -24,7 +24,7 @@ Claude does its best work when it pre-loads the Allegro documentation, but this 
 Generating the cache is run from a regular shell (not Allegro):
 
 ```
-python3 cache_builder/build_doc_cache.py \
+python3 -m cache_builder.build_doc_cache \
   --install-root /opt/cadence/SPB251 \
   --out ~/.local/share/allegro_claude/notes/SPB25_1_2025.md
 ```
