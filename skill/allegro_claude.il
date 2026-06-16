@@ -954,6 +954,148 @@ procedure(ACL_setStatus(text)
           strcat(substring(text 1 ACL_statusTruncLimit-3) "...")
           text)))))
 
+; Long-operation progress helpers. Single in-flight context: the status
+; bar and Allegro cancel state are global, so nested progress would
+; clobber each other. Set/cleared by ACL_progressBegin / ACL_progressEnd.
+defvar(ACL_progressLabel nil)
+defvar(ACL_progressTotal 0)
+defvar(ACL_progressDone 0)
+defvar(ACL_progressMark nil)
+defvar(ACL_progressReadOnly nil)
+defvar(ACL_progressStartTime 0)
+defvar(ACL_progressLastUpdate 0)
+defvar(ACL_progressActive nil)
+defvar(ACL_progressTickInterval 25)   ; redraw status every N ticks...
+defvar(ACL_progressSecInterval 1)     ; ...or every N seconds, whichever fires first
+
+procedure(ACL_progressFormatDuration(secs)
+  ; Returns "1h2m3s" / "15m30s" / "45s" -- human-readable elapsed/ETA.
+  letseq(((s max(0 fix(secs)))
+          (h fix(s / 3600))
+          (m fix(mod(s 3600) / 60))
+          (r fix(mod(s 60))))
+    cond(
+      ((h > 0) sprintf(nil "%dh%dm%ds" h m r))
+      ((m > 0) sprintf(nil "%dm%ds" m r))
+      (t sprintf(nil "%ds" r)))))
+
+procedure(ACL_progressDraw(failed)
+  ; Push the current state to the status bar with ETA derived from
+  ; elapsed-per-item. Bypasses no-op when done is 0 (no ETA yet).
+  letseq(((now stringToTime(getCurrentTime()))
+          (elapsed (now - ACL_progressStartTime))
+          (pct if(plusp(ACL_progressTotal)
+                  fix((100.0 * ACL_progressDone) / ACL_progressTotal)
+                  0))
+          (etaTxt if(and(ACL_progressDone > 0
+                          ACL_progressDone < ACL_progressTotal)
+                     sprintf(nil " | ETA %s"
+                       ACL_progressFormatDuration(
+                         (elapsed * (ACL_progressTotal - ACL_progressDone))
+                         / ACL_progressDone))
+                     ""))
+          (failTxt if(failed > 0
+                      sprintf(nil " | %d failed" failed)
+                      "")))
+    ACL_setStatus(sprintf(nil "%s %d/%d (%d%%)%s%s"
+      or(ACL_progressLabel "Working") ACL_progressDone ACL_progressTotal
+      pct failTxt etaTxt))
+    ACL_progressLastUpdate = now))
+
+procedure(ACL_progressBegin(label total @key (readOnly nil))
+  ; Open a long-operation progress context: opens a DB transaction
+  ; (unless ?readOnly), enables Esc/Cancel handling, seeds the status
+  ; bar. Returns t on success, nil if total <= 0, a transaction is
+  ; already in flight, or the transaction couldn't open. Pair with
+  ; ACL_progressTick in the loop and ACL_progressEnd in finally.
+  cond(
+    (ACL_progressActive
+      printf("*Warning* ACL: ACL_progressBegin called with one already active\n")
+      nil)
+    (or(null(integerp(total)) total <= 0)
+      nil)
+    (t
+      letseq(((mark when(null(readOnly) axlDBTransactionStart())))
+        cond(
+          (and(null(readOnly) null(mark))
+            nil)
+          (t
+            ACL_progressLabel = or(label "Working")
+            ACL_progressTotal = total
+            ACL_progressDone = 0
+            ACL_progressMark = mark
+            ACL_progressReadOnly = readOnly
+            ACL_progressStartTime = stringToTime(getCurrentTime())
+            ACL_progressLastUpdate = ACL_progressStartTime
+            ACL_progressActive = t
+            errset(axlCancelOn())
+            ACL_progressDraw(0)
+            t))))))
+
+procedure(ACL_progressCancelled()
+  ; Returns t if the user has requested cancellation (Esc / traffic
+  ; light) since the progress context began. Safe to call between
+  ; ticks when an inner sub-loop needs its own escape check.
+  and(ACL_progressActive car(errset(axlCancelTest()))))
+
+procedure(ACL_progressTick(@key (count 1) (failed 0))
+  ; Advance the counter by `count` and, on a throttle, redraw the
+  ; status bar with %, ETA, and the caller's failed count. Returns t
+  ; if the loop should continue, nil if the user has cancelled (or
+  ; the call was made without an active context). Caller pattern:
+  ; `unless(ACL_progressTick(?failed failed) ...break loop...)`.
+  cond(
+    (null(ACL_progressActive)
+      printf("*Warning* ACL: ACL_progressTick called without active context\n")
+      nil)
+    (t
+      ACL_progressDone = ACL_progressDone + count
+      letseq(((now stringToTime(getCurrentTime())))
+        when(or((now - ACL_progressLastUpdate) >= ACL_progressSecInterval
+                zerop(mod(ACL_progressDone ACL_progressTickInterval))
+                ACL_progressDone >= ACL_progressTotal)
+          ACL_progressDraw(failed)))
+      not(car(errset(axlCancelTest()))))))
+
+procedure(ACL_progressEnd(@key (cancelled nil) (failed 0))
+  ; Finalize the progress context: turns cancel processing off, then
+  ; either commits the open transaction (on success) or rolls it back
+  ; (on ?cancelled or commit failure). In read-only mode the
+  ; transaction step is skipped. Pushes a final status summary.
+  ; Returns t if the operation committed cleanly (or read-only
+  ; completed), nil if it was cancelled or commit failed.
+  cond(
+    (null(ACL_progressActive)
+      nil)
+    (t
+      letseq(((label ACL_progressLabel)
+              (done ACL_progressDone)
+              (total ACL_progressTotal)
+              (mark ACL_progressMark)
+              (readOnly ACL_progressReadOnly)
+              (committed t))
+        errset(axlCancelOff())
+        cond(
+          (cancelled
+            when(mark axlDBTransactionRollback(mark))
+            committed = nil)
+          (readOnly nil)
+          (t
+            when(mark
+              unless(axlDBTransactionCommit(mark)
+                axlDBTransactionRollback(mark)
+                committed = nil))))
+        ACL_progressActive = nil
+        ACL_progressMark = nil
+        ACL_setStatus(sprintf(nil "%s: %s %d/%d%s"
+          or(label "Working")
+          cond((cancelled "cancelled at")
+               (null(committed) "commit failed at")
+               (t "done"))
+          done total
+          if(failed > 0 sprintf(nil " (%d failed)" failed) "")))
+        committed))))
+
 procedure(ACL_toolPrefix(@optional (driver ACL_activeDriver()))
   ; PROMPT.md uses `$MCP_` placeholders; the prefix differs per driver
   ; because claude exposes MCP tools as `mcp__<server>__<tool>` while
@@ -2338,7 +2480,13 @@ procedure(ACL_runTool(toolName input)
   ; extraction so adding a tool only touches this proc + ACL_toolPreview.
   cond(
     (toolName == "mcp__allegro__allegro_execute"
-      let(((raw errset(ACL_execBlock(ACL_jGet(input "code")))))
+      letseq(((raw errset(ACL_execBlock(ACL_jGet(input "code")))))
+        ; If the agent's code opened a progress context but didn't
+        ; close it -- whether the call ran to completion or threw --
+        ; assume something went wrong and auto-cancel so the
+        ; transaction rolls back and the status bar gets a final
+        ; message instead of being stuck mid-progress.
+        when(ACL_progressActive ACL_progressEnd(?cancelled t))
         if(raw car(raw) "*error* SKILL execution failed unexpectedly")))
     (toolName == "mcp__allegro__allegro_read_file"
       ACL_toolReadFile(ACL_jGet(input "path")

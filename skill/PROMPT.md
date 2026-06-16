@@ -68,6 +68,41 @@ After receiving a recorded journal, explain what the user did and generate a reu
 4. When uncertain about the effect of a command, prefer querying first.
 5. If a SKILL function returns an error, explain what went wrong before retrying.
 
+## Long-running operations
+
+**CRITICAL: Any loop touching more than ~50 board items needs a progress bar and a cancel hook** -- otherwise Allegro looks frozen and the user has no way out. Use the `ACL_progress*` helpers; they wrap the transaction, status bar, ETA, and `axlCancel*` boilerplate so you only write the loop.
+
+API:
+
+- `ACL_progressBegin(label total @key (readOnly nil))` — opens a DB transaction (skip with `?readOnly t` for queries/reports), enables `axlCancelOn`, seeds the status bar. Returns `t` on success, `nil` if `total <= 0`, another progress is already active, or the transaction couldn't open.
+- `ACL_progressTick(@key (count 1) (failed 0))` — call after each item. Increments the counter, refreshes the status (with %, ETA, and failed count) on a throttle. Returns `t` to keep going, `nil` to stop (user cancelled, or you forgot to call Begin). Use `unless(ACL_progressTick(?failed failed) ...break...)`.
+- `ACL_progressCancelled()` — non-counting cancel check for inner sub-loops. Returns `t` if cancel was requested.
+- `ACL_progressEnd(@key (cancelled nil) (failed 0))` — finalizes. Turns cancel off, then commits the transaction on success or rolls back on `?cancelled` / commit failure (no-op in read-only mode). Returns `t` if committed, `nil` on cancel/rollback.
+
+**Always pair Begin with End** in the same `allegro_execute` call. If the call returns with progress still active, the harness assumes something went wrong and auto-cancels (rollback + final status) — you'll see your transaction reverted and the status bar saying "cancelled at N/M". Wrap the loop in `errset` and treat any fatal error as cancelled. Don't show confirmation/report dialogs while progress is active; `ACL_progressEnd` disables cancel first so dialogs are safe afterward.
+
+Pattern:
+
+```skill
+prog((items failed loopErr cancelled)
+  items = myCollectItems()                 ; live; don't cache earlier
+  unless(ACL_progressBegin("Processing components" length(items))
+    return('noItems))                      ; 0 items or transaction failed
+  failed = 0
+  cancelled = nil
+  loopErr = errset(
+    foreach(item items
+      unless(cancelled
+        ; Per-item errset so one bad item doesn't kill the whole run.
+        unless(errset(myApplyOne(item) t)
+          failed = failed + 1)
+        cancelled = null(ACL_progressTick(?failed failed))))
+    t)
+  return(ACL_progressEnd(?cancelled or(cancelled null(loopErr)) ?failed failed)))
+```
+
+For read-only sweeps (queries / reports that don't write the DB), pass `?readOnly t` to `ACL_progressBegin` — the helpers skip the transaction step but still wire up the status bar and cancellation.
+
 ## SKILL Language Notes
 
 SKILL is Lisp-based. Key syntax:

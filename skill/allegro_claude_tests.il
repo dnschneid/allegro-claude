@@ -893,6 +893,103 @@ let(((savedActive ACL_activeEntry) (savedRatio ACL_docCacheRatio))
   ACL_docCacheRatio = savedRatio
   ACL_activeEntry = savedActive)
 
+printf("\n--- Long-op progress helpers ---\n")
+let(((savedStatus ACL_statusText) (savedActive ACL_progressActive)
+     (savedDone ACL_progressDone) (savedTotal ACL_progressTotal)
+     (savedLabel ACL_progressLabel) (savedMark ACL_progressMark)
+     (savedRO ACL_progressReadOnly) (savedForm ACL_form)
+     (savedMode ACL_mode) (savedPending ACL_mcpPending))
+  ACL_form = nil  ; setStatus updates ACL_statusText regardless
+  ACL_mode = "auto"
+  ACL_mcpPending = nil
+  ACL_progressActive = nil
+  ; Duration formatter
+  ACL_check("progress: duration 0s"
+    ACL_progressFormatDuration(0) "0s")
+  ACL_check("progress: duration 45s"
+    ACL_progressFormatDuration(45) "45s")
+  ACL_check("progress: duration 90s"
+    ACL_progressFormatDuration(90) "1m30s")
+  ACL_check("progress: duration 3725s"
+    ACL_progressFormatDuration(3725) "1h2m5s")
+  ; Zero total -> nil, no state change.
+  ACL_check("progress: zero total -> nil"
+    ACL_progressBegin("Test" 0 ?readOnly t) nil)
+  ACL_check("progress: zero total stays inactive"
+    ACL_progressActive nil)
+  ; Read-only begin succeeds and seeds state + status.
+  ACL_check("progress: readOnly begin -> t"
+    ACL_progressBegin("Counting" 10 ?readOnly t) t)
+  ACL_checkTrue("progress: begin sets active" ACL_progressActive)
+  ACL_check("progress: begin sets total" ACL_progressTotal 10)
+  ACL_check("progress: begin sets done=0" ACL_progressDone 0)
+  ACL_checkTrue("progress: status reflects label"
+    pcreMatchp("Counting" ACL_statusText))
+  ACL_checkTrue("progress: status reflects 0/10"
+    pcreMatchp("0/10" ACL_statusText))
+  ; Tick advances done.
+  ACL_progressTick()
+  ACL_check("progress: tick increments done" ACL_progressDone 1)
+  ACL_progressTick(?count 5)
+  ACL_check("progress: tick count advances by N" ACL_progressDone 6)
+  ; Nested begin while one is active -> nil.
+  ACL_check("progress: nested begin -> nil"
+    ACL_progressBegin("Other" 5 ?readOnly t) nil)
+  ACL_check("progress: nested begin leaves state intact"
+    ACL_progressTotal 10)
+  ; End cleanly (?readOnly skipped transaction so commit short-circuits to t).
+  ACL_check("progress: end success -> t"
+    ACL_progressEnd() t)
+  ACL_check("progress: end clears active" ACL_progressActive nil)
+  ACL_checkTrue("progress: end status names label and outcome"
+    pcreMatchp("Counting: done" ACL_statusText))
+  ; Cancelled end -> nil and status names the cancel point.
+  ACL_progressBegin("Cleanup" 3 ?readOnly t)
+  ACL_progressTick()
+  ACL_check("progress: end cancelled -> nil"
+    ACL_progressEnd(?cancelled t) nil)
+  ACL_checkTrue("progress: end cancelled status"
+    pcreMatchp("cancelled at 1/3" ACL_statusText))
+  ; Failed count shows up in the final status line.
+  ACL_progressBegin("Sweep" 4 ?readOnly t)
+  ACL_progressTick()
+  ACL_progressEnd(?failed 2)
+  ACL_checkTrue("progress: failed count in status"
+    pcreMatchp("2 failed" ACL_statusText))
+  ; Tick without active context warns and returns nil so callers
+  ; that `unless`-gate the loop terminate cleanly.
+  ACL_check("progress: stray tick returns nil"
+    ACL_progressTick() nil)
+  ; Active tick returns t while no cancel has been requested.
+  ACL_progressBegin("Loop" 5 ?readOnly t)
+  ACL_check("progress: tick returns t while active"
+    ACL_progressTick() t)
+  ACL_progressEnd()
+  ; allegro_execute auto-closes a progress context the agent's code
+  ; opened but didn't end (e.g. SKILL error or simple omission), so a
+  ; leaked transaction can't leave the panel stuck.
+  ACL_runTool("mcp__allegro__allegro_execute"
+              list(list("code"
+                        "ACL_progressBegin(\"Leaked\" 3 ?readOnly t)")))
+  ACL_check("progress: runTool auto-ends leaked context"
+    ACL_progressActive nil)
+  ACL_checkTrue("progress: auto-end status says cancelled"
+    pcreMatchp("Leaked: cancelled" ACL_statusText))
+  ; End without active context returns nil cleanly.
+  ACL_check("progress: stray end returns nil"
+    ACL_progressEnd() nil)
+  ; Restore globals so later tests aren't perturbed.
+  ACL_progressActive = savedActive
+  ACL_progressDone = savedDone
+  ACL_progressTotal = savedTotal
+  ACL_progressLabel = savedLabel
+  ACL_progressMark = savedMark
+  ACL_progressReadOnly = savedRO
+  ACL_statusText = savedStatus
+  ACL_form = savedForm
+  ACL_mode = savedMode
+  ACL_mcpPending = savedPending)
+
 printf("\n--- Shell quoting (ipcBeginProcess two-pass safe) ---\n")
 ; ACL_shellQuote must round-trip arbitrary text through ipcBeginProcess
 ; on Linux, where pass-1 interprets \X and "..." regions BEFORE handing
