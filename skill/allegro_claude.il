@@ -1327,30 +1327,43 @@ procedure(ACL_deleteSessionFiles(sid)
 procedure(ACL_maybeSaveSession()
   ; First-text save, gated on the user actually having sent a non-
   ; synthetic message. The synthetic boot-up ping is NOT enough -- it
-  ; would otherwise clutter sessions.json with empty entries. Once
-  ; saved, this is a no-op (ACL_sessionSaved == t).
-  when(and(null(ACL_sessionSaved) ACL_sessionUserMsgSeen
-           ACL_sessionId axlGetDrawingName())
-    letseq(((base list(
-              list("board" ACL_normPath(axlGetDrawingName()))
-              list("time" sprintf(nil "%d"
-                stringToTime(getCurrentTime())))
-              list("model" or(ACL_activeId() ""))))
-            (info if(ACL_pendingForkName
-                     append(base list(list("name"
-                       ACL_pendingForkName)))
-                     base)))
-      ACL_addSession(ACL_sessionId info))
-    ACL_pendingForkName = nil
-    ACL_sessionSaved = t
-    when(ACL_sessionPickerForm
-      ACL_renderSessionPicker(?selectIdx ACL_sessionPickerSelIdx))
-    ; Tell the agent where its prior commands live so it can grep them
-    ; instead of re-running discovery.
-    ACL_sendMessage(sprintf(nil
-      "[Session log dir: %s -- holds your prior cmd_<n>.il/.out (allegro_execute code/output) from this session (reference them as appropriate), and is your scratch space for any reports, generated scripts, or working files the user might want to inspect via the Files... button.]"
-      ACL_sessionLogDir)
-      ?isSynthetic t ?noQuery t)))
+  ; would otherwise clutter sessions.json with empty entries. On
+  ; later invocations, rebind the saved entry's board to the current
+  ; drawing if it has changed (e.g. the user did `save as`) so the
+  ; next openPanel doesn't see a stale mismatch and auto-fork.
+  when(and(ACL_sessionUserMsgSeen ACL_sessionId axlGetDrawingName())
+    let(((board ACL_normPath(axlGetDrawingName())))
+      cond(
+        (null(ACL_sessionSaved)
+          letseq(((base list(
+                    list("board" board)
+                    list("time" sprintf(nil "%d"
+                      stringToTime(getCurrentTime())))
+                    list("model" or(ACL_activeId() ""))))
+                  (info if(ACL_pendingForkName
+                           append(base list(list("name"
+                             ACL_pendingForkName)))
+                           base)))
+            ACL_addSession(ACL_sessionId info))
+          ACL_pendingForkName = nil
+          ACL_sessionSaved = t
+          when(ACL_sessionPickerForm
+            ACL_renderSessionPicker(?selectIdx ACL_sessionPickerSelIdx))
+          ; Tell the agent where its prior commands live so it can grep them
+          ; instead of re-running discovery.
+          ACL_sendMessage(sprintf(nil
+            "[Session log dir: %s -- holds your prior cmd_<n>.il/.out (allegro_execute code/output) from this session (reference them as appropriate), and is your scratch space for any reports, generated scripts, or working files the user might want to inspect via the Files... button.]"
+            ACL_sessionLogDir)
+            ?isSynthetic t ?noQuery t))
+        (t
+          let(((info ACL_getSession(ACL_sessionId)))
+            when(and(info
+                     ACL_normPath(or(ACL_jGet(info "board") "")) != board)
+              ACL_addSession(ACL_sessionId
+                cons(list("board" board)
+                     remove(assoc("board" info) info)))
+              when(ACL_sessionPickerForm
+                ACL_renderSessionPicker(?selectIdx ACL_sessionPickerSelIdx)))))))))
 
 ; ============================================================
 ; 6. Agent Process Management
@@ -3371,7 +3384,9 @@ procedure(ACL_updateSessionPickerButtons()
         axlFormSetFieldEditable(form "rename" t)
         axlFormSetFieldEditable(form "delete" t))
       axlFormSetField(form "restore"
-        if(newRow "Create" "Open"))
+        cond((newRow "Create")
+             (ACL_sessionWouldFork(selInfo) "Fork")
+             (t "Open")))
       ; Highlight the locked-in model when an existing session is
       ; selected; otherwise leave whatever the user picked.
       letseq(((sessId when(selInfo ACL_sessionModel(selInfo)))
@@ -3453,6 +3468,14 @@ procedure(ACL_handlePickerDelete()
             ; Keep cursor in place so it lands on the next session.
             ACL_renderSessionPicker(?selectIdx ACL_sessionPickerSelIdx)))))))
 
+procedure(ACL_sessionWouldFork(info)
+  ; t if opening `info` on the current drawing needs a fork (board
+  ; mismatch). nil if boards match or either side is unknown.
+  letseq(((board when(info ACL_jGet(info "board")))
+          (current axlGetDrawingName()))
+    and(board current
+        ACL_normPath(board) != ACL_normPath(current))))
+
 procedure(ACL_handlePickerRestore()
   ; Open the selected session: New, Restore-on-same-board, or
   ; Fork-from-another-board. Closes the picker before handing off.
@@ -3460,8 +3483,7 @@ procedure(ACL_handlePickerRestore()
   ; when the user picked a model; persist it for new sessions.
   letseq(((newRow ACL_selectedIsNewSession())
           (sid if(newRow nil ACL_selectedSessionSid()))
-          (info when(sid ACL_getSession(sid)))
-          (board when(info or(ACL_jGet(info "board") ""))))
+          (info when(sid ACL_getSession(sid))))
     when(newRow
       ACL_saveSettings(ACL_settingsFile ACL_currentSettings()))
     axlFormClose(ACL_sessionPickerForm)
@@ -3469,9 +3491,9 @@ procedure(ACL_handlePickerRestore()
     cond(
       (newRow ACL_handleNewSession())
       (and(sid info)
-        if(ACL_normPath(board) == ACL_normPath(axlGetDrawingName())
-          ACL_handleRestoreSession(sid)
-          ACL_handleForkSession(sid))))))
+        if(ACL_sessionWouldFork(info)
+          ACL_handleForkSession(sid)
+          ACL_handleRestoreSession(sid))))))
 
 procedure(ACL_basename(path)
   ; Last path component of a "/"-or-"\"-separated path.
@@ -3641,6 +3663,19 @@ procedure(ACL_handleForkSession(sid)
     ; Parent's model already locked above; ACL_lockSessionModel is
     ; idempotent so no need to re-call.
     ACL_logReset()
+    ; Show parent's chat history in the panel so the user sees what
+    ; they're forking from while claude reloads the parent context
+    ; (otherwise the panel sits empty under "Thinking..." for the
+    ; duration of the resume). ?toFile nil keeps these lines out of
+    ; the unflushed buffer -- the parent's log.txt gets copied into
+    ; the fork's dir on first system/init, so the disk file already
+    ; has this history.
+    letseq(((parentLog strcat(ACL_logDir sid "/log.txt"))
+            (text when(isFile(parentLog) ACL_readFile(parentLog))))
+      when(and(text strlen(text) > 0)
+        ACL_logWrite(text ?toFile nil)
+        unless(ACL_logEndsWithNL()
+          rplaca(ACL_logContent strcat(car(ACL_logContent) "\n")))))
     ACL_startAgent(sid t)
     ; Stderr handler clears sessionId if the agent rejected the resume.
     if(null(ACL_sessionId) then
@@ -3652,9 +3687,9 @@ procedure(ACL_handleForkSession(sid)
           if(name strcat("\"" name "\" (" sid ")") sid)) "\n"
         "Continuing the conversation from where you left off on that other board."))
       ACL_sendMessage(sprintf(nil
-        "The target board has changed from \"%s\" to \"%s\". Disregard any previous design-specific information and re-query the new design as needed."
+        "[The target board has changed from \"%s\" to \"%s\". Disregard any previous design-specific information and re-query the new design as needed.]"
         oldBoard axlGetDrawingName())
-        ?isSynthetic t))))
+        ?isSynthetic t ?noQuery t))))
 
 ; ============================================================
 ; 14. Open Panel & Registration
@@ -3684,24 +3719,30 @@ procedure(ACL_openPanel(@rest args)
       ACL_refreshLogButtons()
       axlFormDisplay(ACL_form)
       axlFormSetActiveField(ACL_form "userinput")
-      if(ACL_sessionId then
-        ACL_ensureAgent()
-        ; Redisplay existing log and status after window reopen
-        when(ACL_logContent
-          axlFormSetField(ACL_form "chatlog"
-            ACL_logTail(ACL_logLineLimit)))
-        ACL_setStatus(if(and(ACL_proc ipcIsAliveProcess(ACL_proc))
-          ACL_readyStatus() "Starting..."))
-      else
-        letseq(((board axlGetDrawingName())
-                (sessions when(board ACL_getBoardSessions(board))))
-          ; Auto-resume the most recent session for this board, if any.
-          ; If the session id is stale, the stderr handler clears it and
-          ; the next user action starts fresh via ACL_ensureAgent.
-          if(sessions then
-            ACL_handleRestoreSession(car(car(ACL_sortSessionsByTime(sessions))))
-          else
-            ACL_handleNewSession())))
+      letseq(((board axlGetDrawingName())
+              (sessionInfo when(ACL_sessionId ACL_getSession(ACL_sessionId))))
+        cond(
+          ; Live session on a different design -- fork so the new
+          ; panel inherits the conversation but targets this board.
+          (and(ACL_sessionId ACL_sessionWouldFork(sessionInfo))
+            ACL_handleForkSession(ACL_sessionId))
+          (ACL_sessionId
+            ACL_ensureAgent()
+            ; Redisplay existing log and status after window reopen
+            when(ACL_logContent
+              axlFormSetField(ACL_form "chatlog"
+                ACL_logTail(ACL_logLineLimit)))
+            ACL_setStatus(if(and(ACL_proc ipcIsAliveProcess(ACL_proc))
+              ACL_readyStatus() "Starting...")))
+          (t
+            ; Auto-resume the most recent session for this board, if any.
+            ; If the session id is stale, the stderr handler clears it and
+            ; the next user action starts fresh via ACL_ensureAgent.
+            let(((sessions when(board ACL_getBoardSessions(board))))
+              if(sessions then
+                ACL_handleRestoreSession(car(car(ACL_sortSessionsByTime(sessions))))
+              else
+                ACL_handleNewSession())))))
       ; If a prompt was given on the command line, send it after setup.
       when(strlen(prompt) > 0
         axlFormSetField(ACL_form "userinput" prompt)
