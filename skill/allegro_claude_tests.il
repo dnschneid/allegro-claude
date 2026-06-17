@@ -1065,7 +1065,13 @@ let(((savedActive ACL_activeEntry) (savedExtra ACL_extraModels)
     ACL_checkTrue("codex cmd: effort from registry"
       nindex(cmd "model_reasoning_effort=low"))
     ACL_check("codex cmd: no leftover launcher reference"
-      nindex(cmd "codex_launch") nil))
+      nindex(cmd "codex_launch") nil)
+    ; codex's default per-server tool timeout is 300s, but Meta's
+    ; environment also caches sub-300s overrides on some servers; we
+    ; pin allegro's well past any realistic SKILL call so long
+    ; ACL_progress sweeps aren't killed mid-flight.
+    ACL_checkTrue("codex cmd: allegro tool_timeout_sec overridden"
+      nindex(cmd "mcp_servers.allegro.tool_timeout_sec=10000000")))
   ; Without effort, no -c model_reasoning_effort flag.
   ACL_extraModels = "{'cbtest':{'driver':'codex','model':'x'}}"
   ACL_activeEntry = ACL_modelById("cbtest")

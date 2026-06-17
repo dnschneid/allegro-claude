@@ -309,15 +309,13 @@ def send_result(msg_id, result):
     send_message({"jsonrpc": "2.0", "id": msg_id, "result": result})
 
 
-def match_id_by_content(sd, name, arguments, timeout_s=30.0):
+def match_id_by_content(sd, name, arguments):
     # Codex's MCP tools/call carries no tool_use_id in _meta. SKILL
     # writes a tool_<id>.req sidecar alongside every tool_<id>.out
     # whose body is {"name": <bare-tool>, "arguments": <call args>}.
     # Scan those, oldest first, for the one whose (name, arguments)
-    # matches this incoming call. Wait up to `timeout_s` for a match
-    # since SKILL may not have drained the call yet.
+    # matches this incoming call.
     target = (name or "", arguments or {})
-    deadline = time.monotonic() + timeout_s
     while True:
         candidates = []
         for fname in os.listdir(sd):
@@ -339,8 +337,6 @@ def match_id_by_content(sd, name, arguments, timeout_s=30.0):
         if candidates:
             candidates.sort()
             return candidates[0][1]
-        if time.monotonic() >= deadline:
-            return None
         time.sleep(POLL_INTERVAL_S)
 
 

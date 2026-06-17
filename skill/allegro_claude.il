@@ -1717,6 +1717,12 @@ procedure(ACL_codexBuildCmd(mcpScript entryArgs)
             ACL_tomlStr(mcpScript) ACL_tomlStr(tag)))
         ACL_codexConfigArg("mcp_servers.allegro.default_tools_approval_mode"
           ACL_tomlStr("auto"))
+        ; Per-server tool deadline. Codex's default is 300s (per
+        ; codex-mcp/src/rmcp_client.rs:78); pin practically-infinite
+        ; so a long allegro_execute (board sweep, DRC pass, etc.)
+        ; isn't killed mid-flight. Cancel still works via Esc/Cancel
+        ; in the progress bar.
+        ACL_codexConfigArg("mcp_servers.allegro.tool_timeout_sec" "10000000")
         ACL_codexConfigArg("tools.experimental_request_user_input.enabled"
           "false"))
       tokens = append(tokens pair))
