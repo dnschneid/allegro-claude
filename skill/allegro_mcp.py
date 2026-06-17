@@ -309,12 +309,25 @@ def send_result(msg_id, result):
     send_message({"jsonrpc": "2.0", "id": msg_id, "result": result})
 
 
+# Floor mtime for .req matching. Initialized at module load so any
+# .req on disk from a prior session (cancelled / aborted call that
+# never produced a .out) sits below the floor and is ignored.
+# Advanced after each successful match so two queued calls with
+# identical content pair off in FIFO order -- the second tools/call
+# won't re-match the .req we just consumed.
+_match_floor = time.time()
+
+
 def match_id_by_content(sd, name, arguments):
     # Codex's MCP tools/call carries no tool_use_id in _meta. SKILL
-    # writes a tool_<id>.req sidecar alongside every tool_<id>.out
-    # whose body is {"name": <bare-tool>, "arguments": <call args>}.
-    # Scan those, oldest first, for the one whose (name, arguments)
-    # matches this incoming call.
+    # writes a tool_<id>.req sidecar at queue time whose body is
+    # {"name": <bare-tool>, "arguments": <call args>}. Pair the call
+    # to the OLDEST matching .req whose mtime is strictly above the
+    # floor: "oldest above" preserves FIFO ordering across queued
+    # calls; the floor protects against stale .req files from before
+    # this MCP server started (cancelled or aborted prior runs that
+    # share the same content).
+    global _match_floor
     target = (name or "", arguments or {})
     while True:
         candidates = []
@@ -323,20 +336,23 @@ def match_id_by_content(sd, name, arguments):
                 continue
             req_path = os.path.join(sd, fname)
             try:
+                mtime = os.path.getmtime(req_path)
+            except OSError:
+                continue
+            if mtime <= _match_floor:
+                continue
+            try:
                 with open(req_path, "r", encoding="utf-8") as f:
                     payload = json.loads(f.read())
             except (OSError, ValueError):
                 continue
             if (payload.get("name") or "", payload.get("arguments") or {}) != target:
                 continue
-            try:
-                mtime = os.path.getmtime(req_path)
-            except OSError:
-                continue
             candidates.append((mtime, fname[len("tool_") : -len(".req")]))
         if candidates:
-            candidates.sort()
-            return candidates[0][1]
+            mtime, tool_use_id = min(candidates)
+            _match_floor = mtime
+            return tool_use_id
         time.sleep(POLL_INTERVAL_S)
 
 
