@@ -20,6 +20,12 @@
 ; in the round-trip test. Empty by default.
 ACL_defOpt(ACL_extraTestSpecs nil)
 
+; Driver labels to skip in the per-driver round-trip section. Sites
+; running close to the daemon's wall-clock budget can drop slow
+; built-ins (`'("claude" "codex")`) to focus the run on the entries
+; they added via ACL_extraTestSpecs.
+ACL_defOpt(ACL_roundTripSkip nil)
+
 procedure(ACL_check(name got expected)
   if(equal(got expected) then
     ACL_testPass++
@@ -85,6 +91,11 @@ ACL_check("nested arr"   car(ACL_jParse("[[1],[2]]"))        '((1) (2)))
 ; Edge cases
 ACL_check("end of str"   ACL_jParse("")                      nil)
 ACL_check("just ws"      ACL_jParse("   ")                   nil)
+; Non-numeric tokens starting with `-` (e.g. CLI help text like `-h`,
+; `--print-logs`) must NOT throw "unbound variable" via evalstring.
+ACL_check("bad token: -h"             ACL_jParse("-h")             nil)
+ACL_check("bad token: --print-logs"   ACL_jParse("--print-logs")   nil)
+ACL_check("bad token: -hello world"   ACL_jParse("-hello world")   nil)
 
 printf("\n--- JSON Writer ---\n")
 ACL_check("esc str"      ACL_jsonEscStr("hello")             "\"hello\"")
@@ -2487,6 +2498,483 @@ let(((savedActive ACL_activeEntry) (savedPending ACL_fallbackRetryPending)
   ACL_activeEntry = savedActive
   ACL_logUnflushed = "")
 
+printf("\n--- ACP JSON empty-array sentinel ---\n")
+ACL_check("empty-array sentinel renders as []"
+  ACL_jsonVal(ACL_jsonEmptyArray) "[]")
+ACL_check("nil still renders as null"
+  ACL_jsonVal(nil) "null")
+ACL_check("sentinel nested in object"
+  ACL_jsonVal(list(list("mcpServers" ACL_jsonEmptyArray)
+                   list("cwd" "/tmp")))
+  "{\"mcpServers\":[],\"cwd\":\"/tmp\"}")
+
+printf("\n--- Driver type resolution ---\n")
+let(((savedActive ACL_activeEntry)
+     (savedExtra ACL_extraModels)
+     (savedBuiltins ACL_useBuiltinModels))
+  ACL_useBuiltinModels = nil
+  ACL_extraModels = "{
+    'cl':  {'driver':'claude','model':'m'},
+    'cx':  {'driver':'codex','model':'m'},
+    'ap':  {'driver':'my-acp-cli serve','model':'acme/x'},
+    'ap2': {'driver':'/abs/path/agent --flag','model':'acme/y'}
+  }"
+  ACL_activeEntry = ACL_modelById("cl")
+  ACL_check("resolve: claude literal" ACL_activeDriver() "claude")
+  ACL_check("resolve: claude raw" ACL_activeDriverRaw() "claude")
+  ACL_activeEntry = ACL_modelById("cx")
+  ACL_check("resolve: codex literal" ACL_activeDriver() "codex")
+  ACL_check("resolve: codex raw" ACL_activeDriverRaw() "codex")
+  ACL_activeEntry = ACL_modelById("ap")
+  ACL_check("resolve: spawn command -> acp" ACL_activeDriver() "acp")
+  ACL_check("resolve: spawn command kept verbatim"
+    ACL_activeDriverRaw() "my-acp-cli serve")
+  ACL_activeEntry = ACL_modelById("ap2")
+  ACL_check("resolve: abs-path spawn command -> acp"
+    ACL_activeDriver() "acp")
+  ACL_check("resolve: abs-path spawn command kept verbatim"
+    ACL_activeDriverRaw() "/abs/path/agent --flag")
+  ACL_useBuiltinModels = savedBuiltins
+  ACL_extraModels = savedExtra
+  ACL_activeEntry = savedActive)
+
+printf("\n--- ACP utilities ---\n")
+let(((savedNextId ACL_acpNextRpcId))
+  ACL_acpNextRpcId = 0
+  ACL_check("acpAllocRpcId starts at 1" ACL_acpAllocRpcId() 1)
+  ACL_check("acpAllocRpcId monotonic" ACL_acpAllocRpcId() 2)
+  ACL_acpNextRpcId = savedNextId)
+
+let(((savedCaps ACL_acpAgentCaps))
+  ACL_acpAgentCaps = list(list("loadSession" t)
+                          list("sessionCapabilities"
+                            list(list("fork" list())
+                                 list("resume" list())))
+                          list("mcpCapabilities"
+                            list(list("http" t)
+                                 list("sse" t))))
+  ACL_check("acpAgentSupports top-level true"
+    and(ACL_acpAgentSupports('("loadSession")) t) t)
+  ACL_check("acpAgentSupports nested truthy"
+    and(ACL_acpAgentSupports('("sessionCapabilities" "fork")) t) t)
+  ACL_check("acpAgentSupports missing"
+    ACL_acpAgentSupports('("loadFork")) nil)
+  ACL_check("acpAgentSupports nested missing"
+    ACL_acpAgentSupports('("sessionCapabilities" "nope")) nil)
+  ACL_acpAgentCaps = savedCaps)
+
+let(((savedAmbient ACL_acpPendingAmbient))
+  ACL_acpPendingAmbient = ""
+  ACL_check("acpConsumeAmbient no-op when empty"
+    ACL_acpConsumeAmbient("hello") "hello")
+  ACL_check("acpConsumeAmbient clears buffer after no-op"
+    ACL_acpPendingAmbient "")
+  ACL_acpPendingAmbient = "context note"
+  ACL_check("acpConsumeAmbient prepends"
+    ACL_acpConsumeAmbient("user msg") "context note\n\nuser msg")
+  ACL_check("acpConsumeAmbient clears buffer after consume"
+    ACL_acpPendingAmbient "")
+  ACL_acpPendingAmbient = savedAmbient)
+
+printf("\n--- ACP send-side queue + flush ---\n")
+let(((savedProc ACL_proc)
+     (savedPending ACL_acpPendingTurns)
+     (savedInflight ACL_acpInflightPromptId)
+     (savedStarted ACL_acpSessionStarted)
+     (savedSid ACL_sessionId)
+     (savedNextId ACL_acpNextRpcId)
+     (savedRaw ACL_enableRawLog)
+     (savedSent ACL_acpSystemPromptSent)
+     (proc ipcBeginProcess(if(ACL_isWindows "cmd /c more" "cat") "")))
+  when(proc
+    ACL_proc = proc
+    ACL_enableRawLog = nil
+    ACL_acpSystemPromptSent = t   ; skip prompt-prepend wire shape
+    ; No session yet -> queue but don't fire.
+    ACL_acpSessionStarted = nil
+    ACL_acpInflightPromptId = nil
+    ACL_acpPendingTurns = nil
+    ACL_acpNextRpcId = 0
+    ACL_acpDriverSend("hi" nil nil)
+    ACL_check("flush: pre-session keeps queue"
+      ACL_acpPendingTurns '("hi"))
+    ACL_check("flush: pre-session no in-flight"
+      ACL_acpInflightPromptId nil)
+    ; Active session, no in-flight -> the next send fires.
+    ACL_acpSessionStarted = t
+    ACL_sessionId = "test-sid"
+    ACL_acpDriverSend("there" nil nil)
+    ACL_check("flush: idle session drained"
+      ACL_acpPendingTurns nil)
+    ACL_check("flush: in-flight id set"
+      and(ACL_acpInflightPromptId t) t)
+    ACL_check("flush: in-flight count covers batch"
+      ACL_acpInflightPromptCount 2)
+    ; While in flight, additional sends queue and don't fire.
+    ACL_acpDriverSend("more" nil nil)
+    ACL_check("flush: in-flight keeps new queue"
+      ACL_acpPendingTurns '("more"))
+    ; noQuery routes through ambient buffer instead of the turn queue.
+    ACL_acpDriverSend("ambient note" nil t)
+    ACL_check("flush: noQuery buffers ambient"
+      ACL_acpPendingAmbient "ambient note")
+    ACL_check("flush: noQuery doesn't touch turn queue"
+      ACL_acpPendingTurns '("more"))
+    ipcKillProcess(proc))
+  ACL_acpSystemPromptSent = savedSent
+  ACL_enableRawLog = savedRaw
+  ACL_acpNextRpcId = savedNextId
+  ACL_sessionId = savedSid
+  ACL_acpSessionStarted = savedStarted
+  ACL_acpInflightPromptId = savedInflight
+  ACL_acpInflightPromptCount = 0
+  ACL_acpPendingTurns = savedPending
+  ACL_acpPendingAmbient = ""
+  ACL_proc = savedProc)
+
+printf("\n--- ACP system-prompt prepend ---\n")
+let(((savedSent ACL_acpSystemPromptSent)
+     (savedResume ACL_acpResumeId)
+     (savedFast ACL_fast))
+  ACL_fast = t            ; skip doc-cache block for predictable shape
+  ; Fresh session: first prompt prepends system block.
+  ACL_acpSystemPromptSent = nil
+  ACL_acpResumeId = nil
+  letseq(((blocks ACL_acpBuildPromptInput("hello"))
+          (block car(blocks))
+          (text ACL_jGet(block "text")))
+    ACL_check("prompt: first send wraps with markers"
+      and(pcreMatchp("\\[SYSTEM_PROMPT_BEGIN\\]" text)
+          pcreMatchp("\\[SYSTEM_PROMPT_END\\]" text)
+          pcreMatchp("hello$" text)) t)
+    ACL_check("prompt: flag flips after first send"
+      ACL_acpSystemPromptSent t))
+  ; Second send: plain text, no prepend.
+  letseq(((blocks ACL_acpBuildPromptInput("again"))
+          (block car(blocks))
+          (text ACL_jGet(block "text")))
+    ACL_check("prompt: subsequent send is plain text"
+      text "again"))
+  ; Resume path: system prompt never prepended.
+  ACL_acpSystemPromptSent = nil
+  ACL_acpResumeId = "some-prior-id"
+  letseq(((blocks ACL_acpBuildPromptInput("resumed"))
+          (block car(blocks))
+          (text ACL_jGet(block "text")))
+    ACL_check("prompt: resume skips prepend" text "resumed")
+    ACL_check("prompt: resume leaves flag untouched"
+      ACL_acpSystemPromptSent nil))
+  ACL_fast = savedFast
+  ACL_acpResumeId = savedResume
+  ACL_acpSystemPromptSent = savedSent)
+
+printf("\n--- ACP line dispatch ---\n")
+let(((savedInit ACL_acpInitialized)
+     (savedCaps ACL_acpAgentCaps)
+     (savedAuth ACL_acpAuthMethods)
+     (savedStarted ACL_acpSessionStarted)
+     (savedSid ACL_sessionId)
+     (savedLogDir ACL_sessionLogDir)
+     (savedProc ACL_proc)
+     (savedRaw ACL_enableRawLog)
+     (savedPending ACL_acpPendingTurns)
+     (savedInflight ACL_acpInflightPromptId)
+     (savedResume ACL_acpResumeId)
+     (savedSysSent ACL_acpSystemPromptSent)
+     (proc ipcBeginProcess(if(ACL_isWindows "cmd /c more" "cat") "")))
+  when(proc
+    ACL_proc = proc
+    ACL_enableRawLog = nil
+    ACL_sessionLogDir = nil
+    ACL_acpResumeId = nil
+    ACL_acpInitialized = nil
+    ACL_acpAgentCaps = nil
+    ACL_acpAuthMethods = nil
+    ACL_acpSessionStarted = nil
+    ACL_acpPendingTurns = nil
+    ACL_acpInflightPromptId = nil
+    ACL_acpSystemPromptSent = t   ; avoid the buildSystemPrompt path
+    ; initialize response captures caps and triggers session/new.
+    ACL_acpProcessLine(strcat(
+      "{\"id\":1,\"result\":{\"protocolVersion\":1,"
+      "\"agentCapabilities\":{\"loadSession\":true},"
+      "\"authMethods\":[]}}"))
+    ACL_check("dispatch: initialize sets initialized"
+      ACL_acpInitialized t)
+    ACL_check("dispatch: initialize captures caps"
+      ACL_jGet(ACL_acpAgentCaps "loadSession") t)
+    ; session/new response (or whatever issue-session fired) lands.
+    ACL_sessionId = nil
+    ACL_acpProcessLine(strcat(
+      "{\"id\":2,\"result\":{\"sessionId\":\"sess-abc\"}}"))
+    ACL_check("dispatch: session captures sessionId"
+      ACL_sessionId "sess-abc")
+    ACL_check("dispatch: sessionStarted flips"
+      ACL_acpSessionStarted t)
+    ; session/prompt response with stopReason triggers turn end.
+    ACL_acpInflightPromptId = 3
+    ACL_acpInflightPromptCount = 1
+    ACL_busy = t
+    ACL_acpProcessLine(strcat(
+      "{\"id\":3,\"result\":{\"stopReason\":\"end_turn\"}}"))
+    ACL_check("dispatch: prompt clears in-flight"
+      ACL_acpInflightPromptId nil)
+    ACL_check("dispatch: prompt onResponseComplete clears busy"
+      ACL_busy nil)
+    ipcKillProcess(proc))
+  ACL_acpSystemPromptSent = savedSysSent
+  ACL_acpResumeId = savedResume
+  ACL_acpInflightPromptId = savedInflight
+  ACL_acpInflightPromptCount = 0
+  ACL_acpPendingTurns = savedPending
+  ACL_enableRawLog = savedRaw
+  ACL_proc = savedProc
+  ACL_sessionLogDir = savedLogDir
+  ACL_sessionId = savedSid
+  ACL_acpSessionStarted = savedStarted
+  ACL_acpAuthMethods = savedAuth
+  ACL_acpAgentCaps = savedCaps
+  ACL_acpInitialized = savedInit)
+
+printf("\n--- ACP tool-name normalization ---\n")
+; The agent's exposed tool name might be `allegro_execute`,
+; `mcp__allegro__allegro_execute`, `<server>_allegro_execute`, etc.
+; ACL_acpAllegroTailRe extracts the bare `allegro_<verb>` suffix.
+foreach(pair '(("allegro_execute"                  "allegro_execute")
+               ("mcp__allegro__allegro_execute"    "allegro_execute")
+               ("allegro_allegro_execute"          "allegro_execute")
+               ("mcp__allegro__.allegro_execute"   "allegro_execute")
+               ("weird_prefix_allegro_read_file"   "allegro_read_file")
+               ("allegro_multi_edit_file"          "allegro_multi_edit_file")
+               ("nothing-allegro-here"             nil))
+  letseq(((input car(pair))
+          (want cadr(pair))
+          (got when(pcreMatchp(ACL_acpAllegroTailRe input)
+            pcreSubstitute(ACL_acpAllegroTailRe "\\1"))))
+    ACL_check(strcat("normalize: " input)
+      got want)))
+
+printf("\n--- ACP session/{fork,load,new} dispatch ---\n")
+let(((savedProc ACL_proc)
+     (savedRaw ACL_enableRawLog)
+     (savedCaps ACL_acpAgentCaps)
+     (savedResume ACL_acpResumeId)
+     (savedFork ACL_acpResumeIsFork)
+     (savedSent ACL_acpSystemPromptSent)
+     (savedNextId ACL_acpNextRpcId)
+     (savedHome ACL_homeDir)
+     (savedLogContent ACL_logContent)
+     (savedUnflushed ACL_logUnflushed)
+     (proc ipcBeginProcess(if(ACL_isWindows "cmd /c more" "cat") "")))
+  when(proc
+    ACL_proc = proc
+    ACL_enableRawLog = nil
+    ACL_acpSystemPromptSent = t  ; skip prompt-prepend wire shape
+    ; Capture the first wire write by intercepting the helper's
+    ; raw-log mirror -- enableRawLog already nil, so we tap the
+    ; proc-write path indirectly by re-checking ACL_acpNextRpcId
+    ; and the in-flight state instead.
+    ; --- fork path: caps advertise sessionCapabilities.fork ---
+    ACL_acpAgentCaps = list(list("loadSession" t)
+                            list("sessionCapabilities"
+                              list(list("fork" t)
+                                   list("resume" t))))
+    ACL_acpResumeId = "parent-sid"
+    ACL_acpResumeIsFork = t
+    ACL_acpNextRpcId = 0
+    ACL_acpIssueSession()
+    ACL_check("dispatch: fork allocates an rpc id"
+      ACL_acpNextRpcId 1)
+    ; --- load path: fork cap missing, loadSession present ---
+    ACL_acpAgentCaps = list(list("loadSession" t)
+                            list("sessionCapabilities"
+                              list(list("resume" t))))
+    ACL_acpResumeId = "parent-sid"
+    ACL_acpResumeIsFork = t      ; agent doesn't support fork, falls to load
+    ACL_acpNextRpcId = 0
+    ACL_acpIssueSession()
+    ACL_check("dispatch: load allocates an rpc id"
+      ACL_acpNextRpcId 1)
+    ; --- new path: no fork, no load, resumeId DROPPED via dropStaleSession ---
+    ACL_acpAgentCaps = list()
+    ACL_acpResumeId = "parent-sid"
+    ACL_acpResumeIsFork = nil
+    ACL_acpNextRpcId = 0
+    ; dropStaleSession appends a chat note; mute by stubbing logDir
+    letseq(((savedSidFile ACL_sessionsFile))
+      ACL_sessionsFile = strcat(ACL_homeDir "acp_dispatch_test.json")
+      errset(deleteFile(ACL_sessionsFile))
+      ACL_acpIssueSession()
+      errset(deleteFile(ACL_sessionsFile))
+      ACL_sessionsFile = savedSidFile)
+    ACL_check("dispatch: fallback path resets resumeId" ACL_acpResumeId nil)
+    ACL_check("dispatch: fallback path still allocates an rpc id"
+      ACL_acpNextRpcId 1)
+    ipcKillProcess(proc))
+  ACL_logUnflushed = savedUnflushed
+  ACL_logContent = savedLogContent
+  ACL_acpNextRpcId = savedNextId
+  ACL_acpSystemPromptSent = savedSent
+  ACL_acpResumeIsFork = savedFork
+  ACL_acpResumeId = savedResume
+  ACL_acpAgentCaps = savedCaps
+  ACL_enableRawLog = savedRaw
+  ACL_proc = savedProc)
+
+printf("\n--- ACP server-initiated requests ---\n")
+let(((savedProc ACL_proc)
+     (savedRaw ACL_enableRawLog)
+     (proc ipcBeginProcess(if(ACL_isWindows "cmd /c more" "cat") "")))
+  when(proc
+    ACL_proc = proc
+    ACL_enableRawLog = nil
+    ; session/request_permission: pick allow_once when present.
+    ACL_acpHandleRequest(11 "session/request_permission"
+      list(list("toolCall" list(list("toolCallId" "tc1")
+                                list("options" list(
+                                  list(list("optionId" "deny")
+                                       list("name" "Deny")
+                                       list("kind" "reject_once"))
+                                  list(list("optionId" "ok")
+                                       list("name" "Allow Once")
+                                       list("kind" "allow_once"))))))))
+    ; Spec also supports top-level options[] -- exercise that path.
+    ACL_acpHandleRequest(12 "session/request_permission"
+      list(list("options" list(
+                 list(list("optionId" "first")
+                      list("name" "First option")
+                      list("kind" "reject_always"))
+                 list(list("optionId" "second")
+                      list("name" "Second")
+                      list("kind" "reject_once"))))))
+    ; fs/read_text_file: serve the file via toolReadFileLines.
+    letseq(((tmp strcat(ACL_homeDir "acp_fs_read_test.txt")))
+      ACL_writeFile(tmp "line one\nline two\nline three\n")
+      ACL_acpHandleRequest(13 "fs/read_text_file" list(list("path" tmp)))
+      ACL_acpHandleRequest(14 "fs/read_text_file"
+        list(list("path" strcat(ACL_homeDir "no_such_file_acp.txt"))))
+      errset(deleteFile(tmp)))
+    ; Unknown method: returns -32601.
+    ACL_acpHandleRequest(15 "weird/method" list())
+    ; All writes go to the dummy proc; just confirm we didn't crash.
+    ACL_check("requests: handlers run without error" t t)
+    ipcKillProcess(proc))
+  ACL_enableRawLog = savedRaw
+  ACL_proc = savedProc)
+
+printf("\n--- ACP session/update dispatch ---\n")
+let(((savedLog ACL_logContent)
+     (savedQueue ACL_pendingChatQueue)
+     (savedUnflushed ACL_logUnflushed)
+     (savedForm ACL_form)
+     (savedBuf ACL_responseBuf)
+     (savedGot ACL_gotText)
+     (savedStreaming ACL_streamingMsgId)
+     (savedStreamedLen ACL_streamedMsgLen)
+     (savedTokens ACL_lastContextTokens)
+     (savedWindow ACL_lastContextWindow)
+     (savedCost ACL_sessionCostUsd))
+  ACL_form = nil
+  ACL_logContent = nil
+  ACL_pendingChatQueue = nil
+  ACL_logUnflushed = ""
+  ACL_responseBuf = ""
+  ACL_gotText = nil
+  ACL_streamingMsgId = nil
+  ACL_streamedMsgLen = nil
+  ACL_lastContextTokens = 0
+  ACL_lastContextWindow = nil
+  ACL_sessionCostUsd = 0.0
+  ; agent_message_chunk appends text.
+  ACL_acpHandleNotification("session/update"
+    list(list("update" list(
+      list("sessionUpdate" "agent_message_chunk")
+      list("messageId" "msg-1")
+      list("content" list(list("type" "text")
+                          list("text" "hello ")))))))
+  ACL_acpHandleNotification("session/update"
+    list(list("update" list(
+      list("sessionUpdate" "agent_message_chunk")
+      list("messageId" "msg-1")
+      list("content" list(list("type" "text")
+                          list("text" "world")))))))
+  ACL_check("update: text accumulated in responseBuf"
+    ACL_responseBuf "hello world")
+  ACL_check("update: gotText set on first chunk"
+    ACL_gotText t)
+  ; usage_update populates tokens/window/cost globals.
+  ACL_acpHandleNotification("session/update"
+    list(list("update" list(
+      list("sessionUpdate" "usage_update")
+      list("used" 1234)
+      list("size" 200000)
+      list("cost" 0.025)))))
+  ACL_check("update: usage used -> lastContextTokens"
+    ACL_lastContextTokens 1234)
+  ACL_check("update: usage size -> lastContextWindow"
+    ACL_lastContextWindow 200000)
+  ACL_check("update: usage cost -> sessionCostUsd"
+    ACL_sessionCostUsd 0.025)
+  ; Unknown sessionUpdate falls through silently.
+  ACL_acpHandleNotification("session/update"
+    list(list("update" list(list("sessionUpdate" "future_thing")))))
+  ACL_check("update: unknown variant doesn't crash" t t)
+  ACL_sessionCostUsd = savedCost
+  ACL_lastContextWindow = savedWindow
+  ACL_lastContextTokens = savedTokens
+  ACL_streamedMsgLen = savedStreamedLen
+  ACL_streamingMsgId = savedStreaming
+  ACL_gotText = savedGot
+  ACL_responseBuf = savedBuf
+  ACL_form = savedForm
+  ACL_logUnflushed = savedUnflushed
+  ACL_pendingChatQueue = savedQueue
+  ACL_logContent = savedLog)
+
+printf("\n--- ACP auto-fallback on errBody ---\n")
+let(((savedActive ACL_activeEntry) (savedPending ACL_fallbackRetryPending)
+     (savedTriggers ACL_fallbackTriggers) (savedExtra ACL_extraModels)
+     (savedBuiltins ACL_useBuiltinModels)
+     (savedLogDir ACL_sessionLogDir)
+     (savedResume ACL_acpResumeId)
+     (savedStarted ACL_acpSessionStarted)
+     (savedInit ACL_acpInitialized)
+     primary fallback)
+  ACL_useBuiltinModels = nil
+  ACL_extraModels = "{
+    'aprim': {'driver':'p-acp-cmd','model':'p','fallback':'aback'},
+    'aback': {'driver':'b-acp-cmd','model':'b'}
+  }"
+  primary  = ACL_modelById("aprim")
+  fallback = ACL_modelById("aback")
+  ACL_sessionLogDir = nil
+  ACL_acpResumeId = nil
+  ACL_acpSessionStarted = t
+  ACL_acpInitialized = t
+  ACL_activeEntry = primary
+  ACL_fallbackRetryPending = nil
+  ACL_acpProcessLine(strcat(
+    "{\"id\":7,\"error\":{\"code\":-32000,"
+    "\"message\":\"upstream rejected \\\"role\\\":\\\"system\\\"\"}}"))
+  ACL_checkTrue("acp errBody: trigger pending"
+    ACL_fallbackRetryPending)
+  ACL_activeEntry = primary
+  ACL_fallbackRetryPending = nil
+  ACL_acpProcessLine(strcat(
+    "{\"id\":8,\"error\":{\"code\":-32601,\"message\":\"nope\"}}"))
+  ACL_check("acp unrelated error: no retry"
+    ACL_fallbackRetryPending nil)
+  ACL_acpInitialized = savedInit
+  ACL_acpSessionStarted = savedStarted
+  ACL_acpResumeId = savedResume
+  ACL_sessionLogDir = savedLogDir
+  ACL_useBuiltinModels = savedBuiltins
+  ACL_extraModels = savedExtra
+  ACL_fallbackTriggers = savedTriggers
+  ACL_fallbackRetryPending = savedPending
+  ACL_activeEntry = savedActive
+  ACL_logUnflushed = "")
+
 printf("\n--- sendMessage snapshots replay payload ---\n")
 ; sendMessage records the last (text, isSynthetic, noQuery) so the
 ; fallback retry can replay it after relaunching with the new model.
@@ -2715,8 +3203,12 @@ let(((savedFast ACL_fast)
             (modelId cadr(spec))
             (probe caddr(spec))
             (entry ACL_modelById(modelId))
-            (have errset(system(probe))))
-      if(and(entry have car(have) == 0) then
+            (have errset(system(probe)))
+            (skip member(driver ACL_roundTripSkip)))
+      cond(
+        (skip
+          printf("  SKIP: %s (in ACL_roundTripSkip)\n" driver))
+      (and(entry have car(have) == 0)
         ; Pin to the chosen entry; never exercise auto-retry here
         ; (--no-session-persistence breaks --resume which fallback uses).
         ACL_activeEntry = entry
@@ -2842,9 +3334,9 @@ let(((savedFast ACL_fast)
         ; model-side MCP confusion. Claude never emits them.
         when(ACL_activeDriver() == "codex"
           ACL_check(strcat(driver ": no MCP-router errors")
-            ACL_codexMcpErrorCount 0))
-      else
-        printf("  SKIP: %s not in PATH\n" driver))))
+            ACL_codexMcpErrorCount 0)))
+        (t
+          printf("  SKIP: %s not in PATH\n" driver)))))
   ACL_fast = savedFast
   ACL_claudeArgs = savedClaudeArgs
   ACL_activeEntry = savedActive)

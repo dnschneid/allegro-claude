@@ -60,10 +60,10 @@ load("/path/to/allegro-claude/skill/allegro_claude.il")
 Per-entry fields:
 
 - `label` -- free-form display name shown in the picker dropdown.
-- `driver` -- `'claude'` or `'codex'`.
-- `model` -- driver-specific model identifier passed to the CLI.
+- `driver` -- `'claude'`, `'codex'`, or `'acp'`.
+- `model` -- driver-specific. For `claude`/`codex` it's the model identifier passed to the CLI. For `acp` it's the command that starts the [Agent Client Protocol](https://agentclientprotocol.com) server itself (e.g. `'acp-agent-cli'`); ACP carries no wire-level model id, so the agent owns model selection through its own config.
 - `context` -- context window in tokens; gates whether the ~1.5MB doc cache is inlined.
-- `effort` -- (optional) reasoning effort. For `claude`, mapped to `--effort <value>`. For `codex`, mapped to `-c model_reasoning_effort=<value>` (typical codex values: `minimal`, `low`, `medium`, `high`, `xhigh`).
+- `effort` -- (optional) reasoning effort. For `claude`, mapped to `--effort <value>`. For `codex`, mapped to `-c model_reasoning_effort=<value>` (typical codex values: `minimal`, `low`, `medium`, `high`, `xhigh`). Ignored for `acp`.
 - `fallback` -- (optional) id of another registered entry to swap to on a matching `ACL_fallbackTriggers` error.
 - `args` -- (optional) extra CLI args appended only when this entry is selected.
 
@@ -168,6 +168,25 @@ ACL_extraModels = "{
 ```
 
 See `codex/codex-rs/core/models.json` in the codex source tree for additional catalog field examples. If you are in an organization, place the catalog file in a shared location (such as `ALLEGRO_SITE`) so all users benefit from it.
+
+### Agent Client Protocol (ACP) agents
+
+Any [Agent Client Protocol](https://agentclientprotocol.com) agent -- newline-delimited JSON-RPC 2.0 over stdio -- can be registered alongside the built-in `claude` / `codex` entries. There's no `'acp'` magic word; any `driver` value that isn't `'claude'` or `'codex'` is treated as the shell command that spawns the ACP agent. The `model` field is the agent's model id, applied via ACP's `session/set_model` after the session opens (skipped silently when omitted, letting the agent run its default).
+
+```skill
+ACL_extraModels = "{
+  'my-acp-default': {'label':'My ACP Agent (default model)',
+                     'driver':'my-acp-cli serve',
+                     'context':200000},
+  'my-acp-fast':    {'label':'My ACP Agent + fast model',
+                     'driver':'my-acp-cli serve',
+                     'model':'my-org/fast-model',
+                     'context':200000}
+}"
+load("/path/to/allegro-claude/skill/allegro_claude.il")
+```
+
+The allegro MCP server is plumbed in automatically through `session/new`'s `mcpServers` field, so no extra agent-side config is needed for SKILL tool access. Authentication is the agent's responsibility: if it advertises any `authMethods`, the panel surfaces a hint and stops -- run the agent's own auth flow (e.g. `my-acp-cli login`) outside Allegro, then start the session.
 
 ## Files
 

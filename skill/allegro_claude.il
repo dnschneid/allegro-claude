@@ -99,6 +99,10 @@ procedure(ACL_jUnescape(s)
     r))
 
 procedure(ACL_jParseNum(str pos)
+  ; Validate token shape against the JSON number grammar before
+  ; evalstring -- otherwise junk on stdout (e.g. a CLI's --flag help
+  ; text whose lines start with `-`) lands here and evalstring
+  ; throws "unbound variable" on each word.
   let((start c numStr)
     start = pos
     c = substring(str pos 1)
@@ -107,9 +111,10 @@ procedure(ACL_jParseNum(str pos)
       c = substring(str pos 1))
     when(pos > start
       numStr = substring(str start pos - start)
-      when(pcreMatchp(ACL_bignumRe numStr)
-        numStr = strcat(numStr ".0"))
-      list(evalstring(numStr) pos))))
+      when(pcreMatchp(ACL_jNumRe numStr)
+        when(pcreMatchp(ACL_bignumRe numStr)
+          numStr = strcat(numStr ".0"))
+        list(evalstring(numStr) pos)))))
 
 procedure(ACL_jParseLit(str pos word value)
   when(substring(str pos strlen(word)) == word
@@ -185,8 +190,16 @@ procedure(ACL_jsonIsAlist(v)
   and(listp(v) car(v) listp(car(v)) cdr(car(v))
       stringp(caar(v))))
 
+; Sentinel emitted as the JSON literal `[]`. SKILL conflates nil with the
+; empty list, so a bare `list()` (i.e. nil) hits the `null(v)` branch and
+; serializes as `null` instead of `[]`. Pass `ACL_jsonEmptyArray` wherever
+; the wire needs `[]`. Picking a unique uninterned symbol keeps the check
+; cheap and immune to value collisions.
+defvar(ACL_jsonEmptyArray (gensym 'jsonEmptyArray))
+
 procedure(ACL_jsonVal(v)
   cond(
+    (v == ACL_jsonEmptyArray "[]")
     (stringp(v) ACL_jsonEscStr(v))
     (numberp(v) sprintf(nil "%L" v))
     (v == t      "true")
@@ -402,8 +415,22 @@ procedure(ACL_entryLabel(entry)
 procedure(ACL_activeId()
   car(or(ACL_activeEntry ACL_defaultModelEntry())))
 
-procedure(ACL_activeDriver()
+procedure(ACL_activeDriverRaw()
+  ; Raw `driver` field of the active entry: the magic word "claude"
+  ; or "codex" for the built-in CLIs, or the shell command that
+  ; spawns an ACP agent for everything else.
   ACL_entryField(or(ACL_activeEntry ACL_defaultModelEntry()) "driver"))
+
+procedure(ACL_activeDriver()
+  ; Resolved driver type: "claude" / "codex" / "acp". Anything that
+  ; isn't a recognized built-in literally is treated as an ACP spawn
+  ; command, so the entry's `driver` field doubles as both the
+  ; transport selector and (for ACP) the command to launch.
+  let(((raw ACL_activeDriverRaw()))
+    cond(
+      (equal(raw "claude") "claude")
+      (equal(raw "codex")  "codex")
+      (t                   "acp"))))
 
 procedure(ACL_activeModelId()
   ACL_entryField(or(ACL_activeEntry ACL_defaultModelEntry()) "model"))
@@ -555,6 +582,11 @@ defvar(ACL_rejectRe  pcreCompile("^\\s*rejecte?d?\\b[\\W]*(.*)$"  pcreGenCompile
 defvar(ACL_noSessionRe pcreCompile(
   "No conversation found with session ID: ([0-9a-f-]+)"))
 defvar(ACL_bignumRe  pcreCompile("^-?\\d{10,}$"))
+; Strict JSON number grammar: optional `-`, integer part, optional
+; fraction, optional exponent. Used as a pre-flight gate before
+; evalstring so non-numeric tokens (e.g. `-h`, `--print-logs`) don't
+; explode the parser when an agent dumps help text to stdout.
+defvar(ACL_jNumRe    pcreCompile("^-?(0|[1-9]\\d*)(\\.\\d+)?([eE][+-]?\\d+)?$"))
 
 ; Path manipulation. Compiled once because they fire on hot paths
 ; (every IPC write, every stream-handler tool_use, etc).
@@ -1097,12 +1129,14 @@ procedure(ACL_progressEnd(@key (cancelled nil) (failed 0))
         committed))))
 
 procedure(ACL_toolPrefix(@optional (driver ACL_activeDriver()))
-  ; PROMPT.md uses `$MCP_` placeholders; the prefix differs per driver
-  ; because claude exposes MCP tools as `mcp__<server>__<tool>` while
-  ; codex hands the model the bare tool name.
+  ; PROMPT.md uses `$MCP_` placeholders; each driver gets the prefix
+  ; that matches how its host exposes MCP tools to the model. ACP
+  ; commonly names them `<server>_<tool>`, so our `allegro_<verb>`
+  ; tools surface as `allegro_allegro_<verb>`.
   cond(
     (driver == "claude" "mcp__allegro__allegro_")
     (driver == "codex"  "allegro_")
+    (driver == "acp"    "allegro_allegro_")
     (t                  "allegro_")))
 
 procedure(ACL_replacePaths(text)
@@ -1516,6 +1550,7 @@ procedure(ACL_startAgent(@optional resumeId fork)
     cond(
       (driver == "claude" ACL_claudeDriverStart(resumeId fork))
       (driver == "codex"  ACL_codexDriverStart(resumeId fork))
+      (driver == "acp"    ACL_acpDriverStart(resumeId fork))
       (t
         printf("*Error* ACL: unknown driver %L for model %L\n"
           driver ACL_activeId())
@@ -2247,6 +2282,556 @@ procedure(ACL_codexDriverSend(text isSynthetic noQuery)
       ACL_codexPendingTurns = append1(ACL_codexPendingTurns text)
       ACL_codexFlush())))
 
+; --- ACP (Agent Client Protocol) driver ---
+;
+; Newline-delimited JSON-RPC 2.0 over stdio. Lifecycle:
+;   spawn -> initialize -> (auth?) -> session/new (or session/load
+;   on resume) -> session/prompt per user message -> session/update
+;   notifications stream output -> prompt response carries stopReason.
+;
+; The registry's `model` field is the agent executable / shell command;
+; ACP carries no model id at the wire level (the agent owns model
+; selection via its own config). The allegro MCP server is passed
+; through session/new's mcpServers as a stdio entry; the agent spawns
+; the python subprocess and proxies tools/call to it. The system
+; prompt has no slot in initialize or session/new; it rides the first
+; session/prompt of a fresh session.
+
+defvar(ACL_acpNextRpcId 0)         ; per-process JSON-RPC id sequence
+defvar(ACL_acpInitialized nil)     ; t after initialize round-trip
+defvar(ACL_acpAgentCaps nil)       ; raw agentCapabilities alist
+defvar(ACL_acpAuthMethods nil)     ; authMethods array from initialize
+defvar(ACL_acpSessionStarted nil)  ; t after session/new (or load) returns
+defvar(ACL_acpResumeId nil)        ; session id requested at launch
+defvar(ACL_acpResumeIsFork nil)    ; t if launch should fork
+defvar(ACL_acpSystemPromptSent nil) ; t once the prepended prompt has ridden a session/prompt
+defvar(ACL_acpPendingTurns nil)    ; user msgs queued for the next session/prompt
+defvar(ACL_acpPendingAmbient "")   ; noQuery text buffered for next real prompt
+defvar(ACL_acpInflightPromptId nil) ; RPC id of in-flight session/prompt
+defvar(ACL_acpInflightPromptCount 0) ; display-queue entries the in-flight prompt represents
+defvar(ACL_acpHandedToolCalls nil)  ; toolCallIds we've already routed to ACL_handleToolCall
+
+; Filter ACP agents' noisy stderr the way the codex driver does its own.
+; We strip ANSI and drop a few generic noise patterns; sites can extend
+; via ACL_acpStderrNoiseRe if needed.
+defvar(ACL_acpStderrNoiseRe pcreCompile(strcat(
+  "BatchLogProcessor\\.|"
+  "BatchSpanProcessor\\.|"
+  "preferred certificate file is missing")))
+
+; Capture the trailing `allegro_<verb>` portion of an exposed tool
+; name, regardless of whatever prefix the host agent prepended
+; (`mcp__allegro__`, `<server>_`, plain `allegro_`, etc.). The
+; greedy `.*_` consumes through the right-most underscore, so the
+; capture always lands on the final `allegro_<verb>`.
+defvar(ACL_acpAllegroTailRe pcreCompile("(?:.*_)?(allegro_\\w+)$"))
+
+procedure(ACL_acpCleanStderr(line)
+  ; ANSI-stripped line, or nil to suppress.
+  let(((clean pcreReplace(ACL_ansiEscRe line "" 0)))
+    unless(pcreMatchp(ACL_acpStderrNoiseRe clean) clean)))
+
+procedure(ACL_acpAllocRpcId()
+  ACL_acpNextRpcId = ACL_acpNextRpcId + 1
+  ACL_acpNextRpcId)
+
+procedure(ACL_acpSend(method paramsObj @optional id)
+  ; id present -> request, id absent -> notification.
+  let((envelope wire)
+    envelope = list(list("method" method)
+                    list("params" paramsObj))
+    when(id envelope = cons(list("id" id) envelope))
+    wire = strcat(ACL_jsonVal(envelope) "\n")
+    when(ACL_enableRawLog
+      let(((fp outfile(strcat(ACL_homeDir "raw.log") "a")))
+        when(fp fprintf(fp ">>> %s" wire) close(fp))))
+    ipcWriteProcess(ACL_proc wire)))
+
+procedure(ACL_acpSendResult(id result)
+  let(((wire strcat(ACL_jsonObj(list("id" id) list("result" result)) "\n")))
+    when(ACL_enableRawLog
+      let(((fp outfile(strcat(ACL_homeDir "raw.log") "a")))
+        when(fp fprintf(fp ">>> %s" wire) close(fp))))
+    ipcWriteProcess(ACL_proc wire)))
+
+procedure(ACL_acpSendError(id code message)
+  let(((wire strcat(ACL_jsonObj(list("id" id)
+                                list("error" list(list("code" code)
+                                                  list("message" message))))
+                    "\n")))
+    when(ACL_enableRawLog
+      let(((fp outfile(strcat(ACL_homeDir "raw.log") "a")))
+        when(fp fprintf(fp ">>> %s" wire) close(fp))))
+    ipcWriteProcess(ACL_proc wire)))
+
+procedure(ACL_acpBuildCmd(spawnCmd entryArgs)
+  ; entryArgs land raw (user owns the quoting). ACP covers an
+  ; open-ended set of agent CLIs, so any flag tuning is per-entry.
+  ; Linux strips LD_LIBRARY_PATH so Allegro's runtime doesn't bleed
+  ; into the child.
+  let(((prefix if(ACL_isWindows "" "env -u LD_LIBRARY_PATH "))
+       (cmd spawnCmd))
+    cmd = strcat(prefix cmd)
+    when(ACL_nonEmpty(entryArgs)
+      cmd = strcat(cmd " " entryArgs))
+    ACL_wrapCmd(cmd)))
+
+procedure(ACL_acpDriverStart(resumeId fork)
+  ; Stage the allegro MCP script under the canonical path (the site's
+  ; agent config references it from there), reset per-launch state,
+  ; spawn, and kick off `initialize`. session/new is issued from the
+  ; initialize response handler. The entry's `driver` field IS the
+  ; spawn command for ACP entries.
+  letseq(((mcpScript ACL_normPath(strcat(ACL_homeDir "allegro_mcp.py")))
+          (spawnCmd ACL_activeDriverRaw())
+          (entryArgs ACL_entryField(ACL_activeEntry "args"))
+          (cmd ACL_acpBuildCmd(spawnCmd entryArgs)))
+    ACL_copyFile(strcat(ACL_scriptDir "allegro_mcp.py") mcpScript)
+    ACL_acpInitialized = nil
+    ACL_acpAgentCaps = nil
+    ACL_acpAuthMethods = nil
+    ACL_acpSessionStarted = nil
+    ACL_acpResumeId = resumeId
+    ACL_acpResumeIsFork = and(resumeId fork)
+    ACL_acpSystemPromptSent = nil
+    ACL_acpPendingTurns = nil
+    ACL_acpPendingAmbient = ""
+    ACL_acpInflightPromptId = nil
+    ACL_acpInflightPromptCount = 0
+    ACL_acpHandedToolCalls = nil
+    ACL_acpNextRpcId = 0
+    ACL_proc = ipcBeginProcess(cmd ""
+      lambda((id data)
+        ACL_dispatchStreamLines(data "acp" 'ACL_acpProcessLine))
+      lambda((id data)
+        foreach(d parseString(data "\n")
+          let(((clean ACL_acpCleanStderr(d)))
+            when(clean printf("acp: %s\n" clean))))
+        axlFlushDisplay())
+      'ACL_exitHandler)
+    ipcWaitForProcess(ACL_proc)
+    if(and(ACL_proc ipcIsAliveProcess(ACL_proc))
+      ACL_acpSend("initialize"
+        list(list("protocolVersion" 1)
+             list("clientCapabilities" list(
+               list("fs" list(list("readTextFile" t)
+                              list("writeTextFile" 'false)))
+               list("terminal" 'false)))
+             list("clientInfo" list(list("name" "allegro-claude")
+                                    list("version" "1.0"))))
+        ACL_acpAllocRpcId())
+      printf("*Error* ACL: acp process failed to start. Command: %s\n" cmd))))
+
+procedure(ACL_acpAgentSupports(capPath)
+  ; True iff every key in capPath exists in the caps tree. Agents
+  ; advertise capability presence as either `true` or `{}` (empty
+  ; object), so key presence -- not value truthiness -- is the signal.
+  let(((node ACL_acpAgentCaps)
+       (ok t)
+       entry)
+    foreach(key capPath
+      when(ok
+        entry = and(listp(node) assoc(key node))
+        if(entry node = cadr(entry) ok = nil)))
+    ok))
+
+procedure(ACL_acpBuildPromptInput(text)
+  ; Content-block list for one session/prompt. On the first prompt
+  ; of a fresh session, prepend the system prompt (and inlined doc
+  ; cache when it fits); resumed sessions skip the prepend.
+  letseq(((needPrompt and(null(ACL_acpSystemPromptSent)
+                          null(ACL_acpResumeId)))
+          (sys when(needPrompt ACL_buildSystemPrompt()))
+          (block when(and(needPrompt ACL_shouldLoadDocCache())
+                       ACL_renderDocCacheBlock()))
+          (full cond(
+            (null(needPrompt) text)
+            (block
+              strcat("[SYSTEM_PROMPT_BEGIN]\n" sys "\n\n" block
+                     "\n[SYSTEM_PROMPT_END]\n\n" text))
+            (t
+              strcat("[SYSTEM_PROMPT_BEGIN]\n" sys
+                     "\n[SYSTEM_PROMPT_END]\n\n" text)))))
+    when(needPrompt ACL_acpSystemPromptSent = t)
+    list(list(list("type" "text") list("text" full)))))
+
+procedure(ACL_acpBootstrapSessionDir(sid)
+  ; Per-session log dir, MCP-correlation tag, cmd-seq priming.
+  ; Forks copy parent files in so cmd_<N>.il history rides along
+  ; without stealing it.
+  let(((newDir strcat(ACL_logDir sid "/"))
+       (oldDir when(ACL_acpResumeId strcat(ACL_logDir ACL_acpResumeId "/"))))
+    createDir(ACL_logDir)
+    createDir(newDir)
+    when(and(ACL_acpResumeIsFork oldDir isDir(oldDir))
+      ACL_copyDirFiles(oldDir newDir))
+    ACL_sessionLogDir = newDir
+    ACL_logFileAppend("")
+    ACL_refreshLogButtons()
+    ACL_writeSessionTag()
+    ACL_mcpCmdSeq = ACL_mcpScanMaxSeq(ACL_sessionLogDir)))
+
+procedure(ACL_acpMaybeSetModel(sessionResult)
+  ; When the registry entry pins a `model`, issue session/set_model
+  ; so the agent runs against it instead of its own default. Skip
+  ; silently when no model is configured, when the response's
+  ; availableModels lacks the requested id, or when the agent
+  ; already happens to be on it.
+  letseq(((want ACL_activeModelId())
+          (state ACL_jGet(sessionResult "models"))
+          (current ACL_jGet(state "currentModelId"))
+          (avail ACL_jGet(state "availableModels"))
+          (haveIt and(want listp(avail)
+            exists(m avail equal(ACL_jGet(m "modelId") want)))))
+    when(and(ACL_nonEmpty(want) nequal(want current))
+      cond(
+        (and(listp(avail) null(haveIt))
+          ACL_appendChat(sprintf(nil
+            "\n[ACP agent does not expose model %L; staying on %L.]\n"
+            want or(current "agent-default"))))
+        (t
+          ACL_acpSend("session/set_model"
+            list(list("sessionId" ACL_sessionId)
+                 list("modelId" want))
+            ACL_acpAllocRpcId()))))))
+
+procedure(ACL_acpProcessLine(line)
+  prog((parsed method params id result errBody)
+    parsed = ACL_jParse(line)
+    unless(parsed return(nil))
+    parsed = car(parsed)
+    method = ACL_jGet(parsed "method")
+    params = ACL_jGet(parsed "params")
+    id = ACL_jGet(parsed "id")
+    result = ACL_jGet(parsed "result")
+    errBody = ACL_jGet(parsed "error")
+    cond(
+      (and(id method) ACL_acpHandleRequest(id method params))
+      (and(id null(method)) ACL_acpHandleResponse(id result errBody))
+      (method ACL_acpHandleNotification(method params)))))
+
+procedure(ACL_acpHandleRequest(id method params)
+  ; Agent->client requests. Auto-approve permission, serve
+  ; fs/read_text_file (the only capability we advertise), error on
+  ; anything else so the agent moves on instead of stalling.
+  cond(
+    (method == "session/request_permission"
+      ; Pick allow_once if it's in the options; otherwise the first
+      ; option. We don't surface these to chat -- the manual-mode
+      ; hold for allegro_execute happens server-side via the MCP
+      ; queue, not through the agent's permission channel.
+      ; Pick allow_once if present; otherwise the first option.
+      ; Manual mode's gating happens server-side via the MCP queue
+      ; (the .out file doesn't appear until the user approves), not
+      ; through the agent's permission channel.
+      letseq(((opts or(ACL_jGet(ACL_jGet(params "toolCall") "options")
+                       ACL_jGet(params "options")))
+              (allow when(opts car(setof(o opts
+                ACL_jGet(o "kind") == "allow_once"))))
+              (chosen or(allow car(opts))))
+        ACL_acpSendResult(id list(
+          list("outcome" list(list("outcome" "selected")
+                              list("optionId"
+                                ACL_jGet(chosen "optionId"))))))))
+    (method == "fs/read_text_file"
+      letseq(((path ACL_jGet(params "path"))
+              (line ACL_jGet(params "line"))
+              (limit ACL_jGet(params "limit"))
+              (validate ACL_validateFilePath("fs/read_text_file" path t)))
+        cond(
+          (validate
+            ACL_acpSendError(id -32000 validate))
+          (t
+            letseq(((offset or(line 0))
+                    (length or(limit 2000))
+                    (res ACL_toolReadFileLines(path offset length)))
+              if(ACL_toolResultIsError(res)
+                ACL_acpSendError(id -32000 res)
+                ACL_acpSendResult(id list(list("content" res)))))))))
+    (t
+      printf("*Warning* ACL: acp unhandled request %s id=%L\n" method id)
+      ACL_acpSendError(id -32601
+        sprintf(nil "Unknown method: %s" method)))))
+
+procedure(ACL_acpHandleResponse(id result errBody)
+  ; Dispatch JSON-RPC responses in order of decreasing specificity:
+  ; stale-session refusal for in-flight session/load; generic error
+  ; (auto-fallback or surface); initialize success (capture caps,
+  ; issue session); session/{new,load} success (capture sessionId);
+  ; session/prompt success (stopReason -> turn end).
+  cond(
+    (and(errBody ACL_acpResumeId null(ACL_acpSessionStarted))
+      ACL_acpHandleStaleSession(errBody))
+    (errBody
+      ; Clear in-flight state if this error tagged the active prompt.
+      when(and(ACL_acpInflightPromptId equal(id ACL_acpInflightPromptId))
+        ACL_acpInflightPromptId = nil
+        ACL_acpInflightPromptCount = 0)
+      let(((trigger ACL_findFallbackTrigger(nil ACL_jsonVal(errBody))))
+        if(and(trigger ACL_fallbackEntry())
+          ACL_scheduleFallbackRetry(trigger)
+          progn(
+            ACL_appendChat(sprintf(nil "\n[acp error id=%L: %s]\n"
+              id ACL_jsonVal(errBody)))
+            ACL_setStatus("Error")
+            ACL_busy = nil))))
+    (null(ACL_acpInitialized)
+      ACL_acpInitialized = t
+      ACL_acpAgentCaps = ACL_jGet(result "agentCapabilities")
+      ACL_acpAuthMethods = ACL_jGet(result "authMethods")
+      ; Authentication flows live outside Allegro -- surface a hint
+      ; and bail when methods are advertised.
+      if(and(ACL_acpAuthMethods listp(ACL_acpAuthMethods)
+             ACL_acpAuthMethods)
+        progn(
+          ACL_appendChat(strcat(
+            "\n[ACP agent requires authentication. "
+            "Run any required auth flow for your agent outside "
+            "Allegro, then restart this session.]\n"))
+          ACL_setStatus("Auth required"))
+        ACL_acpIssueSession()))
+    (null(ACL_acpSessionStarted)
+      ; session/new and session/fork return a fresh sessionId; the
+      ; load/resume responses omit it and just resume the resumeId
+      ; we already passed.
+      let(((sid or(ACL_jGet(result "sessionId") ACL_acpResumeId)))
+        when(stringp(sid)
+          ACL_acpSessionStarted = t
+          ACL_sessionId = sid
+          ACL_acpBootstrapSessionDir(sid)
+          ACL_acpMaybeSetModel(result)
+          unless(ACL_acpPendingTurns ACL_setStatus("Connected"))
+          ACL_acpFlush())))
+    ; session/prompt response: stopReason -> turn end.
+    (and(ACL_acpInflightPromptId equal(id ACL_acpInflightPromptId))
+      letseq(((stop ACL_jGet(result "stopReason")))
+        ACL_acpInflightPromptId = nil
+        ACL_acpInflightPromptCount = 0
+        ACL_onResponseComplete()
+        when(and(stop nequal(stop "end_turn"))
+          ACL_setStatus(sprintf(nil "Stopped: %s"
+            if(stringp(stop) stop sprintf(nil "%L" stop)))))))))
+
+procedure(ACL_acpHandleStaleSession(errBody)
+  ; session/load was rejected for the sid we tried to attach to.
+  ; Drop the stale id, fall through to a fresh session/new so the
+  ; user lands in a working session instead of looping on the bad id.
+  let(((bad ACL_acpResumeId))
+    ACL_acpResumeId = nil
+    ACL_acpResumeIsFork = nil
+    ACL_dropStaleSession(bad "acp")
+    ACL_acpIssueSession()))
+
+procedure(ACL_acpBuildMcpServers()
+  ; mcpServers entry for the allegro MCP. The agent spawns the
+  ; subprocess and proxies tools/call to it. The session tag rides
+  ; argv so allegro_mcp.py can find the session dir.
+  let(((mcpScript ACL_normPath(strcat(ACL_homeDir "allegro_mcp.py")))
+       (tag or(ACL_sessionTag "")))
+    list(list(
+      list("name" "allegro")
+      list("command" if(ACL_isWindows "python" "python3"))
+      list("args" list(mcpScript tag))
+      list("env" ACL_jsonEmptyArray)))))
+
+procedure(ACL_acpIssueSession()
+  ; Pick a session verb by capability + intent:
+  ;   resume + fork -> session/fork (response carries a NEW sessionId)
+  ;   resume only   -> session/load (resumes the existing sessionId)
+  ;   else          -> session/new
+  ; cwd must be a directory; axlGetDrawingName() is a .brd path, so
+  ; strip the last component.
+  letseq(((wantFork and(ACL_acpResumeId ACL_acpResumeIsFork
+                        ACL_acpAgentSupports('("sessionCapabilities" "fork"))))
+          (wantLoad and(ACL_acpResumeId null(wantFork)
+                        ACL_acpAgentSupports('("loadSession"))))
+          (normCwd ACL_normPath(pcreReplace(ACL_lastPathCompRe
+            simplifyFilename(or(axlGetDrawingName() ACL_homeDir))
+            "" 0)))
+          (mcp ACL_acpBuildMcpServers())
+          (id ACL_acpAllocRpcId()))
+    when(and(ACL_acpResumeId null(wantFork) null(wantLoad))
+      ; Resume requested but the agent supports neither fork nor
+      ; load. Drop the id and start fresh so the user lands
+      ; somewhere instead of seeing a flat error.
+      ACL_appendChat(strcat(
+        "\n[ACP agent does not support session/fork or session/load; "
+        "starting a new session instead.]\n"))
+      ACL_dropStaleSession(ACL_acpResumeId "acp")
+      ACL_acpResumeId = nil)
+    cond(
+      (wantFork
+        ACL_acpSend("session/fork"
+          list(list("sessionId" ACL_acpResumeId)
+               list("cwd" normCwd)
+               list("mcpServers" mcp))
+          id))
+      (wantLoad
+        ACL_acpSend("session/load"
+          list(list("sessionId" ACL_acpResumeId)
+               list("cwd" normCwd)
+               list("mcpServers" mcp))
+          id))
+      (t
+        ACL_acpSend("session/new"
+          list(list("cwd" normCwd)
+               list("mcpServers" mcp))
+          id)))))
+
+procedure(ACL_acpFlush()
+  ; Drain ACL_acpPendingTurns through a single session/prompt when
+  ; the wire is available:
+  ;   session not started      -> no-op (session/{new,load} response will re-flush)
+  ;   prompt in flight         -> no-op (its response will re-flush)
+  ;   idle session             -> single batched session/prompt
+  let(((canSend and(ACL_acpSessionStarted null(ACL_acpInflightPromptId))))
+    when(and(ACL_acpPendingTurns canSend)
+      letseq(((batch ACL_acpPendingTurns)
+              (count length(batch))
+              (body buildString(batch "\n\n")))
+        ACL_acpPendingTurns = nil
+        ACL_acpIssuePrompt(body count)))))
+
+procedure(ACL_acpConsumeAmbient(text)
+  ; Prepend any buffered noQuery context to `text` and clear the
+  ; ambient buffer so ambient hints ride the next real send.
+  letseq(((body if(ACL_nonEmpty(ACL_acpPendingAmbient)
+                strcat(ACL_acpPendingAmbient "\n\n" text)
+                text)))
+    ACL_acpPendingAmbient = ""
+    body))
+
+procedure(ACL_acpIssuePrompt(text count)
+  ; Fire one session/prompt with `text` (any buffered ambient
+  ; consumed). Pin status to "Thinking..." now; first session/update
+  ; chunk takes over from there.
+  letseq(((body ACL_acpConsumeAmbient(text))
+          (rpcId ACL_acpAllocRpcId()))
+    ACL_acpInflightPromptId = rpcId
+    ACL_acpInflightPromptCount = count
+    ACL_busy = t
+    ACL_setStatus("Thinking...")
+    ACL_acpSend("session/prompt"
+      list(list("sessionId" ACL_sessionId)
+           list("prompt" ACL_acpBuildPromptInput(body)))
+      rpcId)))
+
+procedure(ACL_acpHandleNotification(method params)
+  ; session/update is the only first-class notification method; its
+  ; sessionUpdate field discriminates the variant. Other methods
+  ; (custom agent extensions) silently fall through.
+  when(method == "session/update"
+    let(((upd ACL_jGet(params "update")))
+      when(upd
+        let(((kind ACL_jGet(upd "sessionUpdate")))
+          cond(
+            (kind == "agent_message_chunk"
+              ACL_acpHandleAgentChunk(upd))
+            (kind == "agent_thought_chunk"
+              ; Reasoning chunks drop silently; surface in a future
+              ; pass if a model's reasoning is worth showing.
+              nil)
+            (kind == "tool_call"
+              ACL_acpHandleToolCall(upd))
+            (kind == "tool_call_update"
+              ACL_acpHandleToolCallUpdate(upd))
+            (kind == "usage_update"
+              ACL_acpHandleUsageUpdate(upd))
+            (t nil)))))))
+
+procedure(ACL_acpHandleAgentChunk(upd)
+  ; One streamed slice of an agent message. content is the single
+  ; ContentBlock; only text blocks land in the chat panel. messageId
+  ; groups chunks; absent means "one ad-hoc message".
+  letseq(((content ACL_jGet(upd "content"))
+          (msgId or(ACL_jGet(upd "messageId") "acp-msg"))
+          (raw when(content ACL_jGet(content "text")))
+          (text when(stringp(raw) raw)))
+    when(stringp(text)
+      when(and(msgId null(assoc(msgId ACL_streamedMsgLen)))
+        ACL_streamingMsgId = msgId
+        ACL_streamedMsgLen = cons(list(msgId 0) ACL_streamedMsgLen)
+        ; Blank line before fresh assistant text following prior content.
+        when(and(ACL_hadToolUse ACL_logContent) ACL_logWrite("\n\n"))
+        ACL_hadToolUse = nil
+        ACL_setStatus("Responding..."))
+      let(((entry assoc(msgId ACL_streamedMsgLen)))
+        when(entry
+          rplaca(cdr(entry) (cadr(entry) + strlen(text)))))
+      ACL_responseBuf = strcat(ACL_responseBuf text)
+      ACL_streamToDisplay(text)
+      ACL_maybeSaveSession())))
+
+procedure(ACL_acpHandleToolCall(upd)
+  ; Initial tool_call notification. Decorate the status bar and
+  ; defer the allegro-tool handoff to ACL_acpMaybeRouteAllegro --
+  ; agents typically announce here with an empty rawInput.
+  ACL_hadToolUse = t
+  let(((title ACL_jGet(upd "title")))
+    ACL_setStatus(sprintf(nil "Using %s..."
+      if(stringp(title) title sprintf(nil "%L" or(title "?"))))))
+  ACL_acpMaybeRouteAllegro(upd))
+
+procedure(ACL_acpMaybeRouteAllegro(upd)
+  ; Route an allegro_* tool call to ACL_handleToolCall exactly once
+  ; per toolCallId. Dispatch on the spec's status="in_progress"
+  ; marker, which is when the agent locks rawInput and starts
+  ; executing. Agents that omit status get a rawInput-populated
+  ; fallback so we don't deadlock waiting for an in_progress that
+  ; never comes. ACL_acpAllegroTailRe pulls the bare
+  ; `allegro_<verb>` out of whatever host-specific prefix the agent
+  ; wrapped it in.
+  letseq(((toolId or(ACL_jGet(upd "toolCallId") ""))
+          (title or(ACL_jGet(upd "title") ""))
+          (rawInput ACL_jGet(upd "rawInput"))
+          (status ACL_jGet(upd "status"))
+          (bareTool when(pcreMatchp(ACL_acpAllegroTailRe title)
+            pcreSubstitute(ACL_acpAllegroTailRe "\\1")))
+          (already and(ACL_nonEmpty(toolId)
+                       member(toolId ACL_acpHandedToolCalls)))
+          (readyToDispatch or(equal(status "in_progress")
+                              and(null(status) rawInput))))
+    when(and(toolId bareTool rawInput null(already) readyToDispatch)
+      ACL_acpHandedToolCalls = cons(toolId ACL_acpHandedToolCalls)
+      ACL_handleToolCall(list(
+        list("id" toolId)
+        list("name" bareTool)
+        list("input" rawInput))))))
+
+procedure(ACL_acpHandleToolCallUpdate(upd)
+  ; Status update on a previously-announced tool call. Re-route via
+  ; ACL_acpMaybeRouteAllegro so the dispatch fires once rawInput is
+  ; locked. Bounce status back to "Thinking..." on terminal states;
+  ; content updates land via the agent's own session/update chunks.
+  ACL_acpMaybeRouteAllegro(upd)
+  letseq(((status or(ACL_jGet(upd "status") "")))
+    when(member(status '("completed" "failed" "cancelled"))
+      ACL_setStatus("Thinking..."))))
+
+procedure(ACL_acpHandleUsageUpdate(upd)
+  ; usage_update: `used`/`size` drive the % ctx readout, optional
+  ; `cost` drives the $ readout in the status bar.
+  let(((used ACL_jGet(upd "used"))
+       (size ACL_jGet(upd "size"))
+       (cost ACL_jGet(upd "cost")))
+    when(integerp(used) ACL_lastContextTokens = used)
+    when(integerp(size) ACL_lastContextWindow = size)
+    when(numberp(cost) ACL_sessionCostUsd = cost)))
+
+procedure(ACL_acpDriverSend(text isSynthetic noQuery)
+  ; noQuery -> buffer ambient onto next real send. Real sends queue
+  ; and let ACL_acpFlush issue a single batched session/prompt when
+  ; the wire is idle. isSynthetic rides as ordinary user content
+  ; (ACP has no synthetic-message hint).
+  isSynthetic
+  if(noQuery
+    ACL_acpPendingAmbient = if(ACL_nonEmpty(ACL_acpPendingAmbient)
+      strcat(ACL_acpPendingAmbient "\n\n" text)
+      text)
+    progn(
+      ACL_acpPendingTurns = append1(ACL_acpPendingTurns text)
+      ACL_acpFlush())))
+
 ; --- Generic send/ensure entry points ---
 
 procedure(ACL_ensureAgent()
@@ -2271,7 +2856,8 @@ procedure(ACL_sendMessage(text @key (isSynthetic nil) (noQuery nil))
     let(((driver ACL_activeDriver()))
       cond(
         (driver == "claude" ACL_claudeDriverSend(text isSynthetic noQuery))
-        (driver == "codex"  ACL_codexDriverSend(text isSynthetic noQuery))))))
+        (driver == "codex"  ACL_codexDriverSend(text isSynthetic noQuery))
+        (driver == "acp"    ACL_acpDriverSend(text isSynthetic noQuery))))))
 
 ; --- Model fallback on misbehaving API responses ---------------------
 ;
@@ -2350,6 +2936,36 @@ defvar(ACL_mcpPending nil)
 defvar(ACL_mcpExecTimer nil)
 defvar(ACL_mcpCmdSeq 0)
 
+procedure(ACL_normalizeAllegroTool(toolName)
+  ; Strip whatever host-specific prefix a driver/agent put in front
+  ; of our MCP tool name (`mcp__allegro__`, `<server>_`, etc.) and
+  ; return just the bare `allegro_<verb>` form for internal
+  ; dispatch. Returns the input unchanged if no trailing
+  ; `allegro_<verb>` is recognizable.
+  if(and(stringp(toolName) pcreMatchp(ACL_acpAllegroTailRe toolName))
+    pcreSubstitute(ACL_acpAllegroTailRe "\\1")
+    toolName))
+
+procedure(ACL_coerceToolInput(toolName input)
+  ; Coerce known string-typed fields to strings so downstream
+  ; sprintf/strlen/strcat survive when an agent sends a numeric
+  ; literal where the schema expected a string (e.g. `{"code": 42}`
+  ; for allegro_execute).
+  let(((bare ACL_normalizeAllegroTool(toolName))
+       fields val coerced)
+    fields = cond(
+      (bare == "allegro_execute" '("code"))
+      (member(bare '("allegro_read_file" "allegro_write_file"
+                     "allegro_edit_file" "allegro_multi_edit_file"))
+        '("path" "content" "old_string" "new_string")))
+    coerced = input
+    foreach(field fields
+      val = ACL_jGet(coerced field)
+      when(and(val null(stringp(val)))
+        coerced = cons(list(field sprintf(nil "%L" val))
+                       setof(p coerced car(p) != field))))
+    coerced))
+
 procedure(ACL_handleToolCall(block)
   ; Called from the stream handler when a complete tool_use block for
   ; one of our allegro_* tools arrives. Logs the call and queues it
@@ -2361,7 +2977,8 @@ procedure(ACL_handleToolCall(block)
   ; readable log can't get interleaved oddly even if execution hangs.
   letseq(((toolId ACL_jGet(block "id"))
           (toolName or(ACL_jGet(block "name") ""))
-          (input ACL_jGet(block "input"))
+          (input ACL_coerceToolInput(or(ACL_jGet(block "name") "")
+                                     ACL_jGet(block "input")))
           (preview ACL_toolPreview(toolName input))
           (seq nil)
           (synErr nil))
@@ -2410,11 +3027,17 @@ procedure(ACL_toolPreview(toolName input)
   ; Human-readable representation of a tool call for the cmd_<N>.il
   ; log. allegro_execute logs the SKILL code; the file tools log a
   ; comment-prefixed summary plus any content/edit payloads. Returns
-  ; nil for unknown tools.
+  ; nil for unknown tools. Dispatch on the normalized bare tool
+  ; name so callers can pass whatever prefixed form their driver
+  ; exposes.
+  let(((bare ACL_normalizeAllegroTool(toolName)))
   cond(
-    (toolName == "mcp__allegro__allegro_execute"
-      ACL_jGet(input "code"))
-    (toolName == "mcp__allegro__allegro_read_file"
+    (bare == "allegro_execute"
+      ; Coerce non-string code (some agents send `42` rather than
+      ; `"42"`) so the downstream sprintf %s / strlen calls survive.
+      let(((code ACL_jGet(input "code")))
+        if(stringp(code) code sprintf(nil "%L" code))))
+    (bare == "allegro_read_file"
       letseq(((offset ACL_jGet(input "offset"))
               (length ACL_jGet(input "length"))
               (binary ACL_jGet(input "is_binary"))
@@ -2423,15 +3046,15 @@ procedure(ACL_toolPreview(toolName input)
         when(length modes = strcat(modes sprintf(nil " length=%L" length)))
         when(binary modes = strcat(modes " binary"))
         sprintf(nil "; read_file %L%s" ACL_jGet(input "path") modes)))
-    (toolName == "mcp__allegro__allegro_write_file"
+    (bare == "allegro_write_file"
       sprintf(nil "; write_file %L\n%s"
         ACL_jGet(input "path") ACL_jGetStr(input "content")))
-    (toolName == "mcp__allegro__allegro_edit_file"
+    (bare == "allegro_edit_file"
       sprintf(nil "; edit_file %L\n;-- old --\n%s\n;-- new --\n%s"
         ACL_jGet(input "path")
         ACL_jGetStr(input "old_string")
         ACL_jGetStr(input "new_string")))
-    (toolName == "mcp__allegro__allegro_multi_edit_file"
+    (bare == "allegro_multi_edit_file"
       let(((edits or(ACL_jGet(input "edits") nil))
            (idx 0)
            parts)
@@ -2444,7 +3067,7 @@ procedure(ACL_toolPreview(toolName input)
             ACL_jGetStr(edit "old_string")
             sprintf(nil ";-- edit %d new --" idx)
             ACL_jGetStr(edit "new_string"))))
-        buildString(parts "\n")))))
+        buildString(parts "\n"))))))
 
 procedure(ACL_mcpScheduleDrain()
   ; Always defer drain via a one-shot timer so ACL_execBlock's
@@ -2497,8 +3120,11 @@ procedure(ACL_stripMcpPrefix(toolName)
 procedure(ACL_runTool(toolName input)
   ; Dispatch one tool call by name. Each branch handles its own arg
   ; extraction so adding a tool only touches this proc + ACL_toolPreview.
+  ; Compare on the normalized bare name so callers can pass whatever
+  ; prefixed form their driver exposes.
+  let(((bare ACL_normalizeAllegroTool(toolName)))
   cond(
-    (toolName == "mcp__allegro__allegro_execute"
+    (bare == "allegro_execute"
       letseq(((raw errset(ACL_execBlock(ACL_jGet(input "code")))))
         ; If the agent's code opened a progress context but didn't
         ; close it -- whether the call ran to completion or threw --
@@ -2507,22 +3133,22 @@ procedure(ACL_runTool(toolName input)
         ; message instead of being stuck mid-progress.
         when(ACL_progressActive ACL_progressEnd(?cancelled t))
         if(raw car(raw) "*error* SKILL execution failed unexpectedly")))
-    (toolName == "mcp__allegro__allegro_read_file"
+    (bare == "allegro_read_file"
       ACL_toolReadFile(ACL_jGet(input "path")
                        or(ACL_jGet(input "offset") 0)
                        or(ACL_jGet(input "length") 2000)
                        and(ACL_jGet(input "is_binary") t)))
-    (toolName == "mcp__allegro__allegro_write_file"
+    (bare == "allegro_write_file"
       ACL_toolWriteFile(ACL_jGet(input "path")
                         ACL_jGetStr(input "content")))
-    (toolName == "mcp__allegro__allegro_edit_file"
+    (bare == "allegro_edit_file"
       ACL_toolEditFile(ACL_jGet(input "path")
                        ACL_jGetStr(input "old_string")
                        ACL_jGetStr(input "new_string")))
-    (toolName == "mcp__allegro__allegro_multi_edit_file"
+    (bare == "allegro_multi_edit_file"
       ACL_toolMultiEditFile(ACL_jGet(input "path")
                             ACL_jGet(input "edits")))
-    (t sprintf(nil "*error* unknown tool: %s" toolName))))
+    (t sprintf(nil "*error* unknown tool: %s" toolName)))))
 
 procedure(ACL_jGetStr(obj key)
   ; Like ACL_jGet but returns "" for missing/non-string values, so
@@ -3154,13 +3780,17 @@ procedure(ACL_onResponseComplete()
   ; next item/started (so the user sees "You: ..." land alongside the
   ; model's reaction); turn/completed sweeps the remainder (steered
   ; text on a tool-less turn that never produced another item).
+  ; ACP: queued sends can't be mid-turn injected; they batch into the
+  ; next session/prompt. ACL_acpFlush issues that prompt (and flushes
+  ; the matching display lines) if anything is waiting.
   ; Claude takes one queued user msg per turn end, leaving the rest
   ; visible as "Queued:".
-  when(ACL_activeDriver() == "codex"
-    ACL_codexFlushSteeredQueue())
-  if(ACL_activeDriver() == "codex"
-    ACL_flushPendingChat()
-    ACL_flushPendingChat(?one t))
+  let(((driver ACL_activeDriver()))
+    when(driver == "codex" ACL_codexFlushSteeredQueue())
+    when(driver == "acp" ACL_acpFlush())
+    if(member(driver '("codex" "acp"))
+      ACL_flushPendingChat()
+      ACL_flushPendingChat(?one t)))
   ACL_setStatus(ACL_readyStatus()))
 
 ; ============================================================
