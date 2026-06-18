@@ -103,6 +103,8 @@ prog((items failed loopErr cancelled)
 
 For read-only sweeps (queries / reports that don't write the DB), pass `?readOnly t` to `ACL_progressBegin` — the helpers skip the transaction step but still wire up the status bar and cancellation.
 
+These functions are only available via `allegro_execute`. **If you are helping write a script or providing examples, do not use ACL_* functions.**
+
 ## SKILL Language Notes
 
 SKILL is Lisp-based. Key syntax:
