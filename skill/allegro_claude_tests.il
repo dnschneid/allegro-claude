@@ -2873,7 +2873,9 @@ let(((savedLog ACL_logContent)
      (savedStreamedLen ACL_streamedMsgLen)
      (savedTokens ACL_lastContextTokens)
      (savedWindow ACL_lastContextWindow)
-     (savedCost ACL_sessionCostUsd))
+     (savedCost ACL_sessionCostUsd)
+     (savedLoad ACL_acpLoadInflightId))
+  ACL_acpLoadInflightId = nil    ; live mode; notifications must land
   ACL_form = nil
   ACL_logContent = nil
   ACL_pendingChatQueue = nil
@@ -2919,6 +2921,23 @@ let(((savedLog ACL_logContent)
   ACL_acpHandleNotification("session/update"
     list(list("update" list(list("sessionUpdate" "future_thing")))))
   ACL_check("update: unknown variant doesn't crash" t t)
+  ; Replay gate: session/load and session/fork replay historical
+  ; session/update events before the response resolves; those must
+  ; NOT touch the log.
+  ACL_responseBuf = ""
+  ACL_gotText = nil
+  ACL_acpLoadInflightId = 42   ; simulate load in flight
+  ACL_acpHandleNotification("session/update"
+    list(list("update" list(
+      list("sessionUpdate" "agent_message_chunk")
+      list("content" list(list("type" "text")
+                          list("text" "REPLAY -- should not appear")))))))
+  ACL_check("gate: replayed text doesn't reach responseBuf"
+    ACL_responseBuf "")
+  ACL_check("gate: replayed text doesn't flip gotText"
+    ACL_gotText nil)
+  ACL_acpLoadInflightId = nil
+  ACL_acpLoadInflightId = savedLoad
   ACL_sessionCostUsd = savedCost
   ACL_lastContextWindow = savedWindow
   ACL_lastContextTokens = savedTokens

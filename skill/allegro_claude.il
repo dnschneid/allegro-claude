@@ -2310,6 +2310,7 @@ defvar(ACL_acpPendingAmbient "")   ; noQuery text buffered for next real prompt
 defvar(ACL_acpInflightPromptId nil) ; RPC id of in-flight session/prompt
 defvar(ACL_acpInflightPromptCount 0) ; display-queue entries the in-flight prompt represents
 defvar(ACL_acpHandedToolCalls nil)  ; toolCallIds we've already routed to ACL_handleToolCall
+defvar(ACL_acpLoadInflightId nil)   ; RPC id of an in-flight session/load or session/fork; while set, session/update events are historical replay and must not touch the log
 
 ; Filter ACP agents' noisy stderr the way the codex driver does its own.
 ; We strip ANSI and drop a few generic noise patterns; sites can extend
@@ -2399,6 +2400,7 @@ procedure(ACL_acpDriverStart(resumeId fork)
     ACL_acpInflightPromptId = nil
     ACL_acpInflightPromptCount = 0
     ACL_acpHandedToolCalls = nil
+    ACL_acpLoadInflightId = nil
     ACL_acpNextRpcId = 0
     ACL_proc = ipcBeginProcess(cmd ""
       lambda((id data)
@@ -2559,6 +2561,8 @@ procedure(ACL_acpHandleResponse(id result errBody)
   ; (auto-fallback or surface); initialize success (capture caps,
   ; issue session); session/{new,load} success (capture sessionId);
   ; session/prompt success (stopReason -> turn end).
+  when(equal(id ACL_acpLoadInflightId)
+    ACL_acpLoadInflightId = nil)
   cond(
     (and(errBody ACL_acpResumeId null(ACL_acpSessionStarted))
       ACL_acpHandleStaleSession(errBody))
@@ -2593,7 +2597,8 @@ procedure(ACL_acpHandleResponse(id result errBody)
     (null(ACL_acpSessionStarted)
       ; session/new and session/fork return a fresh sessionId; the
       ; load/resume responses omit it and just resume the resumeId
-      ; we already passed.
+      ; we already passed. In all cases, replay (if any) is done by
+      ; the time the response lands.
       let(((sid or(ACL_jGet(result "sessionId") ACL_acpResumeId)))
         when(stringp(sid)
           ACL_acpSessionStarted = t
@@ -2661,12 +2666,17 @@ procedure(ACL_acpIssueSession()
       ACL_acpResumeId = nil)
     cond(
       (wantFork
+        ; fork/load replay historical session/update events before
+        ; the response resolves; flag so ACL_acpHandleNotification
+        ; skips them (log already has the on-disk history).
+        ACL_acpLoadInflightId = id
         ACL_acpSend("session/fork"
           list(list("sessionId" ACL_acpResumeId)
                list("cwd" normCwd)
                list("mcpServers" mcp))
           id))
       (wantLoad
+        ACL_acpLoadInflightId = id
         ACL_acpSend("session/load"
           list(list("sessionId" ACL_acpResumeId)
                list("cwd" normCwd)
@@ -2719,8 +2729,11 @@ procedure(ACL_acpIssuePrompt(text count)
 procedure(ACL_acpHandleNotification(method params)
   ; session/update is the only first-class notification method; its
   ; sessionUpdate field discriminates the variant. Other methods
-  ; (custom agent extensions) silently fall through.
-  when(method == "session/update"
+  ; (custom agent extensions) silently fall through. session/load
+  ; and session/fork replay historical events before their response
+  ; resolves; ACL_acpLoadInflightId gates them out so the panel
+  ; doesn't double-display what's already on disk.
+  when(and(method == "session/update" null(ACL_acpLoadInflightId))
     let(((upd ACL_jGet(params "update")))
       when(upd
         let(((kind ACL_jGet(upd "sessionUpdate")))
@@ -2741,23 +2754,19 @@ procedure(ACL_acpHandleNotification(method params)
 
 procedure(ACL_acpHandleAgentChunk(upd)
   ; One streamed slice of an agent message. content is the single
-  ; ContentBlock; only text blocks land in the chat panel. messageId
-  ; groups chunks; absent means "one ad-hoc message".
+  ; ContentBlock; only text blocks land in the chat panel. ACP has
+  ; no in-turn "message end" marker, so the boundary between
+  ; distinct message runs is signalled by any non-message event
+  ; happening in between -- ACL_hadToolUse already tracks exactly
+  ; that. Insert `\n\n` on the first chunk after such an event.
   letseq(((content ACL_jGet(upd "content"))
-          (msgId or(ACL_jGet(upd "messageId") "acp-msg"))
           (raw when(content ACL_jGet(content "text")))
           (text when(stringp(raw) raw)))
     when(stringp(text)
-      when(and(msgId null(assoc(msgId ACL_streamedMsgLen)))
-        ACL_streamingMsgId = msgId
-        ACL_streamedMsgLen = cons(list(msgId 0) ACL_streamedMsgLen)
-        ; Blank line before fresh assistant text following prior content.
-        when(and(ACL_hadToolUse ACL_logContent) ACL_logWrite("\n\n"))
+      when(ACL_hadToolUse
+        when(ACL_logContent ACL_logWrite("\n\n"))
         ACL_hadToolUse = nil
         ACL_setStatus("Responding..."))
-      let(((entry assoc(msgId ACL_streamedMsgLen)))
-        when(entry
-          rplaca(cdr(entry) (cadr(entry) + strlen(text)))))
       ACL_responseBuf = strcat(ACL_responseBuf text)
       ACL_streamToDisplay(text)
       ACL_maybeSaveSession())))
