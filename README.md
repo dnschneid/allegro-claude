@@ -64,6 +64,7 @@ Per-entry fields:
 - `model` -- driver-specific. For `claude`/`codex` it's the model identifier passed to the CLI. For `acp` it's the command that starts the [Agent Client Protocol](https://agentclientprotocol.com) server itself (e.g. `'acp-agent-cli'`); ACP carries no wire-level model id, so the agent owns model selection through its own config.
 - `context` -- context window in tokens; gates whether the ~1.5MB doc cache is inlined.
 - `effort` -- (optional) reasoning effort. For `claude`, mapped to `--effort <value>`. For `codex`, mapped to `-c model_reasoning_effort=<value>` (typical codex values: `minimal`, `low`, `medium`, `high`, `xhigh`). Ignored for `acp`.
+- `aliases` -- (optional) list of retired ids that also resolve to this entry. Sessions and settings saved under an older id load against the entry that lists it; the alias is never offered for new sessions.
 - `fallback` -- (optional) id of another registered entry to swap to on a matching `ACL_fallbackTriggers` error.
 - `args` -- (optional) extra CLI args appended only when this entry is selected.
 
@@ -82,17 +83,17 @@ ACL_extraModels = "{
 load("/path/to/allegro-claude/skill/allegro_claude.il")
 ```
 
-A user entry whose id matches a built-in fully replaces the built-in. For example, to point the built-in `opus-1m` slug at a different model:
+A user entry whose id matches a built-in fully replaces the built-in. For example, to point the built-in `opus` slug at a different model:
 
 ```skill
 ACL_extraModels = "{
-  'opus-1m': {'label':'Claude Opus (1M, custom)',
-              'driver':'claude', 'model':'my-internal-opus',
-              'context':1000000, 'effort':'max'}
+  'opus': {'label':'Claude Opus (1M, custom)',
+           'driver':'claude', 'model':'my-internal-opus',
+           'context':1000000, 'effort':'max'}
 }"
 ```
 
-Users keep selecting the familiar slug and their saved settings remain compatible; only the underlying `model` changes.
+Users keep selecting the familiar slug and their saved settings remain compatible; only the underlying `model` changes. The replacement drops the built-in's `aliases` too, so restate them if older sessions should still resolve.
 
 To expose only your own entries and hide all built-ins, set `ACL_useBuiltinModels = nil` before loading:
 

@@ -670,11 +670,11 @@ let(((savedExtra ACL_extraModels) (savedBuiltins ACL_useBuiltinModels))
   ACL_extraModels = ""
   ACL_useBuiltinModels = t
   ACL_checkTrue("registry: parsed built-ins"
-    and(ACL_modelById("opus-1m") ACL_modelById("gpt-5-5")))
+    and(ACL_modelById("opus") ACL_modelById("gpt")))
   ACL_check("registry: no surprise built-ins"
     ACL_modelById("does-not-exist") nil)
   ACL_check("registry: built-in has expected label"
-    ACL_entryLabel(ACL_modelById("gpt-5-5")) "Codex GPT-5.5")
+    ACL_entryLabel(ACL_modelById("gpt")) "Codex GPT-5.6 Sol")
   ; Site can append new entries via ACL_extraModels.
   ACL_extraModels = "{'site-local':{'label':'Site Local','driver':'claude',
                                     'model':'x','context':1000}}"
@@ -682,10 +682,10 @@ let(((savedExtra ACL_extraModels) (savedBuiltins ACL_useBuiltinModels))
     ACL_modelById("site-local"))
   ; A site entry whose id matches a built-in replaces it (and a
   ; bare lookup by id finds the override's fields, not the builtin's).
-  ACL_extraModels = "{'gpt-5-5':{'label':'Codex Override','driver':'codex',
+  ACL_extraModels = "{'gpt':{'label':'Codex Override','driver':'codex',
                                      'model':'override','context':42,
                                      'args':'--with-proxy http://override.example/'}}"
-  let(((e ACL_modelById("gpt-5-5")))
+  let(((e ACL_modelById("gpt")))
     ACL_check("registry: override model"
       ACL_entryField(e "model") "override")
     ACL_check("registry: override context"
@@ -696,10 +696,10 @@ let(((savedExtra ACL_extraModels) (savedBuiltins ACL_useBuiltinModels))
       ACL_entryLabel(e) "Codex Override")
     ; Built-in entries carry an effort string the launchers pick up.
     ACL_check("registry: built-in effort field"
-      ACL_entryField(ACL_modelById("opus-1m") "effort") "max"))
+      ACL_entryField(ACL_modelById("opus") "effort") "max"))
   ; Built-in entries before the override are preserved.
   ACL_checkTrue("registry: built-ins preserved alongside override"
-    ACL_modelById("opus-1m"))
+    ACL_modelById("opus"))
   ; Standard JSON with literal `"` quotes still parses.
   ACL_extraModels = "{\"std-json\":{\"label\":\"Std JSON\",\"driver\":\"claude\",
                                      \"model\":\"y\",\"context\":2000}}"
@@ -708,7 +708,7 @@ let(((savedExtra ACL_extraModels) (savedBuiltins ACL_useBuiltinModels))
   ; Malformed JSON: warn, skip extras, keep built-ins.
   ACL_extraModels = "{not valid json}"
   ACL_checkTrue("registry: malformed extras dropped, built-ins kept"
-    ACL_modelById("opus-1m"))
+    ACL_modelById("opus"))
   ; Bare entries without surrounding {} are accepted so site ilinits
   ; can concatenate fragments without each one balancing braces.
   ACL_useBuiltinModels = 'last
@@ -727,7 +727,7 @@ let(((savedExtra ACL_extraModels) (savedBuiltins ACL_useBuiltinModels))
   ACL_extraModels = "{'only':{'label':'Only','driver':'claude',
                               'model':'x','context':500}}"
   ACL_check("registry: nil hides built-ins"
-    ACL_modelById("opus-1m") nil)
+    ACL_modelById("opus") nil)
   ACL_checkTrue("registry: nil keeps extras"
     ACL_modelById("only"))
   ACL_check("registry: nil default is extras' first entry"
@@ -740,21 +740,62 @@ let(((savedExtra ACL_extraModels) (savedBuiltins ACL_useBuiltinModels))
   ACL_check("registry: 'last makes user the default entry"
     car(ACL_defaultModelEntry()) "site-first")
   ACL_checkTrue("registry: 'last still keeps built-ins available"
-    ACL_modelById("opus-1m"))
+    ACL_modelById("opus"))
   ; Placement: t puts built-ins first; default reverts to the first
   ; built-in entry even when extras exist.
   ACL_useBuiltinModels = t
   ACL_check("registry: t makes the first built-in the default"
-    car(ACL_defaultModelEntry()) "opus-1m")
+    car(ACL_defaultModelEntry()) "opus")
   ; User override always wins on id collision, regardless of order.
-  ACL_extraModels = "{'opus-1m':{'label':'My Opus','driver':'claude',
-                                 'model':'x','context':1000}}"
+  ACL_extraModels = "{'opus':{'label':'My Opus','driver':'claude',
+                              'model':'x','context':1000}}"
   ACL_useBuiltinModels = 'last
   ACL_check("registry: user wins on collision ('last)"
-    ACL_entryLabel(ACL_modelById("opus-1m")) "My Opus")
+    ACL_entryLabel(ACL_modelById("opus")) "My Opus")
   ACL_useBuiltinModels = t
   ACL_check("registry: user wins on collision (t)"
-    ACL_entryLabel(ACL_modelById("opus-1m")) "My Opus")
+    ACL_entryLabel(ACL_modelById("opus")) "My Opus")
+  ACL_useBuiltinModels = savedBuiltins
+  ACL_extraModels = savedExtra)
+
+printf("\n--- Model aliases (retired ids) ---\n")
+let(((savedExtra ACL_extraModels) (savedBuiltins ACL_useBuiltinModels)
+     (savedActive ACL_activeEntry))
+  ACL_extraModels = ""
+  ACL_useBuiltinModels = t
+  ; A retired built-in id resolves to the entry that lists it, and the
+  ; entry it hands back is keyed by the canonical id -- so anything
+  ; that persists ACL_activeId() writes the new slug, never the alias.
+  ACL_check("alias: retired built-in resolves"
+    car(ACL_modelById("opus-4-7-1m")) "opus")
+  ACL_check("alias: resolveModel returns canonical id"
+    car(ACL_resolveModel("gpt-5-5")) "gpt")
+  ; Aliases are lookup-only: they never appear in the dropdown/registry
+  ; list that new sessions choose from.
+  ACL_check("alias: absent from registry ids"
+    member("opus-4-7-1m" mapcar('car ACL_models())) nil)
+  ; Restoring a session saved under a retired id locks onto the new
+  ; entry instead of refusing.
+  ACL_activeEntry = nil
+  ACL_check("alias: lockSessionModel accepts retired id"
+    ACL_lockSessionModel(list(list("model" "sonnet-4-6-200k"))) t)
+  ACL_check("alias: locked onto canonical entry"
+    car(ACL_activeEntry) "sonnet")
+  ; The picker row shows the new entry's label, not a `(!)` stale mark.
+  ACL_check("alias: session label uses canonical label"
+    ACL_sessionLabel("sid12345678"
+      list(list("board" "/tmp/x.brd") list("model" "opus-1m")))
+    "sid12345...  [x.brd]  [Claude Opus (1M)]  (?)")
+  ; An exact id always beats an alias, so a site entry can reuse a
+  ; retired slug without being hijacked by the built-in that lists it.
+  ACL_extraModels = "{'gpt-5-5':{'label':'Site Legacy','driver':'codex',
+                                 'model':'x','context':1000}}"
+  ACL_check("alias: exact id beats alias"
+    ACL_entryLabel(ACL_modelById("gpt-5-5")) "Site Legacy")
+  ; Unknown ids still miss -- aliases must not turn every id into a hit.
+  ACL_check("alias: unknown id still nil"
+    ACL_modelById("no-such-alias-12345") nil)
+  ACL_activeEntry = savedActive
   ACL_useBuiltinModels = savedBuiltins
   ACL_extraModels = savedExtra)
 
@@ -3200,7 +3241,7 @@ let((proc buf ready)
 
 printf("\n--- Agent Process (per-driver) ---\n")
 ; End-to-end smoke for every driver on PATH; missing tools just skip.
-; Codex tests can flake because gpt-5-5 sometimes invents non-
+; Codex tests can flake because the codex model sometimes invents non-
 ; existent MCP methods (resources/*, update_plan) before our tool.
 let(((savedFast ACL_fast)
      (savedClaudeArgs ACL_claudeArgs)
@@ -3211,10 +3252,10 @@ let(((savedFast ACL_fast)
     "--no-session-persistence")
   foreach(spec append(
       list(
-        list("claude" "opus-4-7-1m"
+        list("claude" "opus"
              if(ACL_isWindows "where claude >NUL 2>&1"
                "env -u LD_LIBRARY_PATH which claude > /dev/null 2>&1"))
-        list("codex"  "gpt-5-5"
+        list("codex"  "gpt"
              if(ACL_isWindows "where codex >NUL 2>&1"
                "env -u LD_LIBRARY_PATH which codex > /dev/null 2>&1")))
       ACL_extraTestSpecs)

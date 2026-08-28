@@ -304,6 +304,9 @@ ACL_defOpt(ACL_enableRawLog nil)       ; helps with debugging streams
 ;   driver   -- "claude" or "codex".
 ;   model    -- driver-specific model identifier.
 ;   context  -- context window in tokens; gates the ~1.5MB doc cache.
+;   aliases  -- (optional) list of retired ids that also resolve to
+;               this entry, so sessions and settings saved under an
+;               older id keep working. Never selected for new work.
 ;   fallback -- (optional) id of another entry to swap to on a
 ;               matching ACL_fallbackTriggers error.
 ;   effort   -- (optional) reasoning effort. Mapped per-driver:
@@ -325,18 +328,18 @@ ACL_defOpt(ACL_enableRawLog nil)       ; helps with debugging streams
 ;   t               -- built-ins first, user entries after.
 ;   nil             -- omit built-ins entirely.
 defvar(ACL_modelsJson "{
-  'opus-1m':         {'label':'Claude Opus (1M)',         'driver':'claude','model':'opus[1m]',
-                      'context':1000000, 'effort':'max', 'fallback':'opus-4-7-1m'},
-  'opus-4-7-1m':     {'label':'Claude Opus 4.7 (1M)',     'driver':'claude','model':'claude-opus-4-7[1m]',
-                      'context':1000000, 'effort':'max'},
-  'opus-4-7-200k':   {'label':'Claude Opus 4.7 (200K)',   'driver':'claude','model':'claude-opus-4-7',
-                      'context':200000,  'effort':'max'},
-  'sonnet-4-6-1m':   {'label':'Claude Sonnet 4.6 (1M)',   'driver':'claude','model':'claude-sonnet-4-6[1m]',
-                      'context':1000000, 'effort':'max'},
-  'sonnet-4-6-200k': {'label':'Claude Sonnet 4.6 (200K)', 'driver':'claude','model':'claude-sonnet-4-6',
-                      'context':200000,  'effort':'max'},
-  'gpt-5-5':         {'label':'Codex GPT-5.5',            'driver':'codex', 'model':'gpt-5.5',
-                      'context':256000,  'effort':'xhigh'}
+  'opus':            {'label':'Claude Opus (1M)',       'driver':'claude','model':'claude-opus-5[1m]',
+                      'context':1000000, 'effort':'max',
+                      'aliases': ['opus-1m', 'opus-4-7-1m']},
+  'opus-200k':       {'label':'Claude Opus (200K)',     'driver':'claude','model':'claude-opus-5',
+                      'context':200000,  'effort':'max',
+                      'aliases': ['opus-4-7-200k']},
+  'sonnet':          {'label':'Claude Sonnet 5 (1M)',   'driver':'claude','model':'claude-sonnet-5',
+                      'context':1000000, 'effort':'max',
+                      'aliases': ['sonnet-4-6-1m', 'sonnet-4-6-200k']},
+  'gpt':             {'label':'Codex GPT-5.6 Sol',      'driver':'codex', 'model':'gpt-5.6-sol',
+                      'context':256000,  'effort':'xhigh',
+                      'aliases': ['gpt-5-5']}
 }")
 
 defvar(ACL_modelsApostropheRe pcreCompile("'"))
@@ -385,9 +388,15 @@ procedure(ACL_models()
 defvar(ACL_activeEntry nil)
 
 procedure(ACL_modelById(id)
-  ; Look up a registry entry by its id slug. Returns the full alist
-  ; entry `(id fields)` or nil on miss.
-  when(stringp(id) assoc(id ACL_models())))
+  ; Look up a registry entry by its id slug, then by any entry's
+  ; `aliases` so ids retired by a registry update still resolve.
+  ; Returns the full alist entry `(id fields)`, always keyed by the
+  ; canonical id, or nil on miss.
+  when(stringp(id)
+    let(((registry ACL_models()))
+      or(assoc(id registry)
+         car(exists(e registry
+               member(id ACL_entryField(e "aliases"))))))))
 
 procedure(ACL_defaultModelEntry() car(ACL_models()))
 
