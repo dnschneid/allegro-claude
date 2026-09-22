@@ -328,17 +328,14 @@ ACL_defOpt(ACL_enableRawLog nil)       ; helps with debugging streams
 ;   t               -- built-ins first, user entries after.
 ;   nil             -- omit built-ins entirely.
 defvar(ACL_modelsJson "{
-  'opus':            {'label':'Claude Opus (1M)',       'driver':'claude','model':'claude-opus-5[1m]',
-                      'context':1000000, 'effort':'max',
-                      'aliases': ['opus-1m', 'opus-4-7-1m']},
-  'opus-200k':       {'label':'Claude Opus (200K)',     'driver':'claude','model':'claude-opus-5',
-                      'context':200000,  'effort':'max',
-                      'aliases': ['opus-4-7-200k']},
-  'sonnet':          {'label':'Claude Sonnet 5 (1M)',   'driver':'claude','model':'claude-sonnet-5',
-                      'context':1000000, 'effort':'max',
+  'opus':            {'label':'Claude Opus',       'driver':'claude','model':'claude-opus-5',
+                      'context':1000000, 'effort':'high',
+                      'aliases': ['opus-1m', 'opus-4-7-1m', 'opus-200k', 'opus-4-7-200k']},
+  'sonnet':          {'label':'Claude Sonnet 5',   'driver':'claude','model':'claude-sonnet-5',
+                      'context':1000000, 'effort':'xhigh',
                       'aliases': ['sonnet-4-6-1m', 'sonnet-4-6-200k']},
-  'gpt':             {'label':'Codex GPT-5.6 Sol',      'driver':'codex', 'model':'gpt-5.6-sol',
-                      'context':256000,  'effort':'xhigh',
+  'gpt':             {'label':'Codex GPT-6 Sol',      'driver':'codex', 'model':'gpt-6-sol',
+                      'context':256000,  'effort':'high',
                       'aliases': ['gpt-5-5']}
 }")
 
